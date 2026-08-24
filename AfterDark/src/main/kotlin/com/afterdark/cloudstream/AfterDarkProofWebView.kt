@@ -128,6 +128,31 @@ object AfterDarkProofWebView {
                 setAcceptThirdPartyCookies(browser, true)
             }
 
+            // Cache WebView settings on the UI thread.
+            val browserUserAgent = browser.settings.userAgentString
+                ?.takeIf { it.isNotBlank() }
+                ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
+                    "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+
+            fun finishWithCapturedProof(proof: String) {
+                // shouldInterceptRequest() is not a UI-thread callback.
+                handler.post {
+                    if (finished.get()) return@post
+
+                    val cookie = runCatching {
+                        CookieManager.getInstance().getCookie(mainUrl)
+                    }.getOrNull()
+
+                    finish(
+                        ProofSession(
+                            proof = proof,
+                            cookie = cookie,
+                            userAgent = browserUserAgent,
+                        ),
+                    )
+                }
+            }
+
             browser.webChromeClient = object : WebChromeClient() {
                 override fun onCreateWindow(
                     view: WebView?,
@@ -193,15 +218,13 @@ object AfterDarkProofWebView {
                             view: WebView?,
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
-                            val session = captureProof(
-                                view = view,
+                            val proof = captureProofHeader(
                                 webRequest = webRequest,
                                 playbackRequest = request,
                                 targetHost = targetHost,
-                                mainUrl = mainUrl,
                             )
-                            if (session != null) {
-                                finish(session)
+                            if (proof != null) {
+                                finishWithCapturedProof(proof)
                             }
                             return super.shouldInterceptRequest(view, webRequest)
                         }
@@ -244,16 +267,14 @@ object AfterDarkProofWebView {
                     view: WebView?,
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
-                    val session = captureProof(
-                        view = view,
+                    val proof = captureProofHeader(
                         webRequest = webRequest,
                         playbackRequest = request,
                         targetHost = targetHost,
-                        mainUrl = mainUrl,
                     )
 
-                    if (session != null) {
-                        finish(session)
+                    if (proof != null) {
+                        finishWithCapturedProof(proof)
                     }
 
                     return super.shouldInterceptRequest(view, webRequest)
@@ -302,17 +323,15 @@ object AfterDarkProofWebView {
         }
     }
 
-    private fun captureProof(
-        view: WebView?,
+    private fun captureProofHeader(
         webRequest: WebResourceRequest?,
         playbackRequest: PlaybackRequest,
         targetHost: String?,
-        mainUrl: String,
-    ): ProofSession? {
+    ): String? {
         if (webRequest == null) return null
         if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
-        val uri = webRequest.url ?: return null
+        val uri = webRequest.url
         if (!uri.host.equals(targetHost, ignoreCase = true)) return null
         if (uri.path != "/api/sources") return null
         if (uri.getQueryParameter("tmdbId") != playbackRequest.tmdbId.toString()) return null
@@ -327,22 +346,10 @@ object AfterDarkProofWebView {
             }
         }
 
-        val proof = webRequest.requestHeaders.entries
+        return webRequest.requestHeaders.entries
             .firstOrNull { (key, _) -> key.equals(PROOF_HEADER, ignoreCase = true) }
             ?.value
             ?.takeIf { it.isNotBlank() }
-            ?: return null
-
-        val cookie = CookieManager.getInstance().getCookie(mainUrl)
-        val userAgent = view?.settings?.userAgentString
-            ?.takeIf { it.isNotBlank() }
-            ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
-
-        return ProofSession(
-            proof = proof,
-            cookie = cookie,
-            userAgent = userAgent,
-        )
     }
+
 }

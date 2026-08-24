@@ -1,0 +1,7 @@
+AfterDark v8 — isolated fix on top of v5
+
+- AfterDarkProvider.kt is byte-for-byte identical to v5.
+- Browser blocking behavior from v5 is unchanged.
+- None of the v6 loadLinks changes are included.
+- Only change: shouldInterceptRequest() no longer reads WebView settings.
+  UA is cached on the UI thread, and proof completion is posted to the UI Handler.
