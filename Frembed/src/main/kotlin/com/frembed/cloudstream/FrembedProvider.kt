@@ -455,7 +455,7 @@ class FrembedProvider : MainAPI() {
             ?.groupValues
             ?.getOrNull(1)
 
-    private fun emitDirect(
+    private suspend fun emitDirect(
         url: String,
         referer: String,
         callback: (ExtractorLink) -> Unit,
