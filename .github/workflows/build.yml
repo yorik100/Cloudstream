@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Setup JDK 17
@@ -39,38 +39,63 @@ jobs:
         with:
           gradle-version: "8.12"
 
-      - name: Build AfterDark
+      - name: Build extension and repository index
         run: |
-          gradle :AfterDark:make
-          gradle makePluginsJson
+          gradle :AfterDark:make makePluginsJson --stacktrace
 
-      - name: Prepare publication
+      - name: Prepare builds branch contents
+        shell: bash
         run: |
-          mkdir -p /tmp/afterdark-builds
-          cp AfterDark/build/*.cs3 /tmp/afterdark-builds/
-          cp build/plugins.json /tmp/afterdark-builds/plugins.json
-          cp repo.json /tmp/afterdark-builds/repo.json
+          set -euo pipefail
 
-          echo "=== Publication ==="
-          ls -lah /tmp/afterdark-builds
-          cat /tmp/afterdark-builds/plugins.json
+          rm -rf /tmp/afterdark-publish
+          mkdir -p /tmp/afterdark-publish
 
-      - name: Publish builds branch
+          # CloudStream extension package.
+          find AfterDark/build -maxdepth 1 -type f -name '*.cs3' \
+            -exec cp -v {} /tmp/afterdark-publish/ \;
+
+          # Some versions of the CloudStream Gradle plugin also expose the
+          # generated jar in plugins.json, so publish it when present.
+          find AfterDark/build -maxdepth 1 -type f -name '*.jar' \
+            -exec cp -v {} /tmp/afterdark-publish/ \;
+
+          cp -v build/plugins.json /tmp/afterdark-publish/plugins.json
+          cp -v repo.json /tmp/afterdark-publish/repo.json
+
+          test -n "$(find /tmp/afterdark-publish -maxdepth 1 -name '*.cs3' -print -quit)"
+          test -s /tmp/afterdark-publish/plugins.json
+          test -s /tmp/afterdark-publish/repo.json
+
+          echo "=== Files that will be published ==="
+          ls -lah /tmp/afterdark-publish
+
+          echo "=== plugins.json ==="
+          cat /tmp/afterdark-publish/plugins.json
+
+      - name: Publish to builds branch
+        shell: bash
         run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Build output has already been copied to /tmp, so make a clean
+          # orphan branch containing ONLY files CloudStream needs.
           git switch --orphan builds
-          git rm -rf . || true
+          git rm -rf . >/dev/null 2>&1 || true
+          git clean -fdx >/dev/null 2>&1 || true
 
-          cp -r /tmp/afterdark-builds/. .
+          cp -av /tmp/afterdark-publish/. .
 
-          git add .
-          git commit -m "Build AfterDark"
+          git add -A
+          git commit -m "Publish AfterDark ${GITHUB_SHA::7}"
           git push --force origin builds
 
-      - name: Upload CS3 artifact
+      - name: Upload CS3 as Actions artifact too
         uses: actions/upload-artifact@v4
         with:
           name: AfterDark
-          path: AfterDark/build/*.cs3
+          if-no-files-found: error
+          path: /tmp/afterdark-publish/*.cs3
