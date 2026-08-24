@@ -1,48 +1,43 @@
-# AfterDark CloudStream — rebuild v4
+# Yorik CloudStream — AfterDark + Frembed
 
-Projet CloudStream Android pour `https://afterdark06.mom`.
+Ce dépôt contient deux extensions CloudStream indépendantes :
 
-## Fonctionnement
+- **AfterDark** — version de travail actuelle, conservée sans modification.
+- **Frembed** — utilise les endpoints publics Frembed basés sur TMDB :
+  - film : `/api/film.php?id=<TMDB>`
+  - série : `/api/serie.php?id=<TMDB>&sa=<saison>&epi=<episode>`
 
-La récupération des sources suit le flux du frontend AfterDark observé :
+Le module Frembed ne génère aucun `x-nabi-proof`, n'utilise pas Turnstile et
+n'ouvre pas de WebView. Il suit les redirections de l'API, récupère les URLs
+de serveurs présentes dans la réponse/lecteur, délègue les hébergeurs connus
+aux extracteurs CloudStream, et sait également récupérer les liens directs
+HLS/DASH/MP4 trouvés dans les pages.
 
-1. le titre est identifié par `type` (`movie`/`tv`) et `tmdbId`;
-2. l'extension ouvre la page officielle `/watch/...` dans une WebView;
-3. l'utilisateur effectue la vérification Turnstile et les étapes normales du site;
-4. le frontend AfterDark obtient lui-même sa `proof`;
-5. l'extension observe le GET officiel vers `/api/sources` et mémorise le header
-   `x-nabi-proof`;
-6. elle rejoue ensuite le GET `/api/sources?...` avec `Accept:
-   application/x-ndjson`;
-7. chaque ligne NDJSON contenant `items` est parsée;
-8. les liens directs sont envoyés au lecteur CloudStream et les embeds sont
-   confiés à `loadExtractor()`.
+## Publication
 
-La proof n'est ni calculée, ni forgée, ni contournée par l'extension.
+Le workflow `.github/workflows/build.yml` compile les deux modules puis publie
+dans la branche `builds` :
 
-## Différences importantes avec les anciennes archives
+- `AfterDark.cs3`
+- `Frembed.cs3`
+- `plugins.json`
+- `repo.json`
 
-- Kotlin Gradle Plugin **2.4.0**, identique à la version actuellement utilisée
-  par CloudStream master/pre-release.
-- Gradle CI **8.12** et AGP **8.7.3**, combinaison supportée par Kotlin 2.4.0.
-- Plus de dépendance directe à `kotlinx.coroutines`.
-- Plus de dépendance Jackson/jsoup dans l'extension.
-- Le payload passé à `loadLinks()` est encodé explicitement; il ne dépend plus
-  de la sérialisation Jackson de CloudStream.
-- Parsing TMDB et NDJSON via `org.json`, fourni par Android.
-- La WebView n'essaie pas de fabriquer `x-nabi-proof`; elle observe uniquement
-  la requête officielle du site.
-- NiceHttp aligné sur la version actuelle de CloudStream (`0.4.18`).
+URL du dépôt CloudStream :
 
-## GitHub
+`https://raw.githubusercontent.com/yorik100/Cloudstream/builds/repo.json`
 
-Cette archive est déjà configurée pour :
+## Test Frembed conseillé
 
-`yorik100/Cloudstream`
+Film connu :
 
-Le workflow `.github/workflows/build.yml` compile uniquement `AfterDark` et
-publie le `.cs3` comme artifact GitHub Actions.
+- TMDB 533535 — Deadpool & Wolverine
 
-Pour tester : remplace le contenu de ton repo par le contenu de cette archive,
-commit/push, puis ouvre l'Action **Build AfterDark**. Aucune modification YAML
-manuelle n'est nécessaire.
+L'API Frembed redirige actuellement ce film vers une URL du type :
+
+`https://frembed.casa/embed/movie/533535?id=533535`
+
+Pour une série, l'extension utilise l'endpoint public `api/serie.php` avec
+TMDB + saison + épisode.
+
+Le scanner de lecteur est volontairement limité aux routes média/API/embed et aux hôtes tiers afin de ne pas crawler le site Frembed.

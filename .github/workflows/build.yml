@@ -1,4 +1,4 @@
-name: Build AfterDark
+name: Build & Publish CloudStream
 
 on:
   workflow_dispatch:
@@ -7,8 +7,11 @@ on:
       - main
       - master
 
+permissions:
+  contents: write
+
 concurrency:
-  group: afterdark-build
+  group: cloudstream-build
   cancel-in-progress: true
 
 jobs:
@@ -16,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
 
       - name: Setup JDK 17
@@ -36,12 +39,64 @@ jobs:
         with:
           gradle-version: "8.12"
 
-      - name: Build AfterDark
-        run: gradle :AfterDark:make --stacktrace
+      - name: Build AfterDark and Frembed
+        run: |
+          gradle :AfterDark:make :Frembed:make makePluginsJson --stacktrace
 
-      - name: Upload CS3
+      - name: Prepare builds branch contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/cloudstream-publish
+          mkdir -p /tmp/cloudstream-publish
+
+          find AfterDark/build Frembed/build -maxdepth 1 -type f -name '*.cs3' \
+            -exec cp -v {} /tmp/cloudstream-publish/ \;
+
+          find AfterDark/build Frembed/build -maxdepth 1 -type f -name '*.jar' \
+            -exec cp -v {} /tmp/cloudstream-publish/ \;
+
+          cp -v build/plugins.json /tmp/cloudstream-publish/plugins.json
+          cp -v repo.json /tmp/cloudstream-publish/repo.json
+
+          CS3_COUNT="$(find /tmp/cloudstream-publish -maxdepth 1 -type f -name '*.cs3' | wc -l)"
+          if [ "$CS3_COUNT" -lt 2 ]; then
+            echo "ERROR: expected at least 2 .cs3 files, found $CS3_COUNT"
+            find /tmp/cloudstream-publish -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          test -s /tmp/cloudstream-publish/plugins.json
+          test -s /tmp/cloudstream-publish/repo.json
+
+          echo "=== Files that will be published ==="
+          ls -lah /tmp/cloudstream-publish
+
+          echo "=== plugins.json ==="
+          cat /tmp/cloudstream-publish/plugins.json
+
+      - name: Publish to builds branch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch --orphan builds
+          git rm -rf . >/dev/null 2>&1 || true
+          git clean -fdx >/dev/null 2>&1 || true
+
+          cp -av /tmp/cloudstream-publish/. .
+
+          git add -A
+          git commit -m "Publish CloudStream ${GITHUB_SHA::7}"
+          git push --force origin builds
+
+      - name: Upload CS3 artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: AfterDark
+          name: CloudStream-Extensions
           if-no-files-found: error
-          path: AfterDark/build/*.cs3
+          path: /tmp/cloudstream-publish/*.cs3
