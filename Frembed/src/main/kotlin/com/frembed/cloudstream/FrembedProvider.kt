@@ -22,6 +22,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.extractorApis
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONArray
 import org.json.JSONObject
@@ -329,6 +330,7 @@ class FrembedProvider : MainAPI() {
 
     private data class FrembedServer(
         val label: String,
+        val slug: String,
         val lang: String,
         val url: String,
     )
@@ -367,8 +369,12 @@ class FrembedProvider : MainAPI() {
                 ?.uppercase()
                 ?: "VF"
 
+            val slug = host?.stringOrNull("slug")
+                ?: label.lowercase()
+
             result[absoluteUrl] = FrembedServer(
                 label = label,
+                slug = slug,
                 lang = lang,
                 url = absoluteUrl,
             )
@@ -390,6 +396,7 @@ class FrembedProvider : MainAPI() {
 
                     result[absoluteUrl] = FrembedServer(
                         label = "Serveur $serverIndex",
+                        slug = "",
                         lang = lang,
                         url = absoluteUrl,
                     )
@@ -610,9 +617,19 @@ class FrembedProvider : MainAPI() {
         // does NOT forward the Frembed film page as Referer to that host.
         if (emitDirect(target, "", callback)) return true
 
-        // Let each CloudStream host extractor establish its own host-side
-        // Referer/Origin for the final media request (for example uqload.vc/).
-        // Passing the Frembed page here breaks hosts that enforce Referer.
+        // Frembed gives us the host slug in links[] (uqload/voe/dood/...).
+        // Dispatch by that host name first, bypassing CloudStream's domain-based
+        // selector which can miss current mirror domains.
+        if (
+            tryNamedHostExtractors(
+                server = server,
+                url = target,
+                subtitleCallback = subtitleCallback,
+                callback = callback,
+            )
+        ) return true
+
+        // Unknown/new hosts still get CloudStream's normal domain-based fallback.
         return tryCloudStreamExtractor(
             url = target,
             referer = null,
@@ -654,6 +671,56 @@ class FrembedProvider : MainAPI() {
         return "frembed test-video" in value ||
             "frembed test video" in value ||
             "test-video" in value
+    }
+
+    private fun normalizeExtractorName(value: String): String =
+        value.lowercase().filter { it.isLetterOrDigit() }
+
+    private suspend fun tryNamedHostExtractors(
+        server: FrembedServer,
+        url: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val hostKey = normalizeExtractorName(server.slug)
+            .ifBlank { normalizeExtractorName(server.label) }
+
+        if (hostKey.isBlank()) return false
+
+        // CloudStream's normal loadExtractor() first matches by extractor.mainUrl.
+        // Frembed already tells us the actual host (uqload/voe/dood/...), so call
+        // matching extractors directly and bypass stale/missing domain aliases.
+        for (index in extractorApis.lastIndex downTo 0) {
+            val extractor = extractorApis[index]
+            val extractorKey = normalizeExtractorName(extractor.name)
+
+            val matchesHost =
+                extractorKey == hostKey ||
+                    extractorKey.contains(hostKey) ||
+                    hostKey.contains(extractorKey)
+
+            if (!matchesHost) continue
+
+            var emitted = false
+
+            runCatching {
+                extractor.getUrl(
+                    url = url,
+                    referer = null,
+                    subtitleCallback = subtitleCallback,
+                    callback = { link ->
+                        if (!isFrembedTestVideo(link)) {
+                            emitted = true
+                            callback(link)
+                        }
+                    },
+                )
+            }
+
+            if (emitted) return true
+        }
+
+        return false
     }
 
     private suspend fun tryCloudStreamExtractor(
