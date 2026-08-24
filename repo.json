@@ -1,0 +1,8 @@
+{
+  "name": "AfterDark CloudStream",
+  "description": "Extension AfterDark pour CloudStream",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/plugins.json"
+  ]
+}

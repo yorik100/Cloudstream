@@ -1,0 +1,22 @@
+AfterDark CloudStream v4 - validation locale
+
+1. Le code Kotlin de l'extension a été compilé avec kotlinc contre des stubs
+   reproduisant les signatures CloudStream/Android utilisées par le projet.
+   Résultat : PASS (aucune erreur de compilation).
+
+2. Test aller-retour PlaybackRequest.encode()/decode() :
+   Résultat : PASS.
+
+3. Vérifications de configuration :
+   - Kotlin Gradle Plugin : 2.4.0
+   - CloudStream stubs : com.lagradost:cloudstream3:pre-release
+   - NiceHttp : 0.4.18
+   - AGP : 8.7.3
+   - Gradle CI : 8.12
+   - aucune dépendance kotlinx.coroutines dans le code
+   - aucune dépendance Jackson/jsoup dans l'extension
+   - aucun hébergeur Taekong codé en dur
+
+Note : l'environnement de génération n'a pas accès à Maven/Google depuis le
+shell, donc le build Android Gradle réel ne peut pas être exécuté localement.
+Le workflow GitHub Actions inclus exécute ce build réel.
