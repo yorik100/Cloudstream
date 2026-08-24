@@ -54,6 +54,28 @@ class FrembedProvider : MainAPI() {
         "Accept-Language" to "fr-FR,fr;q=0.9,en;q=0.7",
     )
 
+    // Exact request shape observed when Frembed successfully opens /api/stream
+    // inside its player iframe. Do not add browser cookies here: they are
+    // session-specific and must never be hard-coded in the extension.
+    private val streamNavigationHeaders = mapOf(
+        "User-Agent" to (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/151.0.0.0 Safari/537.36"
+            ),
+        "Accept" to (
+            "text/html,application/xhtml+xml,application/xml;q=0.9," +
+                "image/avif,image/webp,image/apng,*/*;q=0.8," +
+                "application/signed-exchange;v=b3;q=0.7"
+            ),
+        "Accept-Language" to "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7,ja;q=0.6",
+        "Sec-Fetch-Dest" to "iframe",
+        "Sec-Fetch-Mode" to "navigate",
+        "Sec-Fetch-Site" to "same-origin",
+        "Sec-Fetch-User" to "?1",
+        "Upgrade-Insecure-Requests" to "1",
+    )
+
     override val mainPage = mainPageOf(
         "movie" to "Films populaires",
         "tv" to "Séries populaires",
@@ -290,6 +312,9 @@ class FrembedProvider : MainAPI() {
         }
     }
 
+    private fun moviePageUrl(tmdbId: Int): String =
+        "$mainUrl/films?id=$tmdbId"
+
     private fun movieInfoUrl(tmdbId: Int): String =
         "$mainUrl/api/films?id=$tmdbId&idType=tmdb"
 
@@ -313,7 +338,7 @@ class FrembedProvider : MainAPI() {
             app.get(
                 url = movieInfoUrl(tmdbId),
                 headers = browserHeaders,
-                referer = "$mainUrl/films?id=$tmdbId",
+                referer = moviePageUrl(tmdbId),
                 cacheTime = 0,
             )
         }.getOrNull() ?: return emptyList()
@@ -530,11 +555,26 @@ class FrembedProvider : MainAPI() {
         serverUrl: String,
         tmdbId: Int,
     ): String? {
+        val filmPage = moviePageUrl(tmdbId)
+
+        // Prime the Frembed session first. In a browser this page is loaded
+        // before the iframe navigation and may establish harmless session
+        // cookies used by Next/Frembed. The shared CloudStream HTTP client can
+        // retain any cookies set by the site; none are hard-coded.
+        runCatching {
+            app.get(
+                url = filmPage,
+                headers = browserHeaders,
+                referer = "$mainUrl/",
+                cacheTime = 0,
+            )
+        }
+
         val response = runCatching {
             app.get(
                 url = serverUrl,
-                headers = browserHeaders,
-                referer = "$mainUrl/films?id=$tmdbId",
+                headers = streamNavigationHeaders,
+                referer = filmPage,
                 allowRedirects = false,
                 cacheTime = 0,
             )
@@ -555,7 +595,8 @@ class FrembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         // Current Frembed movie flow:
-        // /api/stream?... -> HTTP 302 -> actual host embed (Voe/Dood/Uqload/...)
+        // film page -> iframe /api/stream?... -> HTTP 302 -> host embed.
+        val filmPage = moviePageUrl(tmdbId)
         val target = resolveMovieServerRedirect(server.url, tmdbId)
             ?: return false
 
@@ -564,14 +605,14 @@ class FrembedProvider : MainAPI() {
             return true
         }
 
-        if (emitDirect(target, server.url, callback)) return true
+        if (emitDirect(target, filmPage, callback)) return true
 
-        // Do not HTML-crawl the external host here. Its official CloudStream
-        // extractor is the authoritative parser. Crawling player HTML can pick
-        // placeholder/test media instead of the actual stream.
+        // The redirect target is loaded as an iframe originating from the film
+        // page, so use the film page as referer rather than the /api/stream URL.
+        // Do not HTML-crawl the host: leave parsing to CloudStream's extractor.
         return tryCloudStreamExtractor(
             url = target,
-            referer = server.url,
+            referer = filmPage,
             subtitleCallback = subtitleCallback,
             callback = callback,
         )
