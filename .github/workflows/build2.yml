@@ -1,0 +1,76 @@
+name: Build & Publish AfterDark
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+concurrency:
+  group: afterdark-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Setup Gradle 8.12
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.12"
+
+      - name: Build AfterDark
+        run: |
+          gradle :AfterDark:make
+          gradle makePluginsJson
+
+      - name: Prepare publication
+        run: |
+          mkdir -p /tmp/afterdark-builds
+          cp AfterDark/build/*.cs3 /tmp/afterdark-builds/
+          cp build/plugins.json /tmp/afterdark-builds/plugins.json
+          cp repo.json /tmp/afterdark-builds/repo.json
+
+          echo "=== Publication ==="
+          ls -lah /tmp/afterdark-builds
+          cat /tmp/afterdark-builds/plugins.json
+
+      - name: Publish builds branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch --orphan builds
+          git rm -rf . || true
+
+          cp -r /tmp/afterdark-builds/. .
+
+          git add .
+          git commit -m "Build AfterDark"
+          git push --force origin builds
+
+      - name: Upload CS3 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AfterDark
+          path: AfterDark/build/*.cs3
