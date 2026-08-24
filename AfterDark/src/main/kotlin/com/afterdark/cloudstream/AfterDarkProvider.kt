@@ -320,7 +320,7 @@ class AfterDarkProvider : MainAPI() {
                 ?: return@forEach
 
             val items = groupNode.get("items")
-            if (items == null || !items.isArray || items.isEmpty) return@forEach
+            if (items == null || !items.isArray || items.size() == 0) return@forEach
 
             val group = groupNode.get("provider")?.asText()?.takeIf(String::isNotBlank)
                 ?: groupNode.get("id")?.asText()?.takeIf(String::isNotBlank)

@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.app.Dialog
 import android.graphics.Color
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -16,10 +18,9 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 object AfterDarkProofWebView {
     private const val PROOF_HEADER = "x-nabi-proof"
@@ -29,16 +30,39 @@ object AfterDarkProofWebView {
     suspend fun acquire(
         request: PlaybackRequest,
         mainUrl: String,
-    ): ProofSession? {
-        val deferred = CompletableDeferred<ProofSession?>()
+    ): ProofSession? = suspendCoroutine { continuation ->
+        val finished = AtomicBoolean(false)
+        val mainHandler = Handler(Looper.getMainLooper())
+
         var dialog: Dialog? = null
         var webView: WebView? = null
 
-        withContext(Dispatchers.Main) {
+        fun cleanup() {
+            mainHandler.post {
+                runCatching { dialog?.dismiss() }
+                runCatching {
+                    webView?.stopLoading()
+                    webView?.loadUrl("about:blank")
+                    webView?.removeAllViews()
+                    webView?.destroy()
+                }
+                webView = null
+                dialog = null
+            }
+        }
+
+        fun finish(result: ProofSession?) {
+            if (!finished.compareAndSet(false, true)) return
+            mainHandler.removeCallbacksAndMessages(null)
+            cleanup()
+            continuation.resume(result)
+        }
+
+        mainHandler.post {
             val activity = AfterDarkRuntime.currentActivity()
             if (activity == null || activity.isFinishing) {
-                deferred.complete(null)
-                return@withContext
+                finish(null)
+                return@post
             }
 
             val targetHost = Uri.parse(mainUrl).host
@@ -54,7 +78,7 @@ object AfterDarkProofWebView {
                     append("AfterDark — vérification officielle\n")
                     append("Effectue la vérification affichée par AfterDark. ")
                     append("Si le site demande ses étapes habituelles avant lecture, termine-les aussi. ")
-                    append("Cette fenêtre se fermera automatiquement dès que la preuve de lecture aura été émise.")
+                    append("Cette fenêtre se fermera automatiquement dès que la preuve de lecture sera détectée.")
                 }
                 setTextColor(Color.WHITE)
                 textSize = 15f
@@ -64,10 +88,7 @@ object AfterDarkProofWebView {
 
             val cancel = Button(activity).apply {
                 text = "Annuler"
-                setOnClickListener {
-                    if (!deferred.isCompleted) deferred.complete(null)
-                    dialog?.dismiss()
-                }
+                setOnClickListener { finish(null) }
             }
 
             val controls = LinearLayout(activity).apply {
@@ -83,7 +104,7 @@ object AfterDarkProofWebView {
                 )
             }
 
-            webView = WebView(activity).apply {
+            webView = WebView(activity).apply webViewApply@ {
                 setBackgroundColor(Color.BLACK)
 
                 settings.javaScriptEnabled = true
@@ -95,9 +116,10 @@ object AfterDarkProofWebView {
                 settings.setSupportMultipleWindows(false)
                 settings.cacheMode = WebSettings.LOAD_DEFAULT
 
-                val cookies = CookieManager.getInstance()
-                cookies.setAcceptCookie(true)
-                cookies.setAcceptThirdPartyCookies(this, true)
+                CookieManager.getInstance().apply {
+                    setAcceptCookie(true)
+                    setAcceptThirdPartyCookies(this@webViewApply, true)
+                }
 
                 webChromeClient = WebChromeClient()
 
@@ -106,19 +128,16 @@ object AfterDarkProofWebView {
                         view: WebView?,
                         resourceRequest: WebResourceRequest?
                     ): WebResourceResponse? {
-                        captureIfProofRequest(
+                        val proof = extractProof(
                             view = view,
                             webRequest = resourceRequest,
                             playbackRequest = request,
                             targetHost = targetHost,
                             mainUrl = mainUrl,
-                            deferred = deferred,
-                            onCaptured = {
-                                activity.runOnUiThread {
-                                    dialog?.dismiss()
-                                }
-                            }
                         )
+                        if (proof != null) {
+                            finish(proof)
+                        }
                         return super.shouldInterceptRequest(view, resourceRequest)
                     }
                 }
@@ -147,63 +166,51 @@ object AfterDarkProofWebView {
                 )
             )
 
-            dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+            dialog = Dialog(
+                activity,
+                android.R.style.Theme_Black_NoTitleBar_Fullscreen
+            ).apply {
                 setContentView(root)
                 setCancelable(true)
-                setOnCancelListener {
-                    if (!deferred.isCompleted) deferred.complete(null)
-                }
+                setOnCancelListener { finish(null) }
                 setOnDismissListener {
-                    if (!deferred.isCompleted) deferred.complete(null)
+                    if (!finished.get()) finish(null)
                 }
                 show()
             }
 
             webView?.loadUrl(watchUrl)
-        }
 
-        val result = withTimeoutOrNull(TIMEOUT_MS) {
-            deferred.await()
+            mainHandler.postDelayed(
+                { finish(null) },
+                TIMEOUT_MS
+            )
         }
-
-        withContext(Dispatchers.Main) {
-            runCatching { dialog?.dismiss() }
-            runCatching {
-                webView?.stopLoading()
-                webView?.loadUrl("about:blank")
-                webView?.removeAllViews()
-                webView?.destroy()
-            }
-        }
-
-        return result
     }
 
-    private fun captureIfProofRequest(
+    private fun extractProof(
         view: WebView?,
         webRequest: WebResourceRequest?,
         playbackRequest: PlaybackRequest,
         targetHost: String?,
         mainUrl: String,
-        deferred: CompletableDeferred<ProofSession?>,
-        onCaptured: () -> Unit,
-    ) {
-        if (webRequest == null || deferred.isCompleted) return
-        if (!webRequest.method.equals("GET", ignoreCase = true)) return
+    ): ProofSession? {
+        if (webRequest == null) return null
+        if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
-        val uri = webRequest.url ?: return
-        if (!uri.host.equals(targetHost, ignoreCase = true)) return
-        if (uri.path != "/api/sources") return
+        val uri = webRequest.url ?: return null
+        if (!uri.host.equals(targetHost, ignoreCase = true)) return null
+        if (uri.path != "/api/sources") return null
 
-        if (uri.getQueryParameter("tmdbId") != playbackRequest.tmdbId.toString()) return
-        if (uri.getQueryParameter("type") != playbackRequest.type) return
+        if (uri.getQueryParameter("tmdbId") != playbackRequest.tmdbId.toString()) return null
+        if (uri.getQueryParameter("type") != playbackRequest.type) return null
 
         if (playbackRequest.type == "tv") {
             playbackRequest.season?.let {
-                if (uri.getQueryParameter("season") != it.toString()) return
+                if (uri.getQueryParameter("season") != it.toString()) return null
             }
             playbackRequest.episode?.let {
-                if (uri.getQueryParameter("episode") != it.toString()) return
+                if (uri.getQueryParameter("episode") != it.toString()) return null
             }
         }
 
@@ -211,7 +218,7 @@ object AfterDarkProofWebView {
             .firstOrNull { it.key.equals(PROOF_HEADER, ignoreCase = true) }
             ?.value
             ?.takeIf { it.isNotBlank() }
-            ?: return
+            ?: return null
 
         val cookie = CookieManager.getInstance().getCookie(mainUrl)
         val userAgent = view?.settings?.userAgentString
@@ -219,8 +226,10 @@ object AfterDarkProofWebView {
             ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
 
-        if (deferred.complete(ProofSession(proof, cookie, userAgent))) {
-            onCaptured()
-        }
+        return ProofSession(
+            proof = proof,
+            cookie = cookie,
+            userAgent = userAgent,
+        )
     }
 }
