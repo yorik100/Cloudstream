@@ -526,6 +526,57 @@ class FrembedProvider : MainAPI() {
     ): String? =
         location?.let { resolveUrl(requestUrl, it) }
 
+    private suspend fun resolveMovieServerRedirect(
+        serverUrl: String,
+        tmdbId: Int,
+    ): String? {
+        val response = runCatching {
+            app.get(
+                url = serverUrl,
+                headers = browserHeaders,
+                referer = "$mainUrl/films?id=$tmdbId",
+                allowRedirects = false,
+                cacheTime = 0,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 300..399) return null
+
+        return resolveLocation(
+            requestUrl = serverUrl,
+            location = response.headers["Location"],
+        )
+    }
+
+    private suspend fun emitMovieServer(
+        server: FrembedServer,
+        tmdbId: Int,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        // Current Frembed movie flow:
+        // /api/stream?... -> HTTP 302 -> actual host embed (Voe/Dood/Uqload/...)
+        val target = resolveMovieServerRedirect(server.url, tmdbId)
+            ?: return false
+
+        if (isSubtitle(target)) {
+            subtitleCallback(newSubtitleFile("${server.lang} · ${server.label}", target))
+            return true
+        }
+
+        if (emitDirect(target, server.url, callback)) return true
+
+        // Do not HTML-crawl the external host here. Its official CloudStream
+        // extractor is the authoritative parser. Crawling player HTML can pick
+        // placeholder/test media instead of the actual stream.
+        return tryCloudStreamExtractor(
+            url = target,
+            referer = server.url,
+            subtitleCallback = subtitleCallback,
+            callback = callback,
+        )
+    }
+
     private fun qualityName(url: String): String? =
         Regex("""(?i)(2160|1440|1080|720|480|360)p?""")
             .find(url)
@@ -554,20 +605,39 @@ class FrembedProvider : MainAPI() {
         return true
     }
 
+    private fun isFrembedTestVideo(link: ExtractorLink): Boolean {
+        val value = "${link.source} ${link.name} ${link.url}".lowercase()
+        return "frembed test-video" in value ||
+            "frembed test video" in value ||
+            "test-video" in value
+    }
+
     private suspend fun tryCloudStreamExtractor(
         url: String,
         referer: String,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
-    ): Boolean =
+    ): Boolean {
+        var emitted = false
+
         runCatching {
             loadExtractor(
                 url = url,
                 referer = referer,
                 subtitleCallback = subtitleCallback,
-                callback = callback,
+                callback = { link ->
+                    // Some player pages expose a short placeholder/test asset.
+                    // Never forward that asset to CloudStream as a real source.
+                    if (!isFrembedTestVideo(link)) {
+                        emitted = true
+                        callback(link)
+                    }
+                },
             )
-        }.getOrDefault(false)
+        }
+
+        return emitted
+    }
 
     private suspend fun probeUrl(
         url: String,
@@ -741,13 +811,9 @@ class FrembedProvider : MainAPI() {
             var found = false
 
             for (server in servers) {
-                val visited = LinkedHashSet<String>()
-
-                val emitted = probeUrl(
-                    url = server.url,
-                    referer = "$mainUrl/films?id=${request.tmdbId}",
-                    depth = 0,
-                    visited = visited,
+                val emitted = emitMovieServer(
+                    server = server,
+                    tmdbId = request.tmdbId,
                     subtitleCallback = subtitleCallback,
                     callback = callback,
                 )
