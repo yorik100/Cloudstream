@@ -290,13 +290,90 @@ class FrembedProvider : MainAPI() {
         }
     }
 
-    private fun apiUrl(request: FrembedPlaybackRequest): String =
-        if (request.type == "movie") {
-            "$mainUrl/api/film.php?id=${request.tmdbId}"
-        } else {
-            "$mainUrl/api/serie.php?id=${request.tmdbId}" +
-                "&sa=${request.season}&epi=${request.episode}"
+    private fun movieInfoUrl(tmdbId: Int): String =
+        "$mainUrl/api/films?id=$tmdbId&idType=tmdb"
+
+    // Series endpoint still needs to be mapped from the current Frembed API.
+    // Keep the old route only as a fallback until we capture a modern series request.
+    private fun legacySeriesApiUrl(request: FrembedPlaybackRequest): String =
+        "$mainUrl/api/serie.php?id=${request.tmdbId}" +
+            "&sa=${request.season}&epi=${request.episode}"
+
+    private fun streamUrl(rawUrl: String): String? =
+        resolveUrl("$mainUrl/", rawUrl)
+
+    private data class FrembedServer(
+        val label: String,
+        val lang: String,
+        val url: String,
+    )
+
+    private suspend fun fetchMovieServers(tmdbId: Int): List<FrembedServer> {
+        val response = runCatching {
+            app.get(
+                url = movieInfoUrl(tmdbId),
+                headers = browserHeaders,
+                referer = "$mainUrl/films?id=$tmdbId",
+                cacheTime = 0,
+            )
+        }.getOrNull() ?: return emptyList()
+
+        if (response.okhttpResponse.code !in 200..299) return emptyList()
+
+        val root = runCatching { JSONObject(response.text) }.getOrNull()
+            ?: return emptyList()
+
+        val result = LinkedHashMap<String, FrembedServer>()
+
+        // Current Frembed API: links[] is the authoritative server list.
+        val links = root.optJSONArray("links") ?: JSONArray()
+        for (index in 0 until links.length()) {
+            val item = links.optJSONObject(index) ?: continue
+            val rawUrl = item.stringOrNull("url") ?: continue
+            val absoluteUrl = streamUrl(rawUrl) ?: continue
+
+            val host = item.optJSONObject("host")
+            val label = item.stringOrNull("label")
+                ?: host?.stringOrNull("name")
+                ?: host?.stringOrNull("slug")
+                ?: "Serveur ${index + 1}"
+
+            val lang = item.stringOrNull("lang")
+                ?.uppercase()
+                ?: "VF"
+
+            result[absoluteUrl] = FrembedServer(
+                label = label,
+                lang = lang,
+                url = absoluteUrl,
+            )
         }
+
+        // Compatibility fallback for API responses that only expose link1/link2...
+        if (result.isEmpty()) {
+            val suffixes = listOf(
+                "" to "VF",
+                "vostfr" to "VOSTFR",
+                "vo" to "VO",
+            )
+
+            for ((suffix, lang) in suffixes) {
+                for (serverIndex in 1..7) {
+                    val key = "link$serverIndex$suffix"
+                    val rawUrl = root.stringOrNull(key) ?: continue
+                    val absoluteUrl = streamUrl(rawUrl) ?: continue
+
+                    result[absoluteUrl] = FrembedServer(
+                        label = "Serveur $serverIndex",
+                        lang = lang,
+                        url = absoluteUrl,
+                    )
+                }
+            }
+        }
+
+        return result.values.toList()
+    }
 
     private fun normalizeEscapes(value: String): String =
         value
@@ -657,10 +734,36 @@ class FrembedProvider : MainAPI() {
         val request = FrembedPlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données Frembed invalides")
 
+        if (request.type == "movie") {
+            val servers = fetchMovieServers(request.tmdbId)
+            if (servers.isEmpty()) return false
+
+            var found = false
+
+            for (server in servers) {
+                val visited = LinkedHashSet<String>()
+
+                val emitted = probeUrl(
+                    url = server.url,
+                    referer = "$mainUrl/films?id=${request.tmdbId}",
+                    depth = 0,
+                    visited = visited,
+                    subtitleCallback = subtitleCallback,
+                    callback = callback,
+                )
+
+                found = emitted || found
+            }
+
+            return found
+        }
+
+        // Temporary fallback for TV episodes until the current series API
+        // request is captured from Frembed.
         val visited = LinkedHashSet<String>()
 
         return probeUrl(
-            url = apiUrl(request),
+            url = legacySeriesApiUrl(request),
             referer = "$mainUrl/",
             depth = 0,
             visited = visited,
