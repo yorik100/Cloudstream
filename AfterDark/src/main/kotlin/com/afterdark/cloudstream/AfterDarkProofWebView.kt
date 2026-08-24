@@ -2,7 +2,6 @@ package com.afterdark.cloudstream
 
 import android.annotation.SuppressLint
 import android.app.Dialog
-import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Handler
@@ -63,7 +62,8 @@ object AfterDarkProofWebView {
         timeoutRunnable = Runnable { finish(null) }
 
         handler.post {
-            val activity = AfterDarkRuntime.currentActivity()
+            try {
+                val activity = AfterDarkRuntime.currentActivity()
             if (activity == null || activity.isFinishing) {
                 finish(null)
                 return@post
@@ -137,23 +137,80 @@ object AfterDarkProofWebView {
                 ): Boolean {
                     if (resultMsg == null) return false
 
+                    /*
+                     * AfterDark's verification can use target=_blank/window.open.
+                     * Never dispatch those URLs to Android ACTION_VIEW:
+                     * - third-party popups are consumed without opening another app;
+                     * - same-host AfterDark popups are redirected into this WebView.
+                     *
+                     * We do not fabricate a proof. The extension still waits until
+                     * AfterDark itself emits x-nabi-proof on /api/sources.
+                     */
                     val popup = WebView(activity)
-                    popup.settings.javaScriptEnabled = true
+                    popup.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        javaScriptCanOpenWindowsAutomatically = true
+                        setSupportMultipleWindows(false)
+                    }
+
+                    CookieManager.getInstance().apply {
+                        setAcceptCookie(true)
+                        setAcceptThirdPartyCookies(popup, true)
+                    }
+
                     popup.webViewClient = object : WebViewClient() {
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?,
                         ): Boolean {
-                            val uri = request?.url ?: return false
-                            runCatching {
-                                activity.startActivity(Intent(Intent.ACTION_VIEW, uri))
+                            val uri = request?.url ?: return true
+                            val scheme = uri.scheme?.lowercase()
+
+                            // Same-host navigation stays inside the verification WebView.
+                            if (
+                                (scheme == "http" || scheme == "https") &&
+                                uri.host.equals(targetHost, ignoreCase = true)
+                            ) {
+                                browser.post {
+                                    if (!finished.get()) {
+                                        browser.loadUrl(uri.toString())
+                                    }
+                                }
                             }
-                            view?.destroy()
+
+                            // Any external popup is swallowed. No browser/app is launched.
+                            view?.post {
+                                runCatching { view.stopLoading() }
+                                runCatching { view.loadUrl("about:blank") }
+                                runCatching { view.destroy() }
+                            }
                             return true
+                        }
+
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            webRequest: WebResourceRequest?,
+                        ): WebResourceResponse? {
+                            val session = captureProof(
+                                view = view,
+                                webRequest = webRequest,
+                                playbackRequest = request,
+                                targetHost = targetHost,
+                                mainUrl = mainUrl,
+                            )
+                            if (session != null) {
+                                finish(session)
+                            }
+                            return super.shouldInterceptRequest(view, webRequest)
                         }
                     }
 
-                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: return false
+                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
+                        runCatching { popup.destroy() }
+                        return false
+                    }
                     transport.webView = popup
                     resultMsg.sendToTarget()
                     return true
@@ -161,6 +218,28 @@ object AfterDarkProofWebView {
             }
 
             browser.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    view: WebView?,
+                    webRequest: WebResourceRequest?,
+                ): Boolean {
+                    val uri = webRequest?.url ?: return true
+
+                    // Subframes (including Turnstile) continue to work normally.
+                    if (!webRequest.isForMainFrame) return false
+
+                    val scheme = uri.scheme?.lowercase()
+                    if (
+                        (scheme == "http" || scheme == "https") &&
+                        uri.host.equals(targetHost, ignoreCase = true)
+                    ) {
+                        return false
+                    }
+
+                    // Block top-level navigation away from AfterDark.
+                    // This prevents intent:// and external-browser handoff paths.
+                    return true
+                }
+
                 override fun shouldInterceptRequest(
                     view: WebView?,
                     webRequest: WebResourceRequest?,
@@ -214,8 +293,12 @@ object AfterDarkProofWebView {
                 show()
             }
 
-            browser.loadUrl(watchUrl)
-            handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
+                browser.loadUrl(watchUrl)
+                handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
+            } catch (_: Exception) {
+                // A broken/missing WebView component must not crash CloudStream.
+                finish(null)
+            }
         }
     }
 

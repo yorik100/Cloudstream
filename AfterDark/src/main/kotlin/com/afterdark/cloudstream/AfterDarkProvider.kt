@@ -339,7 +339,12 @@ class AfterDarkProvider : MainAPI() {
     private suspend fun obtainSession(request: PlaybackRequest): ProofSession? {
         proofCache[request.titleKey]?.let { return it }
 
-        val session = AfterDarkProofWebView.acquire(request, mainUrl) ?: return null
+        val session = try {
+            AfterDarkProofWebView.acquire(request, mainUrl)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+
         proofCache[request.titleKey] = session
         return session
     }
