@@ -1,6 +1,7 @@
 package com.afterdark.cloudstream
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -30,6 +31,7 @@ class AfterDarkProvider : MainAPI() {
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
 
     private val proofCache = ConcurrentHashMap<String, ProofSession>()
+    private val jsonMapper = jacksonObjectMapper()
 
     override val mainPage = mainPageOf(
         "movie" to "Films populaires",
@@ -316,7 +318,7 @@ class AfterDarkProvider : MainAPI() {
             val line = rawLine.trim()
             if (line.isBlank()) return@forEach
 
-            val groupNode = runCatching { mapper.readTree(line) }.getOrNull()
+            val groupNode = runCatching { jsonMapper.readTree(line) }.getOrNull()
                 ?: return@forEach
 
             val items = groupNode.get("items")
@@ -409,7 +411,7 @@ class AfterDarkProvider : MainAPI() {
         for (source in sources) {
             source.subtitles.forEach { sub ->
                 subtitleCallback(
-                    newSubtitleFile(sub.language, sub.url)
+                    SubtitleFile(sub.language, sub.url)
                 )
             }
 

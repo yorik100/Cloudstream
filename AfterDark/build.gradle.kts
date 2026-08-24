@@ -1,4 +1,4 @@
-version = 3
+version = 4
 
 cloudstream {
     description = "AfterDark - sources via l'API officielle du site après vérification interactive"

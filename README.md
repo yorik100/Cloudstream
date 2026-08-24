@@ -1,4 +1,4 @@
-# AfterDark CloudStream v2
+# AfterDark CloudStream v3
 
 Extension expérimentale CloudStream pour `https://afterdark06.mom`.
 
@@ -89,3 +89,11 @@ Cette extension ne contourne ni ne forge la vérification Turnstile.
 - dépendance officielle `cloudstream("com.lagradost:cloudstream3:pre-release")` ;
 - suppression de la dépendance directe à `kotlinx.coroutines` dans la WebView ;
 - dépôt configuré pour `yorik100/Cloudstream`.
+
+## Correctif v3
+
+- Kotlin Gradle Plugin passe à `2.4.10` afin de lire le `cloudstream.jar`
+  actuel, dont les métadonnées Kotlin sont en `2.4.0`.
+- `mapper` est remplacé par un `jacksonObjectMapper()` local.
+- `newSubtitleFile(...)` est remplacé par `SubtitleFile(...)`, compatible
+  avec l'API CloudStream actuelle.
