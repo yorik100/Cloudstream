@@ -43,9 +43,6 @@ object AfterDarkProofWebView {
             if (!finished.compareAndSet(false, true)) return
 
             handler.removeCallbacks(timeoutRunnable)
-
-            // All WebView/Dialog operations and the continuation resume happen
-            // on the main thread. shouldInterceptRequest() itself is a worker-thread callback.
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
                 runCatching { dialog?.dismiss() }
@@ -57,9 +54,9 @@ object AfterDarkProofWebView {
                 }
                 dialog = null
                 webView = null
-
-                continuation.resume(result)
             }
+
+            continuation.resume(result)
         }
 
         timeoutRunnable = Runnable { finish(null) }
@@ -131,34 +128,6 @@ object AfterDarkProofWebView {
                 setAcceptThirdPartyCookies(browser, true)
             }
 
-            // Read WebSettings only here, on the UI thread.
-            val browserUserAgent = runCatching {
-                browser.settings.userAgentString
-            }.getOrNull()
-                ?.takeIf { it.isNotBlank() }
-                ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
-                    "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
-
-            fun finishWithProof(proof: String) {
-                // shouldInterceptRequest() runs on a worker thread. Hop back to
-                // the main thread before touching CookieManager/WebView state.
-                handler.postDelayed({
-                    if (finished.get()) return@postDelayed
-
-                    val cookie = runCatching {
-                        CookieManager.getInstance().getCookie(mainUrl)
-                    }.getOrNull()
-
-                    finish(
-                        ProofSession(
-                            proof = proof,
-                            cookie = cookie,
-                            userAgent = browserUserAgent,
-                        ),
-                    )
-                }, 150L)
-            }
-
             browser.webChromeClient = object : WebChromeClient() {
                 override fun onCreateWindow(
                     view: WebView?,
@@ -224,13 +193,15 @@ object AfterDarkProofWebView {
                             view: WebView?,
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
-                            val proof = captureProofHeader(
+                            val session = captureProof(
+                                view = view,
                                 webRequest = webRequest,
                                 playbackRequest = request,
                                 targetHost = targetHost,
+                                mainUrl = mainUrl,
                             )
-                            if (proof != null) {
-                                finishWithProof(proof)
+                            if (session != null) {
+                                finish(session)
                             }
                             return super.shouldInterceptRequest(view, webRequest)
                         }
@@ -273,14 +244,16 @@ object AfterDarkProofWebView {
                     view: WebView?,
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
-                    val proof = captureProofHeader(
+                    val session = captureProof(
+                        view = view,
                         webRequest = webRequest,
                         playbackRequest = request,
                         targetHost = targetHost,
+                        mainUrl = mainUrl,
                     )
 
-                    if (proof != null) {
-                        finishWithProof(proof)
+                    if (session != null) {
+                        finish(session)
                     }
 
                     return super.shouldInterceptRequest(view, webRequest)
@@ -329,11 +302,13 @@ object AfterDarkProofWebView {
         }
     }
 
-    private fun captureProofHeader(
+    private fun captureProof(
+        view: WebView?,
         webRequest: WebResourceRequest?,
         playbackRequest: PlaybackRequest,
         targetHost: String?,
-    ): String? {
+        mainUrl: String,
+    ): ProofSession? {
         if (webRequest == null) return null
         if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
@@ -352,9 +327,22 @@ object AfterDarkProofWebView {
             }
         }
 
-        return webRequest.requestHeaders.entries
+        val proof = webRequest.requestHeaders.entries
             .firstOrNull { (key, _) -> key.equals(PROOF_HEADER, ignoreCase = true) }
             ?.value
             ?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        val cookie = CookieManager.getInstance().getCookie(mainUrl)
+        val userAgent = view?.settings?.userAgentString
+            ?.takeIf { it.isNotBlank() }
+            ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+
+        return ProofSession(
+            proof = proof,
+            cookie = cookie,
+            userAgent = userAgent,
+        )
     }
 }
