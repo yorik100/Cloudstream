@@ -605,14 +605,17 @@ class FrembedProvider : MainAPI() {
             return true
         }
 
-        if (emitDirect(target, filmPage, callback)) return true
+        // Frembed answers /api/stream with Referrer-Policy: same-origin.
+        // The 302 target is cross-origin (Uqload/Voe/Dood/etc.), so the browser
+        // does NOT forward the Frembed film page as Referer to that host.
+        if (emitDirect(target, "", callback)) return true
 
-        // The redirect target is loaded as an iframe originating from the film
-        // page, so use the film page as referer rather than the /api/stream URL.
-        // Do not HTML-crawl the host: leave parsing to CloudStream's extractor.
+        // Let each CloudStream host extractor establish its own host-side
+        // Referer/Origin for the final media request (for example uqload.vc/).
+        // Passing the Frembed page here breaks hosts that enforce Referer.
         return tryCloudStreamExtractor(
             url = target,
-            referer = filmPage,
+            referer = null,
             subtitleCallback = subtitleCallback,
             callback = callback,
         )
@@ -655,7 +658,7 @@ class FrembedProvider : MainAPI() {
 
     private suspend fun tryCloudStreamExtractor(
         url: String,
-        referer: String,
+        referer: String?,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {

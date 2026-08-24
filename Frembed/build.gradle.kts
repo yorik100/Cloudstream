@@ -1,4 +1,4 @@
-version = 5
+version = 6
 
 cloudstream {
     description = "Frembed - films et séries via l'API publique Frembed"
