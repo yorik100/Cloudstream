@@ -462,6 +462,22 @@ class AfterDarkProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        return try {
+            loadLinksInternal(data, isCasting, subtitleCallback, callback)
+        } catch (cancelled: java.util.concurrent.CancellationException) {
+            throw cancelled
+        } catch (t: Throwable) {
+            android.util.Log.e("AfterDark", "loadLinks failed", t)
+            false
+        }
+    }
+
+    private suspend fun loadLinksInternal(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
         val request = PlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données AfterDark invalides")
 
