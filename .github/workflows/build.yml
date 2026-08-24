@@ -1,3 +1,34 @@
+name: Build AfterDark
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupérer le projet
+        uses: actions/checkout@v4
+
+      - name: Installer Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Installer Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Installer Android 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Installer Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
       - name: Diagnostic fichiers
         run: |
           echo "=== COMMIT ==="
@@ -13,3 +44,15 @@
 
           echo "=== Recherche kotlinx ==="
           grep -Rni "kotlinx.coroutines" AfterDark || true
+
+      - name: Compiler AfterDark
+        run: gradle :AfterDark:make --stacktrace
+
+      - name: Sauvegarder le résultat
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: AfterDark
+          path: |
+            **/*.cs3
+            **/build/**
