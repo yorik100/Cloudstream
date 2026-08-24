@@ -1,4 +1,4 @@
-# AfterDark CloudStream v1
+# AfterDark CloudStream v2
 
 Extension expérimentale CloudStream pour `https://afterdark06.mom`.
 
@@ -83,3 +83,9 @@ La fenêtre se ferme automatiquement lorsque le frontend AfterDark a émis une
 preuve valide pour ce titre.
 
 Cette extension ne contourne ni ne forge la vérification Turnstile.
+
+## Correctif v2
+
+- dépendance officielle `cloudstream("com.lagradost:cloudstream3:pre-release")` ;
+- suppression de la dépendance directe à `kotlinx.coroutines` dans la WebView ;
+- dépôt configuré pour `yorik100/Cloudstream`.
