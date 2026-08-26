@@ -375,6 +375,10 @@ class FrembedProvider : MainAPI() {
                         "w500",
                     ) ?: seasonPoster
 
+                    val episodeOverview = metadata
+                        ?.stringOrNull("overview")
+                        ?.takeIf { it.isNotBlank() }
+
                     episodes += newEpisode(
                         url = playback.encode(),
                         initializer = {
@@ -387,6 +391,16 @@ class FrembedProvider : MainAPI() {
                             this.season = seasonNumber
                             episode = episodeNumber
                             posterUrl = episodePoster
+                            description = if (availableOnFrembed) {
+                                episodeOverview
+                            } else {
+                                listOfNotNull(
+                                    airDate?.let { "Prévu le $it" },
+                                    episodeOverview,
+                                ).joinToString("\n\n").ifBlank {
+                                    "Épisode à venir"
+                                }
+                            }
                         },
                         fix = false,
                     )
