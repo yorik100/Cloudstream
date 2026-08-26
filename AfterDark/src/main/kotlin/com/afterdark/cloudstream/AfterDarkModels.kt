@@ -14,6 +14,13 @@ data class PlaybackRequest(
     val titleKey: String
         get() = "$type-$tmdbId"
 
+    val sessionKey: String
+        get() = if (type == "tv" && season != null && episode != null) {
+            "$titleKey-s$season-e$episode"
+        } else {
+            titleKey
+        }
+
     fun watchUrl(mainUrl: String): String {
         val base = "$mainUrl/watch/$type-$tmdbId"
         return if (type == "tv" && season != null && episode != null) {
@@ -70,10 +77,20 @@ data class PlaybackRequest(
     }
 }
 
+data class CapturedSourceRequest(
+    val proof: String,
+    val url: String,
+    val headers: Map<String, String>,
+    val referer: String?,
+)
+
 data class ProofSession(
     val proof: String,
     val cookie: String?,
     val userAgent: String,
+    val sourceRequestUrl: String? = null,
+    val sourceRequestHeaders: Map<String, String> = emptyMap(),
+    val sourceReferer: String? = null,
 )
 
 data class ParsedSubtitle(

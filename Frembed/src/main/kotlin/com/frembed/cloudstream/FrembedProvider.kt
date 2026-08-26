@@ -320,11 +320,13 @@ class FrembedProvider : MainAPI() {
     private fun movieInfoUrl(tmdbId: Int): String =
         "$mainUrl/api/films?id=$tmdbId&idType=tmdb"
 
-    // Series endpoint still needs to be mapped from the current Frembed API.
-    // Keep the old route only as a fallback until we capture a modern series request.
-    private fun legacySeriesApiUrl(request: FrembedPlaybackRequest): String =
-        "$mainUrl/api/serie.php?id=${request.tmdbId}" +
-            "&sa=${request.season}&epi=${request.episode}"
+    private fun seriesApiUrl(request: FrembedPlaybackRequest): String? {
+        val season = request.season ?: return null
+        val episode = request.episode ?: return null
+
+        return "$mainUrl/api/public/v1/tv/${request.tmdbId}" +
+            "?sa=$season&epi=$episode"
+    }
 
     private fun streamUrl(rawUrl: String): String? =
         resolveUrl("$mainUrl/", rawUrl)
@@ -477,6 +479,14 @@ class FrembedProvider : MainAPI() {
             clean.endsWith(".ssa")
     }
 
+    private fun isFrembedTestVideoUrl(url: String): Boolean {
+        val value = url.lowercase()
+        return "frembed test-video" in value ||
+            "frembed-test-video" in value ||
+            "test-video" in value ||
+            "test_video" in value
+    }
+
     private fun hostName(url: String): String =
         runCatching {
             URI(url).host
@@ -548,6 +558,7 @@ class FrembedProvider : MainAPI() {
         return rawValues
             .mapNotNull { resolveUrl(baseUrl, it) }
             .filterNot(::isIgnoredAsset)
+            .filterNot(::isFrembedTestVideoUrl)
             .filter(::isInterestingCandidate)
             .distinct()
             .take(40)
@@ -650,6 +661,7 @@ class FrembedProvider : MainAPI() {
         referer: String,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        if (isFrembedTestVideoUrl(url)) return false
         val type = directType(url) ?: return false
 
         callback(
@@ -676,6 +688,41 @@ class FrembedProvider : MainAPI() {
 
     private fun normalizeExtractorName(value: String): String =
         value.lowercase().filter { it.isLetterOrDigit() }
+
+    private fun knownHostSlug(url: String): String? {
+        val host = runCatching { URI(url).host?.lowercase() }.getOrNull()
+            ?: return null
+
+        return when {
+            "uqload" in host -> "uqload"
+            host == "voe.sx" || host.startsWith("voe.") || ".voe." in host -> "voe"
+            "dood" in host -> "dood"
+            "streamtape" in host -> "streamtape"
+            "vidmoly" in host -> "vidmoly"
+            "filemoon" in host -> "filemoon"
+            else -> null
+        }
+    }
+
+    private suspend fun tryKnownHostExtractorByUrl(
+        url: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val slug = knownHostSlug(url) ?: return false
+
+        return tryNamedHostExtractors(
+            server = FrembedServer(
+                label = slug,
+                slug = slug,
+                lang = "",
+                url = url,
+            ),
+            url = url,
+            subtitleCallback = subtitleCallback,
+            callback = callback,
+        )
+    }
 
     private suspend fun tryNamedHostExtractors(
         server: FrembedServer,
@@ -777,6 +824,10 @@ class FrembedProvider : MainAPI() {
             frembedHost != null &&
             !host.equals(frembedHost, ignoreCase = true)
         ) {
+            if (tryKnownHostExtractorByUrl(url, subtitleCallback, callback)) {
+                return true
+            }
+
             if (tryCloudStreamExtractor(url, referer, subtitleCallback, callback)) {
                 return true
             }
@@ -799,6 +850,14 @@ class FrembedProvider : MainAPI() {
                 ?: return false
 
             if (emitDirect(redirected, url, callback)) return true
+
+            if (
+                tryKnownHostExtractorByUrl(
+                    redirected,
+                    subtitleCallback,
+                    callback,
+                )
+            ) return true
 
             if (
                 tryCloudStreamExtractor(
@@ -880,6 +939,17 @@ class FrembedProvider : MainAPI() {
             }
 
             if (
+                tryKnownHostExtractorByUrl(
+                    candidate,
+                    subtitleCallback,
+                    callback,
+                )
+            ) {
+                emitted = true
+                continue
+            }
+
+            if (
                 tryCloudStreamExtractor(
                     candidate,
                     url,
@@ -936,12 +1006,13 @@ class FrembedProvider : MainAPI() {
             return found
         }
 
-        // Temporary fallback for TV episodes until the current series API
-        // request is captured from Frembed.
+        val apiUrl = seriesApiUrl(request) ?: return false
         val visited = LinkedHashSet<String>()
 
+        // The current public TV API returns JSON whose result.items[].link is
+        // the official /embed/serie/<tmdb>?sa=<season>&epi=<episode> player.
         return probeUrl(
-            url = legacySeriesApiUrl(request),
+            url = apiUrl,
             referer = "$mainUrl/",
             depth = 0,
             visited = visited,

@@ -316,21 +316,38 @@ class AfterDarkProvider : MainAPI() {
         request: PlaybackRequest,
         session: ProofSession,
     ): Pair<Int, String> {
-        val referer = request.watchUrl(mainUrl)
-        val headers = linkedMapOf(
-            "Accept" to "application/x-ndjson",
-            "x-nabi-proof" to session.proof,
-            "User-Agent" to session.userAgent,
-        )
+        val headers = LinkedHashMap<String, String>()
+
+        session.sourceRequestHeaders.forEach { (key, value) ->
+            if (
+                !key.equals("Host", ignoreCase = true) &&
+                !key.equals("Connection", ignoreCase = true) &&
+                !key.equals("Content-Length", ignoreCase = true) &&
+                !key.equals("Cookie", ignoreCase = true) &&
+                !key.equals("Referer", ignoreCase = true)
+            ) {
+                headers[key] = value
+            }
+        }
+
+        headers["Accept"] = "application/x-ndjson"
+        headers["x-nabi-proof"] = session.proof
+        headers["User-Agent"] = session.userAgent
 
         session.cookie?.takeIf { it.isNotBlank() }?.let {
             headers["Cookie"] = it
         }
 
+        // Replay the exact official GET /api/sources observed by the WebView
+        // for this exact episode instead of rebuilding the URL after proof.
+        val sourceUrl = session.sourceRequestUrl
+            ?.takeIf { it.startsWith("$mainUrl/api/sources") }
+            ?: sourcesApiUrl(request)
+
         val response = app.get(
-            url = sourcesApiUrl(request),
+            url = sourceUrl,
             headers = headers,
-            referer = referer,
+            referer = session.sourceReferer ?: request.watchUrl(mainUrl),
             cacheTime = 0,
         )
 
@@ -338,7 +355,7 @@ class AfterDarkProvider : MainAPI() {
     }
 
     private suspend fun obtainSession(request: PlaybackRequest): ProofSession? {
-        proofCache[request.titleKey]?.let { return it }
+        proofCache[request.sessionKey]?.let { return it }
 
         val session = try {
             AfterDarkProofWebView.acquire(request, mainUrl)
@@ -346,7 +363,7 @@ class AfterDarkProvider : MainAPI() {
             null
         } ?: return null
 
-        proofCache[request.titleKey] = session
+        proofCache[request.sessionKey] = session
         return session
     }
 
@@ -471,7 +488,7 @@ class AfterDarkProvider : MainAPI() {
 
         // Proofs are temporary. Retry once through the official WebView flow.
         if (response.first == 403) {
-            proofCache.remove(request.titleKey)
+            proofCache.remove(request.sessionKey)
             session = obtainSession(request) ?: return false
             response = fetchSources(request, session)
         }

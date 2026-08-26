@@ -134,7 +134,7 @@ object AfterDarkProofWebView {
                 ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
 
-            fun finishWithCapturedProof(proof: String) {
+            fun finishWithCapturedProof(captured: CapturedSourceRequest) {
                 // shouldInterceptRequest() is not a UI-thread callback.
                 handler.post {
                     if (finished.get()) return@post
@@ -145,9 +145,12 @@ object AfterDarkProofWebView {
 
                     finish(
                         ProofSession(
-                            proof = proof,
+                            proof = captured.proof,
                             cookie = cookie,
                             userAgent = browserUserAgent,
+                            sourceRequestUrl = captured.url,
+                            sourceRequestHeaders = captured.headers,
+                            sourceReferer = captured.referer,
                         ),
                     )
                 }
@@ -218,13 +221,13 @@ object AfterDarkProofWebView {
                             view: WebView?,
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
-                            val proof = captureProofHeader(
+                            val captured = captureSourceRequest(
                                 webRequest = webRequest,
                                 playbackRequest = request,
                                 targetHost = targetHost,
                             )
-                            if (proof != null) {
-                                finishWithCapturedProof(proof)
+                            if (captured != null) {
+                                finishWithCapturedProof(captured)
                             }
                             return super.shouldInterceptRequest(view, webRequest)
                         }
@@ -267,14 +270,14 @@ object AfterDarkProofWebView {
                     view: WebView?,
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
-                    val proof = captureProofHeader(
+                    val captured = captureSourceRequest(
                         webRequest = webRequest,
                         playbackRequest = request,
                         targetHost = targetHost,
                     )
 
-                    if (proof != null) {
-                        finishWithCapturedProof(proof)
+                    if (captured != null) {
+                        finishWithCapturedProof(captured)
                     }
 
                     return super.shouldInterceptRequest(view, webRequest)
@@ -323,11 +326,11 @@ object AfterDarkProofWebView {
         }
     }
 
-    private fun captureProofHeader(
+    private fun captureSourceRequest(
         webRequest: WebResourceRequest?,
         playbackRequest: PlaybackRequest,
         targetHost: String?,
-    ): String? {
+    ): CapturedSourceRequest? {
         if (webRequest == null) return null
         if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
@@ -346,10 +349,30 @@ object AfterDarkProofWebView {
             }
         }
 
-        return webRequest.requestHeaders.entries
+        val headers = LinkedHashMap<String, String>()
+        webRequest.requestHeaders.forEach { (key, value) ->
+            if (key.isNotBlank() && value.isNotBlank()) {
+                headers[key] = value
+            }
+        }
+
+        val proof = headers.entries
             .firstOrNull { (key, _) -> key.equals(PROOF_HEADER, ignoreCase = true) }
             ?.value
             ?.takeIf { it.isNotBlank() }
+            ?: return null
+
+        val referer = headers.entries
+            .firstOrNull { (key, _) -> key.equals("Referer", ignoreCase = true) }
+            ?.value
+            ?.takeIf { it.isNotBlank() }
+
+        return CapturedSourceRequest(
+            proof = proof,
+            url = uri.toString(),
+            headers = headers,
+            referer = referer,
+        )
     }
 
 }
