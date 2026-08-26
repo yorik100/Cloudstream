@@ -453,6 +453,55 @@ class AfterDarkProvider : MainAPI() {
         return sources.distinctBy { "${it.service}|${it.url}" }
     }
 
+    private fun fallbackSources(request: PlaybackRequest): List<ParsedSource> {
+        val season = request.season ?: 1
+        val episode = request.episode ?: 1
+
+        val videasy = if (request.type == "tv") {
+            "https://player.videasy.net/tv/${request.tmdbId}/$season/$episode" +
+                "?overlay=true&color=8B5CF6" +
+                "&nextEpisode=true&episodeSelector=true&autoplayNextEpisode=true"
+        } else {
+            "https://player.videasy.net/movie/${request.tmdbId}" +
+                "?overlay=true&color=8B5CF6"
+        }
+
+        val frembed = if (request.type == "tv") {
+            "https://frembed.skin/embed/serie/${request.tmdbId}" +
+                "?sa=$season&epi=$episode"
+        } else {
+            "https://frembed.skin/embed/movie/${request.tmdbId}"
+        }
+
+        val peachify = if (request.type == "tv") {
+            "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
+                "?dub=French&sub=French&autoNext=30"
+        } else {
+            "https://peachify.top/embed/movie/${request.tmdbId}" +
+                "?dub=French&sub=French"
+        }
+
+        return listOf(
+            "videasy" to videasy,
+            "frembed" to frembed,
+            "peachify" to peachify,
+        ).map { (service, url) ->
+            ParsedSource(
+                group = "Secours",
+                service = service,
+                provider = "AfterDark",
+                url = url,
+                quality = null,
+                language = null,
+                type = "embed",
+                proxied = false,
+                referer = "$mainUrl/",
+                headers = emptyMap(),
+                subtitles = emptyList(),
+            )
+        }
+    }
+
     private fun directType(source: ParsedSource): ExtractorLinkType? {
         val declared = source.type?.lowercase()
 
@@ -505,8 +554,15 @@ class AfterDarkProvider : MainAPI() {
 
         if (response.first !in 200..299) return false
 
-        val sources = parseNdjson(response.second)
-        if (sources.isEmpty()) return false
+        val parsedSources = parseNdjson(response.second)
+
+        // AfterDark's own frontend falls back to three embeds when the streamed
+        // /api/sources response finishes without any item.
+        val sources = if (parsedSources.isEmpty()) {
+            fallbackSources(request)
+        } else {
+            parsedSources
+        }
 
         var emitted = false
         val seen = HashSet<String>()
@@ -549,20 +605,64 @@ class AfterDarkProvider : MainAPI() {
                 continue
             }
 
-            val extractorLoaded = runCatching {
+            var extractorEmitted = false
+
+            runCatching {
                 loadExtractor(
                     url = source.url,
                     referer = sourceReferer,
                     subtitleCallback = subtitleCallback,
                     callback = {
+                        extractorEmitted = true
                         emitted = true
                         callback(it)
                     },
                 )
-            }.getOrDefault(false)
+            }
 
-            // Unknown embeds must not be falsely exposed as direct media.
-            if (!extractorLoaded && !isEmbed) {
+            if (extractorEmitted) continue
+
+            // AfterDark's official fallback embeds are browser players. When
+            // CloudStream has no extractor for one of them, let the official
+            // player execute normally in an internal WebView and capture the
+            // real HLS/DASH/video request it produces.
+            if (isEmbed && source.group == "Secours") {
+                val resolved = runCatching {
+                    AfterDarkEmbedWebView.resolve(
+                        embedUrl = source.url,
+                        sourceName = source.service,
+                        referer = sourceReferer,
+                    )
+                }.getOrNull()
+
+                if (resolved != null && seen.add(resolved.url)) {
+                    val resolvedType = when (resolved.type) {
+                        "m3u8" -> ExtractorLinkType.M3U8
+                        "mpd" -> ExtractorLinkType.DASH
+                        else -> ExtractorLinkType.VIDEO
+                    }
+
+                    callback(
+                        newExtractorLink(
+                            source = source.service,
+                            name = "AfterDark · ${source.service}",
+                            url = resolved.url,
+                            type = resolvedType,
+                        ) {
+                            referer = resolved.referer.orEmpty()
+                            quality = getQualityFromName(source.quality)
+                            headers = resolved.headers
+                        },
+                    )
+                    emitted = true
+                }
+
+                continue
+            }
+
+            // Unknown non-embed URLs can still be handed to the player.
+            // Unknown embeds are never falsely exposed as direct media.
+            if (!isEmbed) {
                 callback(
                     newExtractorLink(
                         source = source.service,

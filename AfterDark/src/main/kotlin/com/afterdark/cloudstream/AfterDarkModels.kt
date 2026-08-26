@@ -116,3 +116,11 @@ data class ParsedSource(
     val headers: Map<String, String>,
     val subtitles: List<ParsedSubtitle>,
 )
+
+data class ResolvedWebMedia(
+    val url: String,
+    val referer: String?,
+    val headers: Map<String, String>,
+    val type: String?,
+)
+
