@@ -466,13 +466,6 @@ class AfterDarkProvider : MainAPI() {
                 "?overlay=true&color=8B5CF6"
         }
 
-        val frembed = if (request.type == "tv") {
-            "https://frembed.skin/embed/serie/${request.tmdbId}" +
-                "?sa=$season&epi=$episode"
-        } else {
-            "https://frembed.skin/embed/movie/${request.tmdbId}"
-        }
-
         val peachify = if (request.type == "tv") {
             "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
                 "?dub=French&sub=French&autoNext=30"
@@ -483,7 +476,6 @@ class AfterDarkProvider : MainAPI() {
 
         return listOf(
             "videasy" to videasy,
-            "frembed" to frembed,
             "peachify" to peachify,
         ).map { (service, url) ->
             ParsedSource(
