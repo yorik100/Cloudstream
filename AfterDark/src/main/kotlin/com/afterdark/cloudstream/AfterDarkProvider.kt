@@ -612,7 +612,14 @@ class AfterDarkProvider : MainAPI() {
                 )
             }
 
-            if (extractorEmitted) continue
+            if (extractorEmitted) {
+                // "Secours" is a failover chain, not a list that should be
+                // resolved all at once. Once Videasy (or a later fallback)
+                // produced a real link, stop here so the next fallback does
+                // not replace it while it is still loading.
+                if (source.group == "Secours") return true
+                continue
+            }
 
             // AfterDark's official fallback embeds are browser players. When
             // CloudStream has no extractor for one of them, let the official
@@ -647,6 +654,11 @@ class AfterDarkProvider : MainAPI() {
                         },
                     )
                     emitted = true
+
+                    // A fallback source was successfully resolved. Do not
+                    // immediately open Peachify after Videasy; Peachify is
+                    // only attempted when Videasy fails to resolve.
+                    return true
                 }
 
                 continue
