@@ -10,6 +10,7 @@ import android.os.Message
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebSettings
@@ -22,7 +23,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 object AfterDarkEmbedWebView {
-    private const val TIMEOUT_MS = 25_000L
+    private const val TIMEOUT_MS = 45_000L
+    private const val USER_ACTIVITY_EXTENSION_MS = 60_000L
 
     private val mediaExtensions = listOf(
         ".m3u8",
@@ -66,6 +68,12 @@ object AfterDarkEmbedWebView {
         }
 
         timeoutRunnable = Runnable { finish(null) }
+
+        fun extendTimeout(delayMs: Long = USER_ACTIVITY_EXTENSION_MS) {
+            if (finished.get()) return
+            handler.removeCallbacks(timeoutRunnable)
+            handler.postDelayed(timeoutRunnable, delayMs)
+        }
 
         handler.post {
             try {
@@ -112,6 +120,93 @@ object AfterDarkEmbedWebView {
                     ?.takeIf { it.isNotBlank() }
                     ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                         "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+
+                fun originOf(url: String): String? =
+                    runCatching {
+                        val uri = Uri.parse(url)
+                        val scheme = uri.scheme ?: return@runCatching null
+                        val host = uri.host ?: return@runCatching null
+                        val port = uri.port
+                        if (port > 0) "$scheme://$host:$port" else "$scheme://$host"
+                    }.getOrNull()
+
+                fun mediaFromJavascript(
+                    url: String?,
+                    contentType: String?,
+                    pageUrl: String?,
+                ): ResolvedWebMedia? {
+                    val value = url?.trim().orEmpty()
+                    if (value.isBlank()) return null
+
+                    val uri = runCatching { Uri.parse(value) }.getOrNull() ?: return null
+                    val scheme = uri.scheme?.lowercase()
+                    if (scheme != "http" && scheme != "https") return null
+
+                    val cleanPath = value
+                        .substringBefore("?")
+                        .substringBefore("#")
+                        .lowercase()
+                    val ct = contentType?.lowercase().orEmpty()
+
+                    val type = when {
+                        cleanPath.endsWith(".m3u8") ||
+                            "mpegurl" in ct -> "m3u8"
+
+                        cleanPath.endsWith(".mpd") ||
+                            "dash+xml" in ct -> "mpd"
+
+                        cleanPath.endsWith(".mp4") ||
+                            cleanPath.endsWith(".mkv") ||
+                            cleanPath.endsWith(".webm") ||
+                            ct.startsWith("video/") ||
+                            "application/octet-stream" in ct -> "video"
+
+                        else -> return null
+                    }
+
+                    val effectivePage = pageUrl
+                        ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                        ?: embedUrl
+
+                    val headers = linkedMapOf(
+                        "User-Agent" to browserUserAgent,
+                        "Referer" to effectivePage,
+                    )
+
+                    originOf(effectivePage)?.let { origin ->
+                        headers["Origin"] = origin
+                    }
+
+                    return ResolvedWebMedia(
+                        url = value,
+                        referer = effectivePage,
+                        headers = headers,
+                        type = type,
+                    )
+                }
+
+                val bridge = object {
+                    @JavascriptInterface
+                    fun media(
+                        url: String?,
+                        contentType: String?,
+                        pageUrl: String?,
+                    ) {
+                        val resolved = mediaFromJavascript(url, contentType, pageUrl)
+                            ?: return
+                        finish(resolved)
+                    }
+
+                    @JavascriptInterface
+                    fun activity() {
+                        extendTimeout()
+                    }
+                }
+
+                browser.addJavascriptInterface(
+                    bridge,
+                    "__AfterDarkMediaBridge",
+                )
 
                 fun captureMedia(webRequest: WebResourceRequest?): ResolvedWebMedia? {
                     if (webRequest == null) return null
@@ -179,13 +274,156 @@ object AfterDarkEmbedWebView {
                     )
                 }
 
-                fun nudgePlayer() {
+                fun installHooksAndNudge() {
                     if (finished.get()) return
 
                     browser.evaluateJavascript(
                         """
                         (() => {
                           try {
+                            const bridge = window.__AfterDarkMediaBridge;
+                            if (!bridge) return;
+
+                            const report = (url, contentType = '') => {
+                              try {
+                                if (!url) return;
+                                bridge.media(String(url), String(contentType || ''), location.href);
+                              } catch (_) {}
+                            };
+
+                            const isInterestingUrl = url => {
+                              const value = String(url || '').toLowerCase();
+                              return value.includes('.m3u8') ||
+                                     value.includes('.mpd') ||
+                                     value.includes('.mp4') ||
+                                     value.includes('.mkv') ||
+                                     value.includes('.webm');
+                            };
+
+                            if (!window.__afterdarkFetchHooked && window.fetch) {
+                              window.__afterdarkFetchHooked = true;
+                              const originalFetch = window.fetch.bind(window);
+
+                              window.fetch = async (...args) => {
+                                const response = await originalFetch(...args);
+                                try {
+                                  const url =
+                                    response.url ||
+                                    (typeof args[0] === 'string'
+                                      ? args[0]
+                                      : args[0] && args[0].url) ||
+                                    '';
+
+                                  const contentType =
+                                    response.headers && response.headers.get
+                                      ? response.headers.get('content-type') || ''
+                                      : '';
+
+                                  if (
+                                    isInterestingUrl(url) ||
+                                    /mpegurl|dash\+xml|^video\/|octet-stream/i.test(contentType)
+                                  ) {
+                                    report(url, contentType);
+                                  }
+                                } catch (_) {}
+                                return response;
+                              };
+                            }
+
+                            if (!window.__afterdarkXhrHooked && window.XMLHttpRequest) {
+                              window.__afterdarkXhrHooked = true;
+                              const originalOpen = XMLHttpRequest.prototype.open;
+                              const originalSend = XMLHttpRequest.prototype.send;
+
+                              XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                                this.__afterdarkUrl = url;
+                                return originalOpen.call(this, method, url, ...rest);
+                              };
+
+                              XMLHttpRequest.prototype.send = function(...args) {
+                                try {
+                                  this.addEventListener('loadstart', () => {
+                                    try { bridge.activity(); } catch (_) {}
+                                  });
+
+                                  this.addEventListener('readystatechange', () => {
+                                    try {
+                                      if (this.readyState < 2) return;
+
+                                      const url =
+                                        this.responseURL ||
+                                        this.__afterdarkUrl ||
+                                        '';
+
+                                      const contentType =
+                                        this.getResponseHeader('content-type') || '';
+
+                                      if (
+                                        isInterestingUrl(url) ||
+                                        /mpegurl|dash\+xml|^video\/|octet-stream/i.test(contentType)
+                                      ) {
+                                        report(url, contentType);
+                                      }
+                                    } catch (_) {}
+                                  });
+                                } catch (_) {}
+
+                                return originalSend.apply(this, args);
+                              };
+                            }
+
+                            if (!window.__afterdarkInteractionHooked) {
+                              window.__afterdarkInteractionHooked = true;
+                              ['click', 'touchstart', 'keydown'].forEach(eventName => {
+                                document.addEventListener(
+                                  eventName,
+                                  () => {
+                                    try { bridge.activity(); } catch (_) {}
+                                  },
+                                  true
+                                );
+                              });
+                            }
+
+                            const scanMedia = () => {
+                              try {
+                                document
+                                  .querySelectorAll('video,audio,source')
+                                  .forEach(media => {
+                                    const url =
+                                      media.currentSrc ||
+                                      media.src ||
+                                      media.getAttribute('src') ||
+                                      '';
+                                    if (isInterestingUrl(url)) {
+                                      report(url, '');
+                                    }
+                                  });
+
+                                if (window.performance && performance.getEntriesByType) {
+                                  performance
+                                    .getEntriesByType("resource")
+                                    .forEach(entry => {
+                                      if (isInterestingUrl(entry.name)) {
+                                        report(entry.name, '');
+                                      }
+                                    });
+                                }
+                              } catch (_) {}
+                            };
+
+                            scanMedia();
+
+                            if (!window.__afterdarkMediaObserver) {
+                              window.__afterdarkMediaObserver = new MutationObserver(scanMedia);
+                              window.__afterdarkMediaObserver.observe(document.documentElement, {
+                                childList: true,
+                                subtree: true,
+                                attributes: true,
+                                attributeFilter: ['src']
+                              });
+                            }
+
                             document.querySelectorAll('video,audio').forEach(media => {
                               try {
                                 media.muted = true;
@@ -213,7 +451,10 @@ object AfterDarkEmbedWebView {
                             });
 
                             if (button) {
-                              try { button.click(); } catch (_) {}
+                              try {
+                                bridge.activity();
+                                button.click();
+                              } catch (_) {}
                             }
                           } catch (_) {}
                         })();
@@ -264,10 +505,12 @@ object AfterDarkEmbedWebView {
                         url: String?,
                     ) {
                         super.onPageFinished(view, url)
-                        nudgePlayer()
-                        handler.postDelayed({ nudgePlayer() }, 1_000L)
-                        handler.postDelayed({ nudgePlayer() }, 3_000L)
-                        handler.postDelayed({ nudgePlayer() }, 6_000L)
+                        extendTimeout()
+                        installHooksAndNudge()
+                        handler.postDelayed({ installHooksAndNudge() }, 1_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 3_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 6_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 12_000L)
                     }
                 }
 

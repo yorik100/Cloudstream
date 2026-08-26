@@ -1,4 +1,4 @@
-version = 12
+version = 14
 
 cloudstream {
     description = "AfterDark - récupération des sources après vérification officielle dans WebView"
