@@ -13,11 +13,15 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -41,6 +45,7 @@ object AfterDarkEmbedWebView {
         referer: String,
     ): ResolvedWebMedia? = suspendCoroutine { continuation ->
         val finished = AtomicBoolean(false)
+        val videasyMode = sourceName.equals("videasy", ignoreCase = true)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
@@ -67,10 +72,14 @@ object AfterDarkEmbedWebView {
             continuation.resume(result)
         }
 
-        timeoutRunnable = Runnable { finish(null) }
+        timeoutRunnable = Runnable {
+            // Peachify/other fallbacks keep a safety timeout. Videasy must not
+            // be declared unavailable from elapsed loading time.
+            if (!videasyMode) finish(null)
+        }
 
         fun extendTimeout(delayMs: Long = USER_ACTIVITY_EXTENSION_MS) {
-            if (finished.get()) return
+            if (finished.get() || videasyMode) return
             handler.removeCallbacks(timeoutRunnable)
             handler.postDelayed(timeoutRunnable, delayMs)
         }
@@ -201,6 +210,16 @@ object AfterDarkEmbedWebView {
                     fun activity() {
                         extendTimeout()
                     }
+
+                    @JavascriptInterface
+                    fun unavailable(reason: String?) {
+                        if (!videasyMode) return
+
+                        // This is only called from explicit Videasy signals:
+                        // sources-with-title failure/empty response, decrypted
+                        // sources[] empty, or an explicit media error.
+                        finish(null)
+                    }
                 }
 
                 browser.addJavascriptInterface(
@@ -274,6 +293,114 @@ object AfterDarkEmbedWebView {
                     )
                 }
 
+                fun isVideasySourceResolutionRequest(
+                    webRequest: WebResourceRequest?,
+                ): Boolean {
+                    if (!videasyMode || webRequest == null) return false
+                    if (!webRequest.method.equals("GET", ignoreCase = true)) return false
+
+                    val uri = webRequest.url
+                    val host = uri.host?.lowercase().orEmpty()
+                    val path = uri.path?.lowercase().orEmpty()
+
+                    return host == "api.speedracelight.com" &&
+                        path.endsWith("/sources-with-title")
+                }
+
+                fun executeVideasySourceResolutionOnce(
+                    webRequest: WebResourceRequest,
+                ): WebResourceResponse? {
+                    val requestUrl = webRequest.url.toString()
+                    val connection = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        instanceFollowRedirects = true
+                        connectTimeout = 20_000
+                        readTimeout = 60_000
+                        useCaches = false
+
+                        webRequest.requestHeaders.forEach { (key, value) ->
+                            if (
+                                key.isNotBlank() &&
+                                value.isNotBlank() &&
+                                !key.equals("Host", ignoreCase = true) &&
+                                !key.equals("Connection", ignoreCase = true) &&
+                                !key.equals("Content-Length", ignoreCase = true) &&
+                                !key.equals("Cookie", ignoreCase = true) &&
+                                !key.equals("Accept-Encoding", ignoreCase = true)
+                            ) {
+                                setRequestProperty(key, value)
+                            }
+                        }
+
+                        setRequestProperty("Accept-Encoding", "identity")
+
+                        CookieManager.getInstance()
+                            .getCookie(requestUrl)
+                            ?.takeIf { it.isNotBlank() }
+                            ?.let { setRequestProperty("Cookie", it) }
+                    }
+
+                    return try {
+                        val statusCode = connection.responseCode
+                        val stream = if (statusCode >= 400) {
+                            connection.errorStream
+                        } else {
+                            connection.inputStream
+                        }
+                        val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
+
+                        val responseHeaders = LinkedHashMap<String, String>()
+                        connection.headerFields.forEach { (key, values) ->
+                            if (key != null && !values.isNullOrEmpty()) {
+                                if (
+                                    !key.equals("Content-Encoding", ignoreCase = true) &&
+                                    !key.equals("Content-Length", ignoreCase = true)
+                                ) {
+                                    responseHeaders[key] = values.joinToString(", ")
+                                }
+                            }
+                        }
+
+                        val mimeType = connection.contentType
+                            ?.substringBefore(";")
+                            ?.trim()
+                            ?.takeIf { it.isNotBlank() }
+                            ?: "application/octet-stream"
+
+                        val reason = connection.responseMessage
+                            ?.takeIf { it.isNotBlank() }
+                            ?: "HTTP $statusCode"
+
+                        // This is Videasy's own availability result. A terminal
+                        // 404/410 means the requested episode has no source on
+                        // Videasy. 204/empty successful responses are also
+                        // explicit no-source results, not loading heuristics.
+                        if (
+                            statusCode == 404 ||
+                            statusCode == 410 ||
+                            statusCode == 204 ||
+                            (statusCode in 200..299 && bytes.isEmpty())
+                        ) {
+                            finish(null)
+                        }
+
+                        WebResourceResponse(
+                            mimeType,
+                            null,
+                            statusCode,
+                            reason,
+                            responseHeaders,
+                            ByteArrayInputStream(bytes),
+                        )
+                    } catch (_: Exception) {
+                        // A real request failure is an explicit resolver failure.
+                        finish(null)
+                        null
+                    } finally {
+                        connection.disconnect()
+                    }
+                }
+
                 fun installHooksAndNudge() {
                     if (finished.get()) return
 
@@ -283,6 +410,8 @@ object AfterDarkEmbedWebView {
                           try {
                             const bridge = window.__AfterDarkMediaBridge;
                             if (!bridge) return;
+
+                            const VIDEASY_MODE = ${'$'}{if (videasyMode) "true" else "false"};
 
                             const report = (url, contentType = '') => {
                               try {
@@ -300,24 +429,146 @@ object AfterDarkEmbedWebView {
                                      value.includes('.webm');
                             };
 
+                            const isVideasySourceRequest = url => {
+                              if (!VIDEASY_MODE) return false;
+                              const value = String(url || '').toLowerCase();
+                              return value.includes('/sources-with-title');
+                            };
+
+                            const sourceLooksPlayable = source => {
+                              if (!source) return false;
+
+                              if (typeof source === 'string') {
+                                return /^https?:\/\//i.test(source) ||
+                                       source.includes('.m3u8') ||
+                                       source.includes('.mpd') ||
+                                       source.includes('.mp4');
+                              }
+
+                              if (typeof source !== 'object') return false;
+
+                              const candidate =
+                                source.url ||
+                                source.file ||
+                                source.src ||
+                                source.source ||
+                                source.stream ||
+                                '';
+
+                              return typeof candidate === 'string' &&
+                                     candidate.length > 0;
+                            };
+
+                            const inspectVideasyPayload = (value, rawText = '') => {
+                              if (!VIDEASY_MODE) return;
+
+                              try {
+                                const raw = String(rawText || '');
+                                const rawLooksLikeMediaPayload =
+                                  raw.includes('"sources"') &&
+                                  (
+                                    raw.includes('"subtitles"') ||
+                                    raw.includes('"tracks"') ||
+                                    raw.includes('"captions"')
+                                  );
+
+                                const visit = (node, depth = 0) => {
+                                  if (!node || typeof node !== 'object' || depth > 3) {
+                                    return false;
+                                  }
+
+                                  if (Array.isArray(node.sources)) {
+                                    const companionKeys =
+                                      Array.isArray(node.subtitles) ||
+                                      Array.isArray(node.tracks) ||
+                                      Array.isArray(node.captions) ||
+                                      rawLooksLikeMediaPayload;
+
+                                    if (companionKeys) {
+                                      if (node.sources.some(sourceLooksPlayable)) {
+                                        window.__afterdarkVideasySourcesConfirmed = true;
+                                      } else {
+                                        bridge.unavailable('videasy-sources-empty');
+                                      }
+                                      return true;
+                                    }
+                                  }
+
+                                  for (const key of ['data', 'result', 'payload', 'response']) {
+                                    if (visit(node[key], depth + 1)) return true;
+                                  }
+
+                                  return false;
+                                };
+
+                                visit(value);
+                              } catch (_) {}
+                            };
+
+                            if (VIDEASY_MODE && !window.__afterdarkJsonParseHooked) {
+                              window.__afterdarkJsonParseHooked = true;
+                              const originalJsonParse = JSON.parse;
+
+                              JSON.parse = function(text, reviver) {
+                                const value = originalJsonParse.call(this, text, reviver);
+                                try {
+                                  inspectVideasyPayload(value, text);
+                                } catch (_) {}
+                                return value;
+                              };
+                            }
+
                             if (!window.__afterdarkFetchHooked && window.fetch) {
                               window.__afterdarkFetchHooked = true;
                               const originalFetch = window.fetch.bind(window);
 
                               window.fetch = async (...args) => {
-                                const response = await originalFetch(...args);
+                                const requestedUrl =
+                                  typeof args[0] === 'string'
+                                    ? args[0]
+                                    : args[0] && args[0].url
+                                      ? args[0].url
+                                      : '';
+
+                                let response;
+
                                 try {
-                                  const url =
-                                    response.url ||
-                                    (typeof args[0] === 'string'
-                                      ? args[0]
-                                      : args[0] && args[0].url) ||
-                                    '';
+                                  response = await originalFetch(...args);
+                                } catch (error) {
+                                  if (isVideasySourceRequest(requestedUrl)) {
+                                    bridge.unavailable('videasy-source-network-error');
+                                  }
+                                  throw error;
+                                }
+
+                                try {
+                                  const url = response.url || requestedUrl || '';
 
                                   const contentType =
                                     response.headers && response.headers.get
                                       ? response.headers.get('content-type') || ''
                                       : '';
+
+                                  if (isVideasySourceRequest(url)) {
+                                    // This is Videasy's own source-resolution
+                                    // request, not a player-loading timer.
+                                    if (
+                                      response.status === 204 ||
+                                      response.status === 404 ||
+                                      response.status === 410 ||
+                                      response.status >= 500
+                                    ) {
+                                      bridge.unavailable(
+                                        'videasy-source-http-' + response.status
+                                      );
+                                    } else if (response.clone) {
+                                      response.clone().text().then(text => {
+                                        if (!String(text || '').trim()) {
+                                          bridge.unavailable('videasy-source-empty-response');
+                                        }
+                                      }).catch(() => {});
+                                    }
+                                  }
 
                                   if (
                                     isInterestingUrl(url) ||
@@ -326,6 +577,7 @@ object AfterDarkEmbedWebView {
                                     report(url, contentType);
                                   }
                                 } catch (_) {}
+
                                 return response;
                               };
                             }
@@ -357,6 +609,30 @@ object AfterDarkEmbedWebView {
 
                                       const contentType =
                                         this.getResponseHeader('content-type') || '';
+
+                                      if (
+                                        this.readyState === 4 &&
+                                        isVideasySourceRequest(url)
+                                      ) {
+                                        if (
+                                          this.status === 0 ||
+                                          this.status === 204 ||
+                                          this.status === 404 ||
+                                          this.status === 410 ||
+                                          this.status >= 500
+                                        ) {
+                                          bridge.unavailable(
+                                            'videasy-source-http-' + this.status
+                                          );
+                                        } else if (
+                                          typeof this.responseText === 'string' &&
+                                          !this.responseText.trim()
+                                        ) {
+                                          bridge.unavailable(
+                                            'videasy-source-empty-response'
+                                          );
+                                        }
+                                      }
 
                                       if (
                                         isInterestingUrl(url) ||
@@ -426,6 +702,18 @@ object AfterDarkEmbedWebView {
 
                             document.querySelectorAll('video,audio').forEach(media => {
                               try {
+                                if (
+                                  VIDEASY_MODE &&
+                                  !media.__afterdarkErrorHooked
+                                ) {
+                                  media.__afterdarkErrorHooked = true;
+                                  media.addEventListener('error', () => {
+                                    if (!window.__afterdarkVideasySourcesConfirmed) {
+                                      bridge.unavailable('videasy-media-error');
+                                    }
+                                  });
+                                }
+
                                 media.muted = true;
                                 media.autoplay = true;
                                 const p = media.play();
@@ -491,7 +779,12 @@ object AfterDarkEmbedWebView {
                     override fun shouldInterceptRequest(
                         view: WebView?,
                         request: WebResourceRequest?,
-                    ): android.webkit.WebResourceResponse? {
+                    ): WebResourceResponse? {
+                        if (isVideasySourceResolutionRequest(request)) {
+                            return executeVideasySourceResolutionOnce(request!!)
+                                ?: super.shouldInterceptRequest(view, request)
+                        }
+
                         val media = captureMedia(request)
                         if (media != null) {
                             finish(media)
@@ -546,7 +839,13 @@ object AfterDarkEmbedWebView {
                 )
 
                 browser.loadUrl(embedUrl, initialHeaders)
-                handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
+
+                // Videasy availability is decided only by explicit source/media
+                // signals. It never falls through to Peachify because "it took
+                // too long". Peachify itself keeps the generic safety timeout.
+                if (!videasyMode) {
+                    handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
+                }
             } catch (_: Exception) {
                 finish(null)
             }

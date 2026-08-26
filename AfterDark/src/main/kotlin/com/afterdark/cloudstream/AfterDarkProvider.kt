@@ -26,6 +26,9 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 class AfterDarkProvider : MainAPI() {
@@ -458,11 +461,11 @@ class AfterDarkProvider : MainAPI() {
         val episode = request.episode ?: 1
 
         val videasy = if (request.type == "tv") {
-            "https://player.videasy.net/tv/${request.tmdbId}/$season/$episode" +
+            "https://player.videasy.to/tv/${request.tmdbId}/$season/$episode" +
                 "?overlay=true&color=8B5CF6" +
                 "&nextEpisode=true&episodeSelector=true&autoplayNextEpisode=true"
         } else {
-            "https://player.videasy.net/movie/${request.tmdbId}" +
+            "https://player.videasy.to/movie/${request.tmdbId}" +
                 "?overlay=true&color=8B5CF6"
         }
 
@@ -524,6 +527,172 @@ class AfterDarkProvider : MainAPI() {
             .distinct()
             .joinToString(" · ")
             .ifBlank { source.group.ifBlank { "AfterDark" } }
+
+    private suspend fun isEpisodeAlreadyAired(
+        request: PlaybackRequest,
+    ): Boolean {
+        if (request.type != "tv") return true
+
+        val season = request.season ?: return true
+        val episode = request.episode ?: return true
+
+        return runCatching {
+            val details = tmdbGet(
+                "/tv/${request.tmdbId}/season/$season/episode/$episode",
+            )
+
+            val airDate = details.stringOrNull("air_date")
+                ?: return@runCatching true
+
+            // ISO yyyy-MM-dd strings sort chronologically.
+            val today = SimpleDateFormat(
+                "yyyy-MM-dd",
+                Locale.US,
+            ).format(Date())
+
+            airDate <= today
+        }.getOrDefault(true)
+    }
+
+    private fun responseContentType(headers: Map<String, String>): String =
+        headers.entries
+            .firstOrNull { (key, _) -> key.equals("Content-Type", ignoreCase = true) }
+            ?.value
+            ?.substringBefore(";")
+            ?.trim()
+            ?.lowercase()
+            .orEmpty()
+
+    private suspend fun validateResolvedMedia(
+        resolved: ResolvedWebMedia,
+    ): Boolean {
+        val referer = resolved.referer.orEmpty()
+        val headers = LinkedHashMap<String, String>(resolved.headers)
+
+        // Never reuse a Range header captured from a browser media segment for
+        // playlist validation.
+        headers.keys
+            .firstOrNull { it.equals("Range", ignoreCase = true) }
+            ?.let { headers.remove(it) }
+
+        return when (resolved.type) {
+            "m3u8" -> runCatching {
+                val response = app.get(
+                    url = resolved.url,
+                    headers = headers,
+                    referer = referer,
+                    cacheTime = 0,
+                )
+
+                if (response.okhttpResponse.code !in 200..299) {
+                    return@runCatching false
+                }
+
+                val contentType = responseContentType(response.headers)
+                val body = response.text.trimStart()
+
+                // A real HLS manifest starts with #EXTM3U. Accept the MIME type
+                // too because a few hosts return a minimal/variant body.
+                body.startsWith("#EXTM3U") ||
+                    "mpegurl" in contentType
+            }.getOrDefault(false)
+
+            "mpd" -> runCatching {
+                val response = app.get(
+                    url = resolved.url,
+                    headers = headers,
+                    referer = referer,
+                    cacheTime = 0,
+                )
+
+                if (response.okhttpResponse.code !in 200..299) {
+                    return@runCatching false
+                }
+
+                val contentType = responseContentType(response.headers)
+                val body = response.text.trimStart()
+
+                body.contains("<MPD", ignoreCase = true) ||
+                    "dash+xml" in contentType
+            }.getOrDefault(false)
+
+            else -> {
+                // For direct video, HEAD avoids downloading the media. Some
+                // hosts reject HEAD, so only 404/410 are final failures; other
+                // failures fall back to a one-byte Range probe.
+                val head = runCatching {
+                    app.head(
+                        url = resolved.url,
+                        headers = headers,
+                        referer = referer,
+                        timeout = 10L,
+                    )
+                }.getOrNull()
+
+                if (head != null) {
+                    val code = head.okhttpResponse.code
+                    if (code == 404 || code == 410) {
+                        return false
+                    }
+
+                    if (code in 200..299) {
+                        val contentType = responseContentType(head.headers)
+                        val contentLength = head.headers.entries
+                            .firstOrNull { (key, _) ->
+                                key.equals("Content-Length", ignoreCase = true)
+                            }
+                            ?.value
+                            ?.toLongOrNull()
+
+                        if (
+                            contentType.startsWith("video/") ||
+                            contentType == "application/octet-stream" ||
+                            (contentLength != null && contentLength > 0)
+                        ) {
+                            return true
+                        }
+                    }
+                }
+
+                runCatching {
+                    val probeHeaders = LinkedHashMap(headers)
+                    probeHeaders["Range"] = "bytes=0-0"
+
+                    val response = app.get(
+                        url = resolved.url,
+                        headers = probeHeaders,
+                        referer = referer,
+                        cacheTime = 0,
+                    )
+
+                    val code = response.okhttpResponse.code
+                    if (code !in 200..299) {
+                        return@runCatching false
+                    }
+
+                    val contentType = responseContentType(response.headers)
+                    val contentRange = response.headers.entries
+                        .firstOrNull { (key, _) ->
+                            key.equals("Content-Range", ignoreCase = true)
+                        }
+                        ?.value
+
+                    // Reject common "200 OK" HTML/JSON error pages.
+                    val clearlyNotVideo =
+                        contentType.startsWith("text/html") ||
+                            contentType.startsWith("application/json") ||
+                            contentType.startsWith("text/plain")
+
+                    !clearlyNotVideo && (
+                        code == 206 ||
+                            !contentRange.isNullOrBlank() ||
+                            contentType.startsWith("video/") ||
+                            contentType == "application/octet-stream"
+                    )
+                }.getOrDefault(false)
+            }
+        }
+    }
 
     override suspend fun loadLinks(
         data: String,
@@ -626,6 +795,15 @@ class AfterDarkProvider : MainAPI() {
             // player execute normally in an internal WebView and capture the
             // real HLS/DASH/video request it produces.
             if (isEmbed && source.group == "Secours") {
+                if (
+                    source.service.equals("videasy", ignoreCase = true) &&
+                    !isEpisodeAlreadyAired(request)
+                ) {
+                    // Do not wait on a Videasy player for an episode that has
+                    // not aired yet. Continue directly to Peachify.
+                    continue
+                }
+
                 val resolved = runCatching {
                     AfterDarkEmbedWebView.resolve(
                         embedUrl = source.url,
@@ -635,6 +813,16 @@ class AfterDarkProvider : MainAPI() {
                 }.getOrNull()
 
                 if (resolved != null && seen.add(resolved.url)) {
+                    // Detection alone is not success: a player can briefly
+                    // expose a stale/deleted media URL. Verify it before
+                    // stopping the fallback chain.
+                    val valid = validateResolvedMedia(resolved)
+
+                    if (!valid) {
+                        // Videasy dead/inaccessible => continue to Peachify.
+                        continue
+                    }
+
                     val resolvedType = when (resolved.type) {
                         "m3u8" -> ExtractorLinkType.M3U8
                         "mpd" -> ExtractorLinkType.DASH
@@ -655,9 +843,7 @@ class AfterDarkProvider : MainAPI() {
                     )
                     emitted = true
 
-                    // A fallback source was successfully resolved. Do not
-                    // immediately open Peachify after Videasy; Peachify is
-                    // only attempted when Videasy fails to resolve.
+                    // Only a verified fallback media URL stops the chain.
                     return true
                 }
 
