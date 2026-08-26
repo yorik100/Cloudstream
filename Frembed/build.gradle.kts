@@ -1,4 +1,4 @@
-version = 12
+version = 13
 cloudstream {
     description = "Frembed - films et séries via l'API publique Frembed"
     authors = listOf("yorik100")
