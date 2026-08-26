@@ -316,6 +316,16 @@ class AfterDarkProvider : MainAPI() {
         request: PlaybackRequest,
         session: ProofSession,
     ): Pair<Int, String> {
+        val capturedStatus = session.sourceResponseStatus
+        val capturedBody = session.sourceResponseBody
+
+        if (capturedStatus != null && capturedBody != null) {
+            // Normal v11 flow: this is the exact response from the one official
+            // /api/sources request intercepted during verification.
+            return capturedStatus to capturedBody
+        }
+
+        // Defensive fallback for an older/incomplete in-memory session only.
         val headers = LinkedHashMap<String, String>()
 
         session.sourceRequestHeaders.forEach { (key, value) ->

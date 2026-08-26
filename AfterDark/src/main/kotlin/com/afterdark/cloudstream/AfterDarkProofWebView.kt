@@ -19,6 +19,9 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.ByteArrayInputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -33,6 +36,7 @@ object AfterDarkProofWebView {
         mainUrl: String,
     ): ProofSession? = suspendCoroutine { continuation ->
         val finished = AtomicBoolean(false)
+        val sourceInterceptStarted = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
@@ -134,7 +138,7 @@ object AfterDarkProofWebView {
                 ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
 
-            fun finishWithCapturedProof(captured: CapturedSourceRequest) {
+            fun finishWithCapturedResponse(captured: CapturedSourceResponse) {
                 // shouldInterceptRequest() is not a UI-thread callback.
                 handler.post {
                     if (finished.get()) return@post
@@ -151,9 +155,47 @@ object AfterDarkProofWebView {
                             sourceRequestUrl = captured.url,
                             sourceRequestHeaders = captured.headers,
                             sourceReferer = captured.referer,
+                            sourceResponseStatus = captured.statusCode,
+                            sourceResponseBody = captured.body,
                         ),
                     )
                 }
+            }
+
+            fun interceptOfficialSources(
+                webRequest: WebResourceRequest?,
+            ): WebResourceResponse? {
+                val requestInfo = captureSourceRequest(
+                    webRequest = webRequest,
+                    playbackRequest = request,
+                    targetHost = targetHost,
+                ) ?: return null
+
+                // WebView can expose the same resource through more than one
+                // client/window. Only one actual /api/sources request is allowed.
+                if (!sourceInterceptStarted.compareAndSet(false, true)) {
+                    return WebResourceResponse(
+                        "text/plain",
+                        "UTF-8",
+                        ByteArrayInputStream(ByteArray(0)),
+                    )
+                }
+
+                val intercepted = runCatching {
+                    executeSourceRequestOnce(
+                        requestInfo = requestInfo,
+                    )
+                }.getOrNull()
+
+                if (intercepted == null) {
+                    // Network interception failed before AfterDark answered.
+                    // Do not fabricate a result or close verification.
+                    sourceInterceptStarted.set(false)
+                    return null
+                }
+
+                finishWithCapturedResponse(intercepted.captured)
+                return intercepted.webResponse
             }
 
             browser.webChromeClient = object : WebChromeClient() {
@@ -221,15 +263,8 @@ object AfterDarkProofWebView {
                             view: WebView?,
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
-                            val captured = captureSourceRequest(
-                                webRequest = webRequest,
-                                playbackRequest = request,
-                                targetHost = targetHost,
-                            )
-                            if (captured != null) {
-                                finishWithCapturedProof(captured)
-                            }
-                            return super.shouldInterceptRequest(view, webRequest)
+                            return interceptOfficialSources(webRequest)
+                                ?: super.shouldInterceptRequest(view, webRequest)
                         }
                     }
 
@@ -270,17 +305,8 @@ object AfterDarkProofWebView {
                     view: WebView?,
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
-                    val captured = captureSourceRequest(
-                        webRequest = webRequest,
-                        playbackRequest = request,
-                        targetHost = targetHost,
-                    )
-
-                    if (captured != null) {
-                        finishWithCapturedProof(captured)
-                    }
-
-                    return super.shouldInterceptRequest(view, webRequest)
+                    return interceptOfficialSources(webRequest)
+                        ?: super.shouldInterceptRequest(view, webRequest)
                 }
             }
 
@@ -326,11 +352,23 @@ object AfterDarkProofWebView {
         }
     }
 
+    private data class SourceRequestInfo(
+        val proof: String,
+        val url: String,
+        val headers: Map<String, String>,
+        val referer: String?,
+    )
+
+    private data class InterceptedSource(
+        val captured: CapturedSourceResponse,
+        val webResponse: WebResourceResponse,
+    )
+
     private fun captureSourceRequest(
         webRequest: WebResourceRequest?,
         playbackRequest: PlaybackRequest,
         targetHost: String?,
-    ): CapturedSourceRequest? {
+    ): SourceRequestInfo? {
         if (webRequest == null) return null
         if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
@@ -367,12 +405,102 @@ object AfterDarkProofWebView {
             ?.value
             ?.takeIf { it.isNotBlank() }
 
-        return CapturedSourceRequest(
+        return SourceRequestInfo(
             proof = proof,
             url = uri.toString(),
             headers = headers,
             referer = referer,
         )
+    }
+
+    private fun executeSourceRequestOnce(
+        requestInfo: SourceRequestInfo,
+    ): InterceptedSource {
+        val connection = (URL(requestInfo.url).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            instanceFollowRedirects = false
+            connectTimeout = 30_000
+            readTimeout = 150_000
+            useCaches = false
+
+            requestInfo.headers.forEach { (key, value) ->
+                if (
+                    !key.equals("Host", ignoreCase = true) &&
+                    !key.equals("Connection", ignoreCase = true) &&
+                    !key.equals("Content-Length", ignoreCase = true) &&
+                    !key.equals("Cookie", ignoreCase = true) &&
+                    !key.equals("Accept-Encoding", ignoreCase = true)
+                ) {
+                    setRequestProperty(key, value)
+                }
+            }
+
+            // Avoid compressed bytes because the captured body is parsed as text.
+            setRequestProperty("Accept-Encoding", "identity")
+
+            CookieManager.getInstance()
+                .getCookie(requestInfo.url)
+                ?.takeIf { it.isNotBlank() }
+                ?.let { setRequestProperty("Cookie", it) }
+        }
+
+        try {
+            val statusCode = connection.responseCode
+            val responseStream = if (statusCode >= 400) {
+                connection.errorStream
+            } else {
+                connection.inputStream
+            }
+
+            val bytes = responseStream?.use { it.readBytes() } ?: ByteArray(0)
+            val body = bytes.toString(Charsets.UTF_8)
+            val mimeType = connection.contentType
+                ?.substringBefore(";")
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: "application/x-ndjson"
+
+            val reason = connection.responseMessage
+                ?.takeIf { it.isNotBlank() }
+                ?: "HTTP $statusCode"
+
+            val responseHeaders = LinkedHashMap<String, String>()
+            connection.headerFields.forEach { (key, values) ->
+                if (key != null && !values.isNullOrEmpty()) {
+                    if (
+                        !key.equals("Content-Encoding", ignoreCase = true) &&
+                        !key.equals("Content-Length", ignoreCase = true)
+                    ) {
+                        responseHeaders[key] = values.joinToString(", ")
+                    }
+                }
+            }
+
+            val captured = CapturedSourceResponse(
+                proof = requestInfo.proof,
+                url = requestInfo.url,
+                headers = requestInfo.headers,
+                referer = requestInfo.referer,
+                statusCode = statusCode,
+                body = body,
+            )
+
+            val webResponse = WebResourceResponse(
+                mimeType,
+                "UTF-8",
+                statusCode,
+                reason,
+                responseHeaders,
+                ByteArrayInputStream(bytes),
+            )
+
+            return InterceptedSource(
+                captured = captured,
+                webResponse = webResponse,
+            )
+        } finally {
+            connection.disconnect()
+        }
     }
 
 }

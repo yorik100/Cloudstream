@@ -77,11 +77,13 @@ data class PlaybackRequest(
     }
 }
 
-data class CapturedSourceRequest(
+data class CapturedSourceResponse(
     val proof: String,
     val url: String,
     val headers: Map<String, String>,
     val referer: String?,
+    val statusCode: Int,
+    val body: String,
 )
 
 data class ProofSession(
@@ -91,6 +93,8 @@ data class ProofSession(
     val sourceRequestUrl: String? = null,
     val sourceRequestHeaders: Map<String, String> = emptyMap(),
     val sourceReferer: String? = null,
+    val sourceResponseStatus: Int? = null,
+    val sourceResponseBody: String? = null,
 )
 
 data class ParsedSubtitle(
