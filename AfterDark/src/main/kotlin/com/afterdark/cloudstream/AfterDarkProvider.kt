@@ -274,6 +274,7 @@ class AfterDarkProvider : MainAPI() {
                                 episode = episodeNumber
                                 posterUrl = seasonPoster
                             },
+                            fix = false,
                         )
                     }
                 }

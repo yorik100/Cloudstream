@@ -292,6 +292,7 @@ class FrembedProvider : MainAPI() {
                                 episode = episodeNumber
                                 posterUrl = seasonPoster
                             },
+                            fix = false,
                         )
                     }
                 }
