@@ -195,6 +195,30 @@ class FrembedProvider : MainAPI() {
         return newHomePageResponse(request, items, page < totalPages)
     }
 
+    private suspend fun isAvailableOnFrembed(item: JSONObject): Boolean {
+        val mediaType = item.stringOrNull("media_type") ?: return false
+        val tmdbId = item.optInt("id", 0).takeIf { it > 0 } ?: return false
+
+        return when (mediaType) {
+            "movie" -> fetchMovieServers(tmdbId).isNotEmpty()
+
+            "tv" -> {
+                // Search results do not include a selected episode. Checking
+                // S01E01 prevents Frembed from advertising unrelated TMDB
+                // titles while keeping search reasonably lightweight.
+                val request = FrembedPlaybackRequest(
+                    tmdbId = tmdbId,
+                    type = "tv",
+                    season = 1,
+                    episode = 1,
+                )
+                fetchSeriesServers(request).isNotEmpty()
+            }
+
+            else -> false
+        }
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
 
@@ -206,11 +230,18 @@ class FrembedProvider : MainAPI() {
             ),
         )
         val results = root.optJSONArray("results") ?: JSONArray()
+        val output = ArrayList<SearchResponse>()
 
-        return results.objects()
-            .mapNotNull { it.toSearchResponse() }
+        for (item in results.objects()) {
+            if (!runCatching { isAvailableOnFrembed(item) }.getOrDefault(false)) {
+                continue
+            }
+
+            item.toSearchResponse()?.let { output += it }
+        }
+
+        return output
             .distinctBy { it.url }
-            .toList()
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -328,6 +359,14 @@ class FrembedProvider : MainAPI() {
             "?sa=$season&epi=$episode"
     }
 
+    private fun seriesInfoUrl(request: FrembedPlaybackRequest): String? {
+        val season = request.season ?: return null
+        val episode = request.episode ?: return null
+
+        return "$mainUrl/api/series?id=${request.tmdbId}" +
+            "&sa=$season&epi=$episode&idType=tmdb"
+    }
+
     private fun seriesPageUrl(request: FrembedPlaybackRequest): String? {
         val season = request.season ?: return null
         val episode = request.episode ?: return null
@@ -416,6 +455,97 @@ class FrembedProvider : MainAPI() {
                         slug = "",
                         lang = lang,
                         url = absoluteUrl,
+                    )
+                }
+            }
+        }
+
+        return result.values.toList()
+    }
+
+    private suspend fun fetchSeriesServers(
+        request: FrembedPlaybackRequest,
+    ): List<FrembedServer> {
+        val infoUrl = seriesInfoUrl(request) ?: return emptyList()
+        val pageUrl = seriesPageUrl(request) ?: return emptyList()
+
+        val response = runCatching {
+            app.get(
+                url = infoUrl,
+                headers = browserHeaders,
+                referer = pageUrl,
+                cacheTime = 0,
+            )
+        }.getOrNull() ?: return emptyList()
+
+        if (response.okhttpResponse.code !in 200..299) return emptyList()
+
+        val root = runCatching { JSONObject(response.text) }.getOrNull()
+            ?: return emptyList()
+
+        val result = LinkedHashMap<String, FrembedServer>()
+
+        // Current Frembed series API: links[] is the authoritative list.
+        val links = root.optJSONArray("links") ?: JSONArray()
+        for (index in 0 until links.length()) {
+            val item = links.optJSONObject(index) ?: continue
+            val rawUrl = item.stringOrNull("url") ?: continue
+            val absoluteUrl = streamUrl(rawUrl) ?: continue
+
+            val host = item.optJSONObject("host")
+            val label = item.stringOrNull("label")
+                ?: host?.stringOrNull("name")
+                ?: host?.stringOrNull("slug")
+                ?: "Serveur ${index + 1}"
+
+            val slug = host?.stringOrNull("slug")
+                ?: label.lowercase()
+
+            val lang = item.stringOrNull("lang")
+                ?.uppercase()
+                ?: "VF"
+
+            result[absoluteUrl] = FrembedServer(
+                label = label,
+                slug = slug,
+                lang = lang,
+                url = absoluteUrl,
+            )
+        }
+
+        // Compatibility fallback for older API responses.
+        if (result.isEmpty()) {
+            val suffixes = listOf(
+                "" to "VF",
+                "vostfr" to "VOSTFR",
+                "vo" to "VO",
+            )
+
+            for ((suffix, lang) in suffixes) {
+                for (serverIndex in 1..7) {
+                    val key = "link$serverIndex$suffix"
+                    val rawUrl = root.stringOrNull(key) ?: continue
+                    val absoluteUrl = streamUrl(rawUrl) ?: continue
+
+                    result[absoluteUrl] = FrembedServer(
+                        label = "Serveur $serverIndex",
+                        slug = "",
+                        lang = lang,
+                        url = absoluteUrl,
+                    )
+                }
+            }
+
+            root.stringOrNull("link")?.let { rawUrl ->
+                streamUrl(rawUrl)?.let { absoluteUrl ->
+                    result.putIfAbsent(
+                        absoluteUrl,
+                        FrembedServer(
+                            label = "Serveur",
+                            slug = "",
+                            lang = root.stringOrNull("version") ?: "VF",
+                            url = absoluteUrl,
+                        ),
                     )
                 }
             }
@@ -691,12 +821,12 @@ class FrembedProvider : MainAPI() {
     }
 
     private suspend fun emitSeriesServer(
-        serverUrl: String,
+        server: FrembedServer,
         request: FrembedPlaybackRequest,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val target = resolveSeriesServerRedirect(serverUrl, request)
+        val target = resolveSeriesServerRedirect(server.url, request)
             ?: return false
 
         if (isFrembedTestVideoUrl(target)) return false
@@ -708,7 +838,18 @@ class FrembedProvider : MainAPI() {
 
         if (emitDirect(target, "", callback)) return true
 
-        // Same host-name dispatch that fixed movie mirrors.
+        // The series API already tells us the authoritative host.slug.
+        if (
+            tryNamedHostExtractors(
+                server = server,
+                url = target,
+                subtitleCallback = subtitleCallback,
+                callback = callback,
+            )
+        ) {
+            return true
+        }
+
         if (tryKnownHostExtractorByUrl(target, subtitleCallback, callback)) {
             return true
         }
@@ -1172,41 +1313,14 @@ class FrembedProvider : MainAPI() {
             return found
         }
 
-        val apiUrl = seriesApiUrl(request) ?: return false
-
-        // First verify that Frembed actually exposes this episode through its
-        // current public API. The API itself only returns the player link, not
-        // the individual server ids.
-        val available = runCatching {
-            val response = app.get(
-                url = apiUrl,
-                headers = browserHeaders,
-                referer = "$mainUrl/",
-                cacheTime = 0,
-            )
-
-            if (response.okhttpResponse.code !in 200..299) {
-                false
-            } else {
-                val root = JSONObject(response.text)
-                val items = root.optJSONObject("result")
-                    ?.optJSONArray("items")
-                    ?: JSONArray()
-
-                items.length() > 0
-            }
-        }.getOrDefault(false)
-
-        if (!available) return false
-
-        val serverUrls = fetchSeriesStreamUrls(request)
-        if (serverUrls.isEmpty()) return false
+        val servers = fetchSeriesServers(request)
+        if (servers.isEmpty()) return false
 
         var found = false
 
-        for (serverUrl in serverUrls) {
+        for (server in servers) {
             val emitted = emitSeriesServer(
-                serverUrl = serverUrl,
+                server = server,
                 request = request,
                 subtitleCallback = subtitleCallback,
                 callback = callback,
