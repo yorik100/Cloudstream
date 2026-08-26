@@ -28,6 +28,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 class FrembedProvider : MainAPI() {
     override var mainUrl = "https://frembed.casa"
@@ -121,6 +125,20 @@ class FrembedProvider : MainAPI() {
             optJSONObject(index)?.let { yield(it) }
         }
     }
+
+    private fun todayUtc(): String =
+        SimpleDateFormat(
+            "yyyy-MM-dd",
+            Locale.US,
+        ).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+
+    private fun isFutureEpisode(
+        airDate: String?,
+        today: String,
+    ): Boolean =
+        airDate != null && airDate > today
 
     private suspend fun tmdbGet(
         path: String,
@@ -297,37 +315,90 @@ class FrembedProvider : MainAPI() {
                 score = scoreValue
             }
         } else {
-            val seasons = details.optJSONArray("seasons") ?: JSONArray()
-
-            val episodes = seasons.objects()
+            val seasons = (details.optJSONArray("seasons") ?: JSONArray())
+                .objects()
                 .filter { it.optInt("episode_count", 0) > 0 }
                 .sortedBy { it.optInt("season_number", 0) }
-                .flatMap { season ->
-                    val seasonNumber = season.optInt("season_number", 0)
-                    val episodeCount = season.optInt("episode_count", 0)
-                    val seasonPoster = poster(season.stringOrNull("poster_path"))
-
-                    (1..episodeCount).asSequence().map { episodeNumber ->
-                        val playback = FrembedPlaybackRequest(
-                            tmdbId = tmdbId,
-                            type = "tv",
-                            season = seasonNumber,
-                            episode = episodeNumber,
-                        )
-
-                        newEpisode(
-                            url = playback.encode(),
-                            initializer = {
-                                name = "Épisode $episodeNumber"
-                                this.season = seasonNumber
-                                episode = episodeNumber
-                                posterUrl = seasonPoster
-                            },
-                            fix = false,
-                        )
-                    }
-                }
                 .toList()
+
+            val today = todayUtc()
+            val episodes = ArrayList<com.lagradost.cloudstream3.Episode>()
+            var hasAvailableEpisode = false
+
+            for (season in seasons) {
+                val seasonNumber = season.optInt("season_number", 0)
+                val episodeCount = season.optInt("episode_count", 0)
+                val seasonPoster = poster(season.stringOrNull("poster_path"))
+
+                val seasonDetails = runCatching {
+                    tmdbGet("/tv/$tmdbId/season/$seasonNumber")
+                }.getOrNull()
+
+                val metadataByEpisode =
+                    (seasonDetails?.optJSONArray("episodes") ?: JSONArray())
+                        .objects()
+                        .associateBy { it.optInt("episode_number", 0) }
+
+                for (episodeNumber in 1..episodeCount) {
+                    val metadata = metadataByEpisode[episodeNumber]
+                    val airDate = metadata?.stringOrNull("air_date")
+                    val future = isFutureEpisode(airDate, today)
+
+                    val playback = FrembedPlaybackRequest(
+                        tmdbId = tmdbId,
+                        type = "tv",
+                        season = seasonNumber,
+                        episode = episodeNumber,
+                    )
+
+                    // Frembed itself decides whether this exact episode exists.
+                    // A future TMDB date never blocks an early Frembed release.
+                    val availableOnFrembed = runCatching {
+                        fetchSeriesServers(playback).isNotEmpty()
+                    }.getOrDefault(false)
+
+                    if (availableOnFrembed) {
+                        hasAvailableEpisode = true
+                    } else if (!future) {
+                        // An already-aired episode with no Frembed server does
+                        // not belong in the Frembed provider.
+                        continue
+                    }
+
+                    val episodeTitle = metadata
+                        ?.stringOrNull("name")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "Épisode $episodeNumber"
+
+                    val episodePoster = poster(
+                        metadata?.stringOrNull("still_path"),
+                        "w500",
+                    ) ?: seasonPoster
+
+                    episodes += newEpisode(
+                        url = playback.encode(),
+                        initializer = {
+                            name = if (availableOnFrembed) {
+                                episodeTitle
+                            } else {
+                                val dateLabel = airDate?.let { " · $it" }.orEmpty()
+                                "⏳ À venir · $episodeTitle$dateLabel"
+                            }
+                            this.season = seasonNumber
+                            episode = episodeNumber
+                            posterUrl = episodePoster
+                        },
+                        fix = false,
+                    )
+                }
+            }
+
+            // A direct/catalog URL must not expose a TMDB-only series as a
+            // Frembed title. Future placeholders are shown only once Frembed
+            // already has at least one real episode for the series.
+            if (!hasAvailableEpisode) {
+                throw ErrorLoadingException("Série indisponible sur Frembed")
+            }
 
             newTvSeriesLoadResponse(
                 name = title,
