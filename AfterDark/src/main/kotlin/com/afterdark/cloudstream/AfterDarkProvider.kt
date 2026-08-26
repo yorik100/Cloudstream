@@ -554,10 +554,8 @@ class AfterDarkProvider : MainAPI() {
         }.getOrDefault(true)
     }
 
-    private fun responseContentType(headers: Map<String, String>): String =
-        headers.entries
-            .firstOrNull { (key, _) -> key.equals("Content-Type", ignoreCase = true) }
-            ?.value
+    private fun responseContentType(headers: okhttp3.Headers): String =
+        headers["Content-Type"]
             ?.substringBefore(";")
             ?.trim()
             ?.lowercase()
@@ -637,12 +635,8 @@ class AfterDarkProvider : MainAPI() {
 
                     if (code in 200..299) {
                         val contentType = responseContentType(head.headers)
-                        val contentLength = head.headers.entries
-                            .firstOrNull { (key, _) ->
-                                key.equals("Content-Length", ignoreCase = true)
-                            }
-                            ?.value
-                            ?.toLongOrNull()
+                        val contentLength =
+                            head.headers["Content-Length"]?.toLongOrNull()
 
                         if (
                             contentType.startsWith("video/") ||
@@ -671,11 +665,8 @@ class AfterDarkProvider : MainAPI() {
                     }
 
                     val contentType = responseContentType(response.headers)
-                    val contentRange = response.headers.entries
-                        .firstOrNull { (key, _) ->
-                            key.equals("Content-Range", ignoreCase = true)
-                        }
-                        ?.value
+                    val contentRange =
+                        response.headers["Content-Range"]
 
                     // Reject common "200 OK" HTML/JSON error pages.
                     val clearlyNotVideo =
