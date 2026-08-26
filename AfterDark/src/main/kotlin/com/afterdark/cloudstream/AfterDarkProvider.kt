@@ -1,6 +1,7 @@
 package com.afterdark.cloudstream
 
 import com.lagradost.cloudstream3.ErrorLoadingException
+import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -10,6 +11,7 @@ import com.lagradost.cloudstream3.Score
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.addDate
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
@@ -29,6 +31,7 @@ import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 class AfterDarkProvider : MainAPI() {
@@ -250,38 +253,93 @@ class AfterDarkProvider : MainAPI() {
                 score = scoreValue
             }
         } else {
-            val seasons = details.optJSONArray("seasons") ?: JSONArray()
-            val episodes = seasons.objects()
+            val seasons = (details.optJSONArray("seasons") ?: JSONArray())
+                .objects()
                 .filter { it.optInt("episode_count", 0) > 0 }
                 .sortedBy { it.optInt("season_number", 0) }
-                .flatMap { season ->
-                    val seasonNumber = season.optInt("season_number", 0)
-                    val episodeCount = season.optInt("episode_count", 0)
-                    val seasonPoster = poster(season.stringOrNull("poster_path"))
-
-                    (1..episodeCount).asSequence().map { episodeNumber ->
-                        val playback = PlaybackRequest(
-                            tmdbId = tmdbId,
-                            type = "tv",
-                            title = title,
-                            releaseYear = releaseYear,
-                            season = seasonNumber,
-                            episode = episodeNumber,
-                        )
-
-                        newEpisode(
-                            url = playback.encode(),
-                            initializer = {
-                                name = "Épisode $episodeNumber"
-                                this.season = seasonNumber
-                                episode = episodeNumber
-                                posterUrl = seasonPoster
-                            },
-                            fix = false,
-                        )
-                    }
-                }
                 .toList()
+
+            // Match AfterDark's title page exactly:
+            // an episode is considered aired when air_date is missing or when
+            // its ISO date is <= today's UTC ISO date.
+            val todayUtc = afterDarkTodayUtc()
+            val episodes = mutableListOf<Episode>()
+
+            for (season in seasons) {
+                val seasonNumber = season.optInt("season_number", 0)
+                if (seasonNumber < 0) continue
+
+                val episodeCount = season.optInt("episode_count", 0)
+                val seasonPoster = poster(season.stringOrNull("poster_path"))
+
+                val seasonDetails = runCatching {
+                    tmdbGet("/tv/$tmdbId/season/$seasonNumber")
+                }.getOrNull()
+
+                val episodeMetadata = (seasonDetails?.optJSONArray("episodes") ?: JSONArray())
+                    .objects()
+                    .associateBy { it.optInt("episode_number", 0) }
+
+                for (episodeNumber in 1..episodeCount) {
+                    val metadata = episodeMetadata[episodeNumber]
+                    val airDate = metadata?.stringOrNull("air_date")
+                    val aired = isAiredOnAfterDark(airDate, todayUtc)
+
+                    val episodeTitle = metadata
+                        ?.stringOrNull("name")
+                        ?.takeIf { it.isNotBlank() }
+                        ?: "Épisode $episodeNumber"
+
+                    val episodePoster = poster(
+                        metadata?.stringOrNull("still_path"),
+                        "w500",
+                    ) ?: seasonPoster
+
+                    val episodeOverview = metadata
+                        ?.stringOrNull("overview")
+                        ?.takeIf { it.isNotBlank() }
+
+                    val runtime = metadata
+                        ?.optInt("runtime", 0)
+                        ?.takeIf { it > 0 }
+
+                    val playback = PlaybackRequest(
+                        tmdbId = tmdbId,
+                        type = "tv",
+                        title = title,
+                        releaseYear = releaseYear,
+                        season = seasonNumber,
+                        episode = episodeNumber,
+                    )
+
+                    episodes += newEpisode(
+                        url = playback.encode(),
+                        initializer = {
+                            name = if (aired) {
+                                episodeTitle
+                            } else {
+                                "⏳ À venir · $episodeTitle"
+                            }
+                            this.season = seasonNumber
+                            episode = episodeNumber
+                            posterUrl = episodePoster
+                            description = if (aired) {
+                                episodeOverview
+                            } else {
+                                listOfNotNull(
+                                    airDate?.let { "Prévu le $it" },
+                                    episodeOverview,
+                                ).joinToString("\n\n").ifBlank {
+                                    "Épisode à venir"
+                                }
+                            }
+                            runTime = runtime
+                            addDate(airDate)
+                        },
+                        fix = false,
+                    )
+                }
+            }
 
             newTvSeriesLoadResponse(
                 name = title,
@@ -528,31 +586,19 @@ class AfterDarkProvider : MainAPI() {
             .joinToString(" · ")
             .ifBlank { source.group.ifBlank { "AfterDark" } }
 
-    private suspend fun isEpisodeAlreadyAired(
-        request: PlaybackRequest,
-    ): Boolean {
-        if (request.type != "tv") return true
+    private fun afterDarkTodayUtc(): String =
+        SimpleDateFormat(
+            "yyyy-MM-dd",
+            Locale.US,
+        ).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
 
-        val season = request.season ?: return true
-        val episode = request.episode ?: return true
-
-        return runCatching {
-            val details = tmdbGet(
-                "/tv/${request.tmdbId}/season/$season/episode/$episode",
-            )
-
-            val airDate = details.stringOrNull("air_date")
-                ?: return@runCatching true
-
-            // ISO yyyy-MM-dd strings sort chronologically.
-            val today = SimpleDateFormat(
-                "yyyy-MM-dd",
-                Locale.US,
-            ).format(Date())
-
-            airDate <= today
-        }.getOrDefault(true)
-    }
+    private fun isAiredOnAfterDark(
+        airDate: String?,
+        todayUtc: String,
+    ): Boolean =
+        airDate == null || airDate <= todayUtc
 
     private fun responseContentType(headers: okhttp3.Headers): String =
         headers["Content-Type"]
@@ -786,15 +832,6 @@ class AfterDarkProvider : MainAPI() {
             // player execute normally in an internal WebView and capture the
             // real HLS/DASH/video request it produces.
             if (isEmbed && source.group == "Secours") {
-                if (
-                    source.service.equals("videasy", ignoreCase = true) &&
-                    !isEpisodeAlreadyAired(request)
-                ) {
-                    // Do not wait on a Videasy player for an episode that has
-                    // not aired yet. Continue directly to Peachify.
-                    continue
-                }
-
                 val resolved = runCatching {
                     AfterDarkEmbedWebView.resolve(
                         embedUrl = source.url,
