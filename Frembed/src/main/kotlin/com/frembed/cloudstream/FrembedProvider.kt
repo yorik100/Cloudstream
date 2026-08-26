@@ -328,6 +328,20 @@ class FrembedProvider : MainAPI() {
             "?sa=$season&epi=$episode"
     }
 
+    private fun seriesPageUrl(request: FrembedPlaybackRequest): String? {
+        val season = request.season ?: return null
+        val episode = request.episode ?: return null
+
+        return "$mainUrl/series?id=${request.tmdbId}&sa=$season&epi=$episode"
+    }
+
+    private fun seriesEmbedUrl(request: FrembedPlaybackRequest): String? {
+        val season = request.season ?: return null
+        val episode = request.episode ?: return null
+
+        return "$mainUrl/embed/serie/${request.tmdbId}?sa=$season&epi=$episode"
+    }
+
     private fun streamUrl(rawUrl: String): String? =
         resolveUrl("$mainUrl/", rawUrl)
 
@@ -562,6 +576,158 @@ class FrembedProvider : MainAPI() {
             .filter(::isInterestingCandidate)
             .distinct()
             .take(40)
+    }
+
+    private fun extractSeriesStreamUrls(
+        baseUrl: String,
+        body: String,
+        request: FrembedPlaybackRequest,
+    ): List<String> {
+        val normalized = normalizeEscapes(body)
+        val expectedTmdb = request.tmdbId.toString()
+        val expectedSeason = request.season?.toString() ?: return emptyList()
+        val expectedEpisode = request.episode?.toString() ?: return emptyList()
+
+        val result = LinkedHashSet<String>()
+
+        // Current Frembed series player route observed in the browser:
+        // /api/stream?type=serie&tmdb=1396&sa=1&epi=1&server=id:898
+        Regex(
+            """(?i)(?:https?://[^"'<>\\\s]+)?/api/stream\?[^"'<>\\\s]+"""
+        ).findAll(normalized).forEach { match ->
+            val absolute = resolveUrl(baseUrl, match.value) ?: return@forEach
+            val uri = runCatching { URI(absolute) }.getOrNull() ?: return@forEach
+            val query = uri.rawQuery ?: return@forEach
+
+            val params = query.split("&")
+                .mapNotNull { part ->
+                    val pieces = part.split("=", limit = 2)
+                    if (pieces.size != 2) null
+                    else pieces[0].lowercase() to pieces[1]
+                }
+                .toMap()
+
+            if (
+                params["type"]?.equals("serie", ignoreCase = true) == true &&
+                params["tmdb"] == expectedTmdb &&
+                params["sa"] == expectedSeason &&
+                params["epi"] == expectedEpisode &&
+                params["server"]?.startsWith("id:") == true
+            ) {
+                result += absolute
+            }
+        }
+
+        return result.toList()
+    }
+
+    private suspend fun fetchSeriesStreamUrls(
+        request: FrembedPlaybackRequest,
+    ): List<String> {
+        val pageUrl = seriesPageUrl(request) ?: return emptyList()
+        val embedUrl = seriesEmbedUrl(request) ?: return emptyList()
+
+        // Prime the same page that Chrome uses as Referer for /api/stream.
+        val pageResponse = runCatching {
+            app.get(
+                url = pageUrl,
+                headers = browserHeaders,
+                referer = "$mainUrl/",
+                cacheTime = 0,
+            )
+        }.getOrNull()
+
+        val result = LinkedHashSet<String>()
+
+        if (pageResponse != null && pageResponse.okhttpResponse.code in 200..299) {
+            result += extractSeriesStreamUrls(pageUrl, pageResponse.text, request)
+        }
+
+        // Some Frembed builds serialize the server ids in the embed route
+        // rather than the /series page, so inspect both official player pages.
+        val embedResponse = runCatching {
+            app.get(
+                url = embedUrl,
+                headers = browserHeaders,
+                referer = pageUrl,
+                cacheTime = 0,
+            )
+        }.getOrNull()
+
+        if (embedResponse != null && embedResponse.okhttpResponse.code in 200..299) {
+            result += extractSeriesStreamUrls(embedUrl, embedResponse.text, request)
+        }
+
+        return result.toList()
+    }
+
+    private suspend fun resolveSeriesServerRedirect(
+        serverUrl: String,
+        request: FrembedPlaybackRequest,
+    ): String? {
+        val pageUrl = seriesPageUrl(request) ?: return null
+
+        // Exact successful browser context supplied from DevTools:
+        // Referer: /series?id=<tmdb>&sa=<season>&epi=<episode>
+        // Sec-Fetch-Dest: iframe
+        // Sec-Fetch-Mode: navigate
+        // Sec-Fetch-Site: same-origin
+        val response = runCatching {
+            app.get(
+                url = serverUrl,
+                headers = streamNavigationHeaders,
+                referer = pageUrl,
+                allowRedirects = false,
+                cacheTime = 0,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 300..399) return null
+
+        return resolveLocation(
+            requestUrl = serverUrl,
+            location = response.headers["Location"],
+        )
+    }
+
+    private suspend fun emitSeriesServer(
+        serverUrl: String,
+        request: FrembedPlaybackRequest,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val target = resolveSeriesServerRedirect(serverUrl, request)
+            ?: return false
+
+        if (isFrembedTestVideoUrl(target)) return false
+
+        if (isSubtitle(target)) {
+            subtitleCallback(newSubtitleFile("Frembed", target))
+            return true
+        }
+
+        if (emitDirect(target, "", callback)) return true
+
+        // Same host-name dispatch that fixed movie mirrors.
+        if (tryKnownHostExtractorByUrl(target, subtitleCallback, callback)) {
+            return true
+        }
+
+        if (tryCloudStreamExtractor(target, null, subtitleCallback, callback)) {
+            return true
+        }
+
+        // Unknown hosts (the captured example also showed fanstream.buzz)
+        // can still expose an iframe/direct media URL, so probe only that
+        // resolved third-party target as a last fallback.
+        return probeUrl(
+            url = target,
+            referer = "$mainUrl/",
+            depth = 0,
+            visited = LinkedHashSet(),
+            subtitleCallback = subtitleCallback,
+            callback = callback,
+        )
     }
 
     private fun resolveLocation(
@@ -1007,17 +1173,47 @@ class FrembedProvider : MainAPI() {
         }
 
         val apiUrl = seriesApiUrl(request) ?: return false
-        val visited = LinkedHashSet<String>()
 
-        // The current public TV API returns JSON whose result.items[].link is
-        // the official /embed/serie/<tmdb>?sa=<season>&epi=<episode> player.
-        return probeUrl(
-            url = apiUrl,
-            referer = "$mainUrl/",
-            depth = 0,
-            visited = visited,
-            subtitleCallback = subtitleCallback,
-            callback = callback,
-        )
+        // First verify that Frembed actually exposes this episode through its
+        // current public API. The API itself only returns the player link, not
+        // the individual server ids.
+        val available = runCatching {
+            val response = app.get(
+                url = apiUrl,
+                headers = browserHeaders,
+                referer = "$mainUrl/",
+                cacheTime = 0,
+            )
+
+            if (response.okhttpResponse.code !in 200..299) {
+                false
+            } else {
+                val root = JSONObject(response.text)
+                val items = root.optJSONObject("result")
+                    ?.optJSONArray("items")
+                    ?: JSONArray()
+
+                items.length() > 0
+            }
+        }.getOrDefault(false)
+
+        if (!available) return false
+
+        val serverUrls = fetchSeriesStreamUrls(request)
+        if (serverUrls.isEmpty()) return false
+
+        var found = false
+
+        for (serverUrl in serverUrls) {
+            val emitted = emitSeriesServer(
+                serverUrl = serverUrl,
+                request = request,
+                subtitleCallback = subtitleCallback,
+                callback = callback,
+            )
+            found = emitted || found
+        }
+
+        return found
     }
 }
