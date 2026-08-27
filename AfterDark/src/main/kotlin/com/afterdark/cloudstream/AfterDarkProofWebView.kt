@@ -121,7 +121,7 @@ object AfterDarkProofWebView {
                 domStorageEnabled = true
                 databaseEnabled = true
                 loadsImagesAutomatically = true
-                mediaPlaybackRequiresUserGesture = true
+                mediaPlaybackRequiresUserGesture = false
                 javaScriptCanOpenWindowsAutomatically = true
                 setSupportMultipleWindows(true)
                 cacheMode = WebSettings.LOAD_DEFAULT
@@ -137,6 +137,60 @@ object AfterDarkProofWebView {
                 ?.takeIf { it.isNotBlank() }
                 ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+
+            fun installAutoOpenAndPlay(target: WebView?) {
+                if (target == null || finished.get()) return
+
+                target.evaluateJavascript(
+                    """
+                    (() => {
+                      const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
+                      const normalize = value =>
+                        String(value || "").replace(/\\s+/g, " ").trim();
+
+                      const findAndClick = () => {
+                        const candidates = Array.from(
+                          document.querySelectorAll('a,button,[role="button"]')
+                        );
+
+                        const button = candidates.find(element => {
+                          const text = normalize(element.textContent);
+                          return text === TARGET_TEXT || text.includes(TARGET_TEXT);
+                        });
+
+                        if (!button) return false;
+                        if (button.dataset.afterdarkAutoOpened === "1") return true;
+
+                        button.dataset.afterdarkAutoOpened = "1";
+                        button.click();
+                        return true;
+                      };
+
+                      if (findAndClick()) return;
+
+                      if (window.__afterdarkAutoOpenObserver) {
+                        try { window.__afterdarkAutoOpenObserver.disconnect(); } catch (_) {}
+                      }
+
+                      const observer = new MutationObserver(() => {
+                        if (findAndClick()) {
+                          try { observer.disconnect(); } catch (_) {}
+                          window.__afterdarkAutoOpenObserver = null;
+                        }
+                      });
+
+                      observer.observe(document.documentElement, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true
+                      });
+
+                      window.__afterdarkAutoOpenObserver = observer;
+                    })();
+                    """.trimIndent(),
+                    null,
+                )
+            }
 
             fun finishWithCapturedResponse(captured: CapturedSourceResponse) {
                 // shouldInterceptRequest() is not a UI-thread callback.
@@ -221,6 +275,7 @@ object AfterDarkProofWebView {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
                         javaScriptCanOpenWindowsAutomatically = true
                         setSupportMultipleWindows(false)
                     }
@@ -231,6 +286,14 @@ object AfterDarkProofWebView {
                     }
 
                     popup.webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(
+                            view: WebView?,
+                            url: String?,
+                        ) {
+                            super.onPageFinished(view, url)
+                            installAutoOpenAndPlay(view)
+                        }
+
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?,
@@ -279,6 +342,14 @@ object AfterDarkProofWebView {
             }
 
             browser.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(
+                    view: WebView?,
+                    url: String?,
+                ) {
+                    super.onPageFinished(view, url)
+                    installAutoOpenAndPlay(view)
+                }
+
                 override fun shouldOverrideUrlLoading(
                     view: WebView?,
                     webRequest: WebResourceRequest?,
