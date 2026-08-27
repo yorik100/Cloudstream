@@ -439,6 +439,67 @@ object AfterDarkEmbedWebView {
                                 isVisible(anchor) && normalizedText(anchor.textContent) === 'go back'
                               );
 
+                            const isVideasyPage = () => {
+                              if (!VIDEASY_MODE) return false;
+                              const host = String(location.hostname || '').toLowerCase();
+                              return host === 'player.videasy.to' ||
+                                     host.endsWith('.videasy.to');
+                            };
+
+                            const findVideasyPlayButton = () => {
+                              if (!isVideasyPage()) return null;
+
+                              // Prefer the exact Videasy play icon supplied by
+                              // the player: <path d="M8 5v14l11-7z">.
+                              const iconButton = [...document.querySelectorAll('svg')].
+                                map(svg => ({
+                                  svg,
+                                  path: svg.querySelector('path[d="M8 5v14l11-7z"]')
+                                })).
+                                find(item =>
+                                  item.path &&
+                                  isVisible(item.svg) &&
+                                  item.svg.closest('button,[role="button"]')
+                                );
+
+                              if (iconButton) {
+                                const owner = iconButton.svg.closest('button,[role="button"]');
+                                if (owner && isVisible(owner)) return owner;
+                              }
+
+                              // Fallback for future Videasy markup changes.
+                              return [...document.querySelectorAll('button,[role="button"]')]
+                                .find(element => {
+                                  if (!isVisible(element)) return false;
+                                  const label = normalizedText(
+                                    element.getAttribute('aria-label') ||
+                                    element.getAttribute('title') ||
+                                    element.textContent
+                                  );
+                                  return label === 'play' ||
+                                         label === 'lecture' ||
+                                         label === 'lire';
+                                }) || null;
+                            };
+
+                            const tryVideasyAutoPlay = () => {
+                              if (!isVideasyPage()) return false;
+                              if (window.__afterdarkVideasyPlayClicked) return true;
+
+                              const playButton = findVideasyPlayButton();
+                              if (!playButton) return false;
+
+                              try {
+                                window.__afterdarkVideasyPlayClicked = true;
+                                bridge.activity();
+                                playButton.click();
+                                return true;
+                              } catch (_) {
+                                window.__afterdarkVideasyPlayClicked = false;
+                                return false;
+                              }
+                            };
+
                             const playerSelectors = [
                               'video',
                               'audio',
@@ -556,11 +617,13 @@ object AfterDarkEmbedWebView {
                             };
 
                             scanMedia();
+                            tryVideasyAutoPlay();
                             checkVideasyDomState();
 
                             if (!window.__afterdarkMediaObserver) {
                               window.__afterdarkMediaObserver = new MutationObserver(() => {
                                 scanMedia();
+                                tryVideasyAutoPlay();
                                 checkVideasyDomState();
                               });
                               window.__afterdarkMediaObserver.observe(document.documentElement, {
@@ -590,28 +653,30 @@ object AfterDarkEmbedWebView {
                               } catch (_) {}
                             });
 
-                            const candidates = [...document.querySelectorAll(
-                              'button,[role="button"],.play,.vjs-big-play-button'
-                            )];
+                            if (!VIDEASY_MODE) {
+                              const candidates = [...document.querySelectorAll(
+                                'button,[role="button"],.play,.vjs-big-play-button'
+                              )];
 
-                            const button = candidates.find(el => {
-                              const text = (
-                                el.innerText ||
-                                el.getAttribute('aria-label') ||
-                                el.getAttribute('title') ||
-                                ''
-                              ).toLowerCase();
+                              const button = candidates.find(el => {
+                                const text = (
+                                  el.innerText ||
+                                  el.getAttribute('aria-label') ||
+                                  el.getAttribute('title') ||
+                                  ''
+                                ).toLowerCase();
 
-                              return text.includes('play') ||
-                                     text.includes('lecture') ||
-                                     el.classList.contains('vjs-big-play-button');
-                            });
+                                return text.includes('play') ||
+                                       text.includes('lecture') ||
+                                       el.classList.contains('vjs-big-play-button');
+                              });
 
-                            if (button) {
-                              try {
-                                bridge.activity();
-                                button.click();
-                              } catch (_) {}
+                              if (button) {
+                                try {
+                                  bridge.activity();
+                                  button.click();
+                                } catch (_) {}
+                              }
                             }
                           } catch (_) {}
                         })();
