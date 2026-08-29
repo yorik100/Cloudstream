@@ -75,6 +75,10 @@ object AfterDarkProofWebView {
 
             val targetHost = Uri.parse(mainUrl).host
             val watchUrl = request.watchUrl(mainUrl)
+            val verificationHostForJs = targetHost
+                .orEmpty()
+                .replace("\\", "\\\\")
+                .replace("'", "\\'")
 
             val root = LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
@@ -116,6 +120,8 @@ object AfterDarkProofWebView {
             webView = browser
 
             browser.setBackgroundColor(Color.BLACK)
+            browser.isFocusable = true
+            browser.isFocusableInTouchMode = true
             browser.settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
@@ -138,15 +144,59 @@ object AfterDarkProofWebView {
                 ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                     "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
 
-            fun installAutoOpenAndPlay(target: WebView?) {
+            fun installAutoOpenAndPlay(
+                target: WebView?,
+                reloadIfStuck: Boolean,
+            ) {
                 if (target == null || finished.get()) return
 
                 target.evaluateJavascript(
                     """
                     (() => {
                       const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
+                      const EXPECTED_HOST = '$verificationHostForJs';
+                      const RELOAD_IF_STUCK = ${if (reloadIfStuck) "true" else "false"};
+                      const RELOAD_DELAY_MS = 10000;
+                      const SEEN_KEY = "__afterdark_verification_button_seen";
+
+                      if (
+                        !EXPECTED_HOST ||
+                        String(location.hostname || "").toLowerCase() !==
+                          EXPECTED_HOST.toLowerCase()
+                      ) {
+                        return;
+                      }
+
                       const normalize = value =>
                         String(value || "").replace(/\\s+/g, " ").trim();
+
+                      const wasSeen = () => {
+                        if (window.__afterdarkVerificationButtonSeen === true) {
+                          return true;
+                        }
+
+                        try {
+                          return sessionStorage.getItem(SEEN_KEY) === "1";
+                        } catch (_) {
+                          return false;
+                        }
+                      };
+
+                      const cancelReload = () => {
+                        const timer = window.__afterdarkVerificationReloadTimer;
+                        if (timer) {
+                          clearTimeout(timer);
+                          window.__afterdarkVerificationReloadTimer = null;
+                        }
+                      };
+
+                      const markSeen = () => {
+                        window.__afterdarkVerificationButtonSeen = true;
+                        try {
+                          sessionStorage.setItem(SEEN_KEY, "1");
+                        } catch (_) {}
+                        cancelReload();
+                      };
 
                       const findAndClick = () => {
                         const candidates = Array.from(
@@ -159,6 +209,11 @@ object AfterDarkProofWebView {
                         });
 
                         if (!button) return false;
+
+                        // Once the button has appeared, never reload this
+                        // verification because of the 10-second watchdog.
+                        markSeen();
+
                         if (button.dataset.afterdarkAutoOpened === "1") return true;
 
                         button.dataset.afterdarkAutoOpened = "1";
@@ -186,6 +241,30 @@ object AfterDarkProofWebView {
                       });
 
                       window.__afterdarkAutoOpenObserver = observer;
+
+                      // This function is called from onPageFinished(), so the
+                      // countdown begins only after WebView considers the page loaded.
+                      // Popup WebViews keep auto-click support but get no reload timer.
+                      if (RELOAD_IF_STUCK && !wasSeen()) {
+                        cancelReload();
+
+                        window.__afterdarkVerificationReloadTimer = setTimeout(() => {
+                          window.__afterdarkVerificationReloadTimer = null;
+
+                          // The button may have appeared and disappeared before
+                          // the ten seconds elapsed. Persisting the flag in
+                          // sessionStorage prevents an unwanted reload.
+                          if (wasSeen()) return;
+
+                          try {
+                            location.reload();
+                          } catch (_) {
+                            try {
+                              location.href = location.href;
+                            } catch (_) {}
+                          }
+                        }, RELOAD_DELAY_MS);
+                      }
                     })();
                     """.trimIndent(),
                     null,
@@ -291,7 +370,7 @@ object AfterDarkProofWebView {
                             url: String?,
                         ) {
                             super.onPageFinished(view, url)
-                            installAutoOpenAndPlay(view)
+                            installAutoOpenAndPlay(view, reloadIfStuck = false)
                         }
 
                         override fun shouldOverrideUrlLoading(
@@ -347,7 +426,7 @@ object AfterDarkProofWebView {
                     url: String?,
                 ) {
                     super.onPageFinished(view, url)
-                    installAutoOpenAndPlay(view)
+                    installAutoOpenAndPlay(view, reloadIfStuck = true)
                 }
 
                 override fun shouldOverrideUrlLoading(
@@ -414,6 +493,7 @@ object AfterDarkProofWebView {
                 show()
             }
 
+                browser.requestFocus()
                 browser.loadUrl(watchUrl)
                 handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
             } catch (_: Exception) {
