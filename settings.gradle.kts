@@ -1,3 +1,17 @@
+// Kotlin 2.4 metadata requires R8 9.1.29+.
+// Keep AGP 8.7.3 for CloudStream compatibility and override only D8/R8.
+pluginManagement {
+    buildscript {
+        repositories {
+            google()
+            mavenCentral()
+        }
+        dependencies {
+            classpath("com.android.tools:r8:9.1.29")
+        }
+    }
+}
+
 rootProject.name = "CloudstreamPlugins"
 
 val disabled = emptyList<String>()

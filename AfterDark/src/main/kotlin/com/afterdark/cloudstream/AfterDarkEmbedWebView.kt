@@ -109,7 +109,6 @@ object AfterDarkEmbedWebView {
                 browser.settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
-                    databaseEnabled = true
                     loadsImagesAutomatically = true
                     mediaPlaybackRequiresUserGesture = false
                     javaScriptCanOpenWindowsAutomatically = false

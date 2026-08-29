@@ -1,4 +1,4 @@
-version = 25
+version = 26
 cloudstream {
     description = "AfterDark - récupération des sources après vérification officielle dans WebView"
     authors = listOf("yorik100")
