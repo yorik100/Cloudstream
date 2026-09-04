@@ -1,4 +1,4 @@
-version = 15
+version = 16
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "Frembed - domaine découvert et validé automatiquement"
+    description = "Frembed - dernier domaine validé en priorité, découverte automatique"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
