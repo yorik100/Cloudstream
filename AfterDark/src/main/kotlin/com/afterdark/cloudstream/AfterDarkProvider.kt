@@ -35,7 +35,7 @@ import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 class AfterDarkProvider : MainAPI() {
-    override var mainUrl = "https://afd926.mom"
+    override var mainUrl = AfterDarkDomainResolver.SOURCE_ORIGIN
     override var name = "AfterDark"
     override var lang = "fr"
 
@@ -53,6 +53,17 @@ class AfterDarkProvider : MainAPI() {
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
 
     private val proofCache = ConcurrentHashMap<String, ProofSession>()
+    private val domainResolver = AfterDarkDomainResolver()
+
+    private suspend fun ensureAfterDarkDomain(): String {
+        val resolved = domainResolver.resolve()
+        mainUrl = resolved
+        return resolved
+    }
+
+    internal suspend fun prepareDomain() {
+        ensureAfterDarkDomain()
+    }
 
     override val mainPage = mainPageOf(
         "movie" to "Films populaires",
@@ -167,6 +178,8 @@ class AfterDarkProvider : MainAPI() {
         page: Int,
         request: MainPageRequest,
     ): HomePageResponse {
+        ensureAfterDarkDomain()
+
         val type = if (request.data == "tv") "tv" else "movie"
         val endpoint = if (type == "tv") "/tv/popular" else "/movie/popular"
         val root = tmdbGet(endpoint, mapOf("page" to page.toString()))
@@ -182,6 +195,8 @@ class AfterDarkProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
+
+        ensureAfterDarkDomain()
 
         val root = tmdbGet(
             "/search/multi",
@@ -199,6 +214,8 @@ class AfterDarkProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        ensureAfterDarkDomain()
+
         val match = Regex("""/watch/(movie|tv)-(\d+)""").find(url)
             ?: throw ErrorLoadingException("URL AfterDark invalide")
 
@@ -737,6 +754,8 @@ class AfterDarkProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        ensureAfterDarkDomain()
+
         val request = PlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données AfterDark invalides")
 
