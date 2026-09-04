@@ -1,5 +1,6 @@
 package com.afterdark.cloudstream
 
+import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
@@ -34,7 +35,9 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
-class AfterDarkProvider : MainAPI() {
+class AfterDarkProvider(
+    preferences: SharedPreferences,
+) : MainAPI() {
     override var mainUrl = AfterDarkDomainResolver.SOURCE_ORIGIN
     override var name = "AfterDark"
     override var lang = "fr"
@@ -53,7 +56,7 @@ class AfterDarkProvider : MainAPI() {
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
 
     private val proofCache = ConcurrentHashMap<String, ProofSession>()
-    private val domainResolver = AfterDarkDomainResolver()
+    private val domainResolver = AfterDarkDomainResolver(preferences)
 
     private suspend fun ensureAfterDarkDomain(): String {
         val resolved = domainResolver.resolve()
