@@ -1,4 +1,4 @@
-version = 29
+version = 28
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - cache persistant avec rejet des anciennes pages d'adresse"
+    description = "AfterDark - domaine officiel résolu automatiquement puis vérification WebView"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
