@@ -34,7 +34,7 @@ import java.util.Locale
 import java.util.TimeZone
 
 class FrembedProvider : MainAPI() {
-    override var mainUrl = "https://frembed.casa"
+    override var mainUrl = FrembedDomainResolver.DISCOVERY_ORIGIN
     override var name = "Frembed"
     override var lang = "fr"
 
@@ -80,6 +80,21 @@ class FrembedProvider : MainAPI() {
         "Sec-Fetch-User" to "?1",
         "Upgrade-Insecure-Requests" to "1",
     )
+
+    private val domainResolver = FrembedDomainResolver(
+        requestHeaders = browserHeaders,
+        streamHeaders = streamNavigationHeaders,
+    )
+
+    private suspend fun ensureFrembedDomain(): String {
+        val resolved = domainResolver.resolve()
+        mainUrl = resolved
+        return resolved
+    }
+
+    internal suspend fun prepareDomain() {
+        ensureFrembedDomain()
+    }
 
     override val mainPage = mainPageOf(
         "movie" to "Films populaires",
@@ -199,6 +214,8 @@ class FrembedProvider : MainAPI() {
         page: Int,
         request: MainPageRequest,
     ): HomePageResponse {
+        ensureFrembedDomain()
+
         val type = if (request.data == "tv") "tv" else "movie"
         val endpoint = if (type == "tv") "/tv/popular" else "/movie/popular"
 
@@ -240,6 +257,8 @@ class FrembedProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
 
+        ensureFrembedDomain()
+
         val root = tmdbGet(
             "/search/multi",
             mapOf(
@@ -263,6 +282,8 @@ class FrembedProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
+        ensureFrembedDomain()
+
         val match = Regex("""/cloudstream/(movie|tv)/(\d+)""").find(url)
             ?: throw ErrorLoadingException("URL Frembed invalide")
 
@@ -1375,6 +1396,8 @@ class FrembedProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
+        ensureFrembedDomain()
+
         val request = FrembedPlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données Frembed invalides")
 
