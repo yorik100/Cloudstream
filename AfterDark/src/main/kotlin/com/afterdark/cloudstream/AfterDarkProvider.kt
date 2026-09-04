@@ -35,7 +35,7 @@ import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
 class AfterDarkProvider : MainAPI() {
-    override var mainUrl = "https://afterdark06.mom"
+    override var mainUrl = "https://afd926.mom"
     override var name = "AfterDark"
     override var lang = "fr"
 
