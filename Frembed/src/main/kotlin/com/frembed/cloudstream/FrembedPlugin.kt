@@ -13,7 +13,11 @@ class FrembedPlugin : Plugin() {
     private val discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun load(context: Context) {
-        val provider = FrembedProvider()
+        val preferences = context.getSharedPreferences(
+            FrembedDomainResolver.PREFERENCES_NAME,
+            Context.MODE_PRIVATE,
+        )
+        val provider = FrembedProvider(preferences)
         registerMainAPI(provider)
 
         discoveryScope.launch {

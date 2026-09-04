@@ -1,5 +1,6 @@
 package com.frembed.cloudstream
 
+import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -33,7 +34,9 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-class FrembedProvider : MainAPI() {
+class FrembedProvider(
+    preferences: SharedPreferences,
+) : MainAPI() {
     override var mainUrl = FrembedDomainResolver.DISCOVERY_ORIGIN
     override var name = "Frembed"
     override var lang = "fr"
@@ -84,6 +87,7 @@ class FrembedProvider : MainAPI() {
     private val domainResolver = FrembedDomainResolver(
         requestHeaders = browserHeaders,
         streamHeaders = streamNavigationHeaders,
+        preferences = preferences,
     )
 
     private suspend fun ensureFrembedDomain(): String {

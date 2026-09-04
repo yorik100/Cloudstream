@@ -1,5 +1,6 @@
 package com.frembed.cloudstream
 
+import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.async
@@ -15,6 +16,7 @@ import java.net.URI
 internal class FrembedDomainResolver(
     private val requestHeaders: Map<String, String>,
     private val streamHeaders: Map<String, String>,
+    private val preferences: SharedPreferences,
 ) {
     private val resolutionMutex = Mutex()
 
@@ -26,6 +28,15 @@ internal class FrembedDomainResolver(
 
         return resolutionMutex.withLock {
             cachedOrigin?.let { return@withLock it }
+
+            readPersistedOrigin()?.let { persistedOrigin ->
+                validateCandidate(persistedOrigin)?.let { resolved ->
+                    remember(resolved)
+                    return@withLock resolved
+                }
+
+                clearPersistedOrigin()
+            }
 
             val candidates = discoverCandidates()
             if (candidates.isEmpty()) {
@@ -42,7 +53,7 @@ internal class FrembedDomainResolver(
                 }
 
                 results.firstOrNull { it != null }?.let { resolved ->
-                    cachedOrigin = resolved
+                    remember(resolved)
                     return@withLock resolved
                 }
             }
@@ -51,6 +62,39 @@ internal class FrembedDomainResolver(
                 "Aucun domaine Frembed actuellement utilisable",
             )
         }
+    }
+
+    private fun readPersistedOrigin(): String? {
+        val rawValue = preferences.getString(PREFERENCE_LAST_ORIGIN, null)
+            ?: return null
+        val origin = normalizePersistedOrigin(rawValue)
+        if (origin == null) clearPersistedOrigin()
+        return origin
+    }
+
+    private fun normalizePersistedOrigin(rawValue: String): String? {
+        val uri = runCatching { URI(rawValue.trim()) }.getOrNull() ?: return null
+        val host = uri.host?.lowercase() ?: return null
+
+        if (uri.scheme != "https") return null
+        if (uri.userInfo != null) return null
+        if (uri.port != -1 && uri.port != 443) return null
+        if (!FREMBED_DOMAIN.matches(host)) return null
+
+        return "https://$host"
+    }
+
+    private fun remember(origin: String) {
+        cachedOrigin = origin
+        preferences.edit()
+            .putString(PREFERENCE_LAST_ORIGIN, origin)
+            .commit()
+    }
+
+    private fun clearPersistedOrigin() {
+        preferences.edit()
+            .remove(PREFERENCE_LAST_ORIGIN)
+            .commit()
     }
 
     private suspend fun discoverCandidates(): List<String> {
@@ -243,6 +287,9 @@ internal class FrembedDomainResolver(
     }
 
     internal companion object {
+        const val PREFERENCES_NAME = "frembed_domain_resolver"
+        const val PREFERENCE_LAST_ORIGIN = "last_valid_origin"
+
         const val DISCOVERY_ORIGIN = "https://crt.sh"
         const val DISCOVERY_URL =
             "$DISCOVERY_ORIGIN/?Identity=frembed.%25&output=json"
