@@ -178,8 +178,6 @@ class AfterDarkProvider : MainAPI() {
         page: Int,
         request: MainPageRequest,
     ): HomePageResponse {
-        ensureAfterDarkDomain()
-
         val type = if (request.data == "tv") "tv" else "movie"
         val endpoint = if (type == "tv") "/tv/popular" else "/movie/popular"
         val root = tmdbGet(endpoint, mapOf("page" to page.toString()))
@@ -195,8 +193,6 @@ class AfterDarkProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-
-        ensureAfterDarkDomain()
 
         val root = tmdbGet(
             "/search/multi",
@@ -214,8 +210,6 @@ class AfterDarkProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        ensureAfterDarkDomain()
-
         val match = Regex("""/watch/(movie|tv)-(\d+)""").find(url)
             ?: throw ErrorLoadingException("URL AfterDark invalide")
 
@@ -432,14 +426,15 @@ class AfterDarkProvider : MainAPI() {
             ?.takeIf { it.startsWith("$mainUrl/api/sources") }
             ?: sourcesApiUrl(request)
 
-        val response = app.get(
+        headers["Referer"] = session.sourceReferer ?: request.watchUrl(mainUrl)
+
+        val response = AfterDarkCronetClient.get(
             url = sourceUrl,
             headers = headers,
-            referer = session.sourceReferer ?: request.watchUrl(mainUrl),
-            cacheTime = 0,
+            timeoutMs = 150_000L,
         )
 
-        return response.okhttpResponse.code to response.text
+        return response.statusCode to response.text
     }
 
     private suspend fun obtainSession(request: PlaybackRequest): ProofSession? {

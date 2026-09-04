@@ -8,9 +8,15 @@ import java.lang.ref.WeakReference
 object AfterDarkRuntime {
     private var contextRef: WeakReference<Context>? = null
 
+    @Volatile
+    private var appContext: Context? = null
+
     fun init(context: Context) {
         contextRef = WeakReference(context)
+        appContext = context.applicationContext
     }
+
+    fun applicationContext(): Context? = appContext
 
     fun currentActivity(): Activity? {
         var current: Context? = contextRef?.get()

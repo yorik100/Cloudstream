@@ -20,8 +20,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.ByteArrayInputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -404,6 +402,7 @@ object AfterDarkProofWebView {
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
                             return interceptOfficialSources(webRequest)
+                                ?: proxyOfficialGet(webRequest, targetHost)
                                 ?: super.shouldInterceptRequest(view, webRequest)
                         }
                     }
@@ -454,6 +453,7 @@ object AfterDarkProofWebView {
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
                     return interceptOfficialSources(webRequest)
+                        ?: proxyOfficialGet(webRequest, targetHost)
                         ?: super.shouldInterceptRequest(view, webRequest)
                 }
             }
@@ -565,91 +565,130 @@ object AfterDarkProofWebView {
     private fun executeSourceRequestOnce(
         requestInfo: SourceRequestInfo,
     ): InterceptedSource {
-        val connection = (URL(requestInfo.url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            instanceFollowRedirects = false
-            connectTimeout = 30_000
-            readTimeout = 150_000
-            useCaches = false
+        val response = AfterDarkCronetClient.getBlocking(
+            url = requestInfo.url,
+            headers = requestInfo.headers,
+            timeoutMs = 150_000L,
+        )
 
-            requestInfo.headers.forEach { (key, value) ->
-                if (
-                    !key.equals("Host", ignoreCase = true) &&
-                    !key.equals("Connection", ignoreCase = true) &&
-                    !key.equals("Content-Length", ignoreCase = true) &&
-                    !key.equals("Cookie", ignoreCase = true) &&
-                    !key.equals("Accept-Encoding", ignoreCase = true)
-                ) {
-                    setRequestProperty(key, value)
-                }
-            }
+        val captured = CapturedSourceResponse(
+            proof = requestInfo.proof,
+            url = requestInfo.url,
+            headers = requestInfo.headers,
+            referer = requestInfo.referer,
+            statusCode = response.statusCode,
+            body = response.text,
+        )
 
-            // Avoid compressed bytes because the captured body is parsed as text.
-            setRequestProperty("Accept-Encoding", "identity")
+        return InterceptedSource(
+            captured = captured,
+            webResponse = response.toWebResponse("application/x-ndjson"),
+        )
+    }
 
-            CookieManager.getInstance()
-                .getCookie(requestInfo.url)
-                ?.takeIf { it.isNotBlank() }
-                ?.let { setRequestProperty("Cookie", it) }
+    private fun proxyOfficialGet(
+        webRequest: WebResourceRequest?,
+        targetHost: String?,
+    ): WebResourceResponse? {
+        if (webRequest == null) return null
+        if (!webRequest.method.equals("GET", ignoreCase = true)) return null
+
+        val uri = webRequest.url
+        if (!uri.scheme.equals("https", ignoreCase = true)) return null
+        if (!uri.host.equals(targetHost, ignoreCase = true)) return null
+
+        val headers = LinkedHashMap<String, String>()
+        webRequest.requestHeaders.forEach { (key, value) ->
+            if (key.isNotBlank() && value.isNotBlank()) headers[key] = value
         }
 
-        try {
-            val statusCode = connection.responseCode
-            val responseStream = if (statusCode >= 400) {
-                connection.errorStream
-            } else {
-                connection.inputStream
-            }
-
-            val bytes = responseStream?.use { it.readBytes() } ?: ByteArray(0)
-            val body = bytes.toString(Charsets.UTF_8)
-            val mimeType = connection.contentType
-                ?.substringBefore(";")
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
-                ?: "application/x-ndjson"
-
-            val reason = connection.responseMessage
-                ?.takeIf { it.isNotBlank() }
-                ?: "HTTP $statusCode"
-
-            val responseHeaders = LinkedHashMap<String, String>()
-            connection.headerFields.forEach { (key, values) ->
-                if (key != null && !values.isNullOrEmpty()) {
-                    if (
-                        !key.equals("Content-Encoding", ignoreCase = true) &&
-                        !key.equals("Content-Length", ignoreCase = true)
-                    ) {
-                        responseHeaders[key] = values.joinToString(", ")
-                    }
-                }
-            }
-
-            val captured = CapturedSourceResponse(
-                proof = requestInfo.proof,
-                url = requestInfo.url,
-                headers = requestInfo.headers,
-                referer = requestInfo.referer,
-                statusCode = statusCode,
-                body = body,
+        return runCatching {
+            AfterDarkCronetClient.getBlocking(
+                url = uri.toString(),
+                headers = headers,
+                timeoutMs = if (webRequest.isForMainFrame) 45_000L else 30_000L,
+            ).toWebResponse(
+                defaultMimeType = if (webRequest.isForMainFrame) {
+                    "text/html"
+                } else {
+                    "application/octet-stream"
+                },
             )
+        }.getOrElse {
+            if (!webRequest.isForMainFrame) return null
 
-            val webResponse = WebResourceResponse(
-                mimeType,
+            WebResourceResponse(
+                "text/html",
                 "UTF-8",
-                statusCode,
-                reason,
-                responseHeaders,
-                ByteArrayInputStream(bytes),
+                ByteArrayInputStream(
+                    """
+                    <!doctype html>
+                    <html lang="fr"><meta charset="utf-8">
+                    <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
+                    <h2>Connexion AfterDark impossible</h2>
+                    <p>Cronet n'a pas pu établir la connexion protégée ECH.</p>
+                    <p>Vérifie que les services Google Play sont à jour.</p>
+                    </body></html>
+                    """.trimIndent().toByteArray(),
+                ),
             )
-
-            return InterceptedSource(
-                captured = captured,
-                webResponse = webResponse,
-            )
-        } finally {
-            connection.disconnect()
         }
+    }
+
+    private fun AfterDarkCronetResponse.toWebResponse(
+        defaultMimeType: String,
+    ): WebResourceResponse {
+        val contentType = header("Content-Type").orEmpty()
+        val mimeType = contentType
+            .substringBefore(';')
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?: defaultMimeType
+        val charset = Regex("charset=([^;\\s]+)", RegexOption.IGNORE_CASE)
+            .find(contentType)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim('"', '\'')
+            ?: "UTF-8"
+
+        val responseHeaders = LinkedHashMap<String, String>()
+        headers.forEach { (key, values) ->
+            if (
+                !key.equals("Content-Encoding", ignoreCase = true) &&
+                !key.equals("Content-Length", ignoreCase = true) &&
+                !key.equals("Transfer-Encoding", ignoreCase = true) &&
+                !key.equals("Set-Cookie", ignoreCase = true) &&
+                values.isNotEmpty()
+            ) {
+                responseHeaders[key] = values.joinToString(", ")
+            }
+        }
+
+        return WebResourceResponse(
+            mimeType,
+            charset,
+            statusCode,
+            reasonPhrase(statusCode),
+            responseHeaders,
+            ByteArrayInputStream(body),
+        )
+    }
+
+    private fun reasonPhrase(statusCode: Int): String = when (statusCode) {
+        200 -> "OK"
+        201 -> "Created"
+        204 -> "No Content"
+        206 -> "Partial Content"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        410 -> "Gone"
+        429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
+        502 -> "Bad Gateway"
+        503 -> "Service Unavailable"
+        else -> "HTTP $statusCode"
     }
 
 }
