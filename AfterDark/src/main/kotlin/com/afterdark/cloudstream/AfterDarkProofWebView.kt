@@ -7,6 +7,8 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -614,8 +616,17 @@ object AfterDarkProofWebView {
                     "application/octet-stream"
                 },
             )
-        }.getOrElse {
+        }.getOrElse { error ->
+            Log.e(
+                AfterDarkDomainResolver.TAG,
+                "Proxy Cronet WebView impossible pour ${uri.host}",
+                error,
+            )
             if (!webRequest.isForMainFrame) return null
+
+            val diagnostic = TextUtils.htmlEncode(
+                "${error.javaClass.simpleName}: ${error.message ?: "aucun détail"}",
+            )
 
             WebResourceResponse(
                 "text/html",
@@ -626,8 +637,8 @@ object AfterDarkProofWebView {
                     <html lang="fr"><meta charset="utf-8">
                     <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
                     <h2>Connexion AfterDark impossible</h2>
-                    <p>Cronet n'a pas pu établir la connexion protégée ECH.</p>
-                    <p>Vérifie que les services Google Play sont à jour.</p>
+                    <p>La tentative QUIC immédiate et la connexion Cronet ont échoué.</p>
+                    <p style="color:#aaa;word-break:break-word">$diagnostic</p>
                     </body></html>
                     """.trimIndent().toByteArray(),
                 ),

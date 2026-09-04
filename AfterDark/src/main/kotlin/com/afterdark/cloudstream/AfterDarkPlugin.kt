@@ -1,6 +1,7 @@
 package com.afterdark.cloudstream
 
 import android.content.Context
+import android.util.Log
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import kotlinx.coroutines.CoroutineScope
@@ -19,6 +20,13 @@ class AfterDarkPlugin : Plugin() {
 
         discoveryScope.launch {
             runCatching { provider.prepareDomain() }
+                .onFailure { error ->
+                    Log.e(
+                        AfterDarkDomainResolver.TAG,
+                        "Découverte initiale du domaine impossible",
+                        error,
+                    )
+                }
         }
     }
 }

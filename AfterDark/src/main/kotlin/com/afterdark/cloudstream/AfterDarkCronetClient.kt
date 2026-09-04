@@ -1,5 +1,7 @@
 package com.afterdark.cloudstream
 
+import android.net.Uri
+import android.util.Log
 import android.webkit.CookieManager
 import com.google.android.gms.net.CronetProviderInstaller
 import com.google.android.gms.tasks.Tasks
@@ -7,6 +9,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
+import org.chromium.net.DnsOptions
+import org.chromium.net.NetworkException
+import org.chromium.net.QuicException
 import org.chromium.net.UrlRequest
 import org.chromium.net.UrlResponseInfo
 import java.io.ByteArrayOutputStream
@@ -44,13 +49,17 @@ internal object AfterDarkCronetClient {
     private const val READ_BUFFER_SIZE = 64 * 1024
     private const val MAX_BODY_BYTES = 16 * 1024 * 1024
 
+    private const val TAG = "AfterDarkCronet"
+
     private val engineLock = Any()
     private val callbackExecutor = Executors.newCachedThreadPool { runnable ->
         Thread(runnable, "AfterDark-Cronet").apply { isDaemon = true }
     }
 
+    private val cronetEngines = LinkedHashMap<String, CronetEngine>()
+
     @Volatile
-    private var cronetEngine: CronetEngine? = null
+    private var providerReady = false
 
     suspend fun get(
         url: String,
@@ -69,7 +78,7 @@ internal object AfterDarkCronetClient {
             "Une requête Cronet bloquante ne peut pas être lancée sur le thread UI"
         }
 
-        val engine = getOrCreateEngine()
+        val engine = getOrCreateEngine(url)
         val finished = AtomicBoolean(false)
         val done = CountDownLatch(1)
         val output = ByteArrayOutputStream()
@@ -128,6 +137,7 @@ internal object AfterDarkCronetClient {
                 error: CronetException,
             ) {
                 if (!finished.compareAndSet(false, true)) return
+                Log.e(TAG, "Échec ${describeFailure(url, error)}", error)
                 failure = error
                 done.countDown()
             }
@@ -155,6 +165,7 @@ internal object AfterDarkCronetClient {
 
         if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
             activeRequest.cancel()
+            Log.e(TAG, "Timeout Cronet après ${timeoutMs} ms pour $url")
             throw TimeoutException("Délai Cronet dépassé pour $url")
         }
 
@@ -163,27 +174,73 @@ internal object AfterDarkCronetClient {
             .also(::synchronizeCookies)
     }
 
-    private fun getOrCreateEngine(): CronetEngine {
-        cronetEngine?.let { return it }
+    @OptIn(DnsOptions.Experimental::class)
+    private fun getOrCreateEngine(url: String): CronetEngine {
+        val uri = Uri.parse(url)
+        val host = uri.host
+            ?.lowercase()
+            ?.takeIf { it.isNotBlank() }
+            ?: throw IllegalArgumentException("Hôte Cronet invalide : $url")
+        val port = uri.port.takeIf { it > 0 } ?: 443
+        val engineKey = "$host:$port"
 
-        return synchronized(engineLock) {
-            cronetEngine?.let { return@synchronized it }
+        synchronized(engineLock) {
+            cronetEngines[engineKey]?.let { return it }
 
             val context = AfterDarkRuntime.applicationContext()
                 ?: throw IllegalStateException("Contexte AfterDark indisponible")
 
-            Tasks.await(
-                CronetProviderInstaller.installProvider(context),
-                PROVIDER_TIMEOUT_SECONDS,
-                TimeUnit.SECONDS,
-            )
+            if (!providerReady) {
+                Tasks.await(
+                    CronetProviderInstaller.installProvider(context),
+                    PROVIDER_TIMEOUT_SECONDS,
+                    TimeUnit.SECONDS,
+                )
+                providerReady = true
+            }
 
             CronetEngine.Builder(context)
                 .enableHttp2(true)
                 .enableQuic(true)
+                // The hospital network closes TCP/TLS when the AfterDark SNI is
+                // visible. A per-host QUIC hint makes Cronet try HTTP/3 on the
+                // first request instead of waiting for an unreachable Alt-Svc.
+                .addQuicHint(host, port, port)
+                // Use Chromium's resolver rather than Android getaddrinfo so
+                // Cronet can process modern DNS records used by ECH/HTTP3.
+                .setDnsOptions(
+                    DnsOptions.builder()
+                        .useBuiltInDnsResolver(true),
+                )
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
                 .build()
-                .also { cronetEngine = it }
+                .also { engine ->
+                    cronetEngines[engineKey] = engine
+                    Log.i(TAG, "Moteur prêt pour $engineKey; QUIC immédiat + DNS interne")
+                }
+        }
+    }
+
+    private fun describeFailure(url: String, error: CronetException): String = buildString {
+        append(url)
+        append(" : ")
+        append(error.javaClass.simpleName)
+        error.message?.takeIf { it.isNotBlank() }?.let {
+            append(" (")
+            append(it)
+            append(')')
+        }
+        if (error is NetworkException) {
+            append("; code=")
+            append(error.errorCode)
+            append("; interne=")
+            append(error.cronetInternalErrorCode)
+            append("; retryable=")
+            append(error.immediatelyRetryable())
+        }
+        if (error is QuicException) {
+            append("; quic=")
+            append(error.quicDetailedErrorCode)
         }
     }
 
