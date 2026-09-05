@@ -38,16 +38,12 @@ jobs:
           frembed_origin() {
             local value="$1"
             local host
-
+          
             if [[ ! "$value" =~ ^https://([^/:?#]+)([/?#]|$) ]]; then
               return 1
             fi
-
+          
             host="${BASH_REMATCH[1],,}"
-            if [[ ! "$host" =~ ^(www\.)?frembed\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
-              return 1
-            fi
-
             printf 'https://%s/\n' "$host"
           }
 
@@ -117,7 +113,7 @@ jobs:
                 -e 's#\\/#/#g' \
                 -e 's#\\u002[fF]#/#g' \
                 "$body_file" |
-                grep -Eio '(https:)?//(www\.)?frembed\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?' |
+                grep -Eio '(https:)?//([a-z0-9-]+\.)+[a-z]{2,}' |
                 awk '!seen[tolower($0)]++' || true
             )"
 
