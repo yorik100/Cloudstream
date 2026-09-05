@@ -1,0 +1,102 @@
+name: Update KeepLink redirect
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-keep-link-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  update-link:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Follow redirect and update KeepLink.txt
+        id: keep-link
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file="KeepLink.txt"
+          if [[ ! -f "$file" ]]; then
+            echo "::error file=$file::KeepLink.txt does not exist"
+            exit 1
+          fi
+
+          current_url="$(awk 'NF { sub(/\r$/, ""); print; exit }' "$file")"
+          if [[ ! "$current_url" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::error file=$file::KeepLink.txt must contain one valid HTTPS URL"
+            exit 1
+          fi
+
+          if ! curl_output="$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --max-redirs 10 \
+              --connect-timeout 15 \
+              --max-time 60 \
+              --retry 2 \
+              --retry-delay 2 \
+              --retry-all-errors \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
+              --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
+              --header 'Cache-Control: no-cache' \
+              --output /dev/null \
+              --write-out $'%{url_effective}\n%{http_code}' \
+              "$current_url"
+          )"; then
+            echo "The current URL could not be reached; KeepLink.txt is unchanged."
+            exit 0
+          fi
+
+          final_url="$(sed -n '1p' <<< "$curl_output")"
+          status_code="$(sed -n '2p' <<< "$curl_output")"
+
+          if [[ ! "$status_code" =~ ^[23][0-9][0-9]$ ]]; then
+            echo "Final HTTP status is $status_code; KeepLink.txt is unchanged."
+            exit 0
+          fi
+
+          if [[ ! "$final_url" =~ ^https://[^[:space:]]+$ ]]; then
+            echo "::warning::The redirect target is not a valid HTTPS URL."
+            exit 0
+          fi
+
+          if [[ "$final_url" == "$current_url" ]]; then
+            echo "KeepLink.txt is already current: $current_url"
+            exit 0
+          fi
+
+          printf '%s\n' "$final_url" > "$file"
+          echo "old_url=$current_url" >> "$GITHUB_OUTPUT"
+          echo "new_url=$final_url" >> "$GITHUB_OUTPUT"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated URL
+        if: steps.keep-link.outputs.changed == 'true'
+        shell: bash
+        env:
+          OLD_URL: ${{ steps.keep-link.outputs.old_url }}
+          NEW_URL: ${{ steps.keep-link.outputs.new_url }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- KeepLink.txt
+          git commit -m "chore: update KeepLink redirect"
+          git push
+          echo "Updated $OLD_URL -> $NEW_URL"
