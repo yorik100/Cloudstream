@@ -567,7 +567,7 @@ object AfterDarkProofWebView {
     private fun executeSourceRequestOnce(
         requestInfo: SourceRequestInfo,
     ): InterceptedSource {
-        val response = AfterDarkCronetClient.getBlocking(
+        val response = AfterDarkCronetClient.getBlockingWithRetry(
             url = requestInfo.url,
             headers = requestInfo.headers,
             timeoutMs = 150_000L,
@@ -606,7 +606,7 @@ object AfterDarkProofWebView {
         }
 
         return runCatching {
-            AfterDarkCronetClient.getBlocking(
+            AfterDarkCronetClient.getBlockingWithRetry(
                 url = uri.toString(),
                 headers = headers,
                 timeoutMs = if (webRequest.isForMainFrame) 45_000L else 30_000L,

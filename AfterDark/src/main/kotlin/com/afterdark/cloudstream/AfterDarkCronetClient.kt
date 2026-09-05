@@ -47,6 +47,7 @@ internal object AfterDarkCronetClient {
     private const val PROVIDER_TIMEOUT_SECONDS = 20L
     private const val READ_BUFFER_SIZE = 64 * 1024
     private const val MAX_BODY_BYTES = 16 * 1024 * 1024
+    private const val DEFAULT_ENGINE_NAMESPACE = "playback"
 
     private const val TAG = "AfterDarkCronet"
     private val EXPERIMENTAL_DNS_OPTIONS = """
@@ -71,8 +72,9 @@ internal object AfterDarkCronetClient {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
         enableDnsHttpsRecords: Boolean = false,
+        engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
     ): AfterDarkCronetResponse = withContext(Dispatchers.IO) {
-        getBlocking(url, headers, timeoutMs, enableDnsHttpsRecords)
+        getBlocking(url, headers, timeoutMs, enableDnsHttpsRecords, engineNamespace)
     }
 
     fun getBlocking(
@@ -80,12 +82,13 @@ internal object AfterDarkCronetClient {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
         enableDnsHttpsRecords: Boolean = false,
+        engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
     ): AfterDarkCronetResponse {
         check(LooperGuard.isNotMainThread()) {
             "Une requête Cronet bloquante ne peut pas être lancée sur le thread UI"
         }
 
-        val engine = getOrCreateEngine(url, enableDnsHttpsRecords)
+        val engine = getOrCreateEngine(url, enableDnsHttpsRecords, engineNamespace)
         val finished = AtomicBoolean(false)
         val done = CountDownLatch(1)
         val output = ByteArrayOutputStream()
@@ -181,9 +184,47 @@ internal object AfterDarkCronetClient {
             .also(::synchronizeCookies)
     }
 
+    fun getBlockingWithRetry(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        timeoutMs: Long = 30_000L,
+        enableDnsHttpsRecords: Boolean = false,
+        engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
+        maxAttempts: Int = 2,
+    ): AfterDarkCronetResponse {
+        require(maxAttempts >= 1) { "maxAttempts doit être supérieur ou égal à 1" }
+        var lastFailure: Throwable? = null
+
+        for (attempt in 1..maxAttempts) {
+            try {
+                return getBlocking(
+                    url = url,
+                    headers = headers,
+                    timeoutMs = timeoutMs,
+                    enableDnsHttpsRecords = enableDnsHttpsRecords,
+                    engineNamespace = engineNamespace,
+                )
+            } catch (error: Throwable) {
+                lastFailure = error
+                val retryable = error is NetworkException && error.immediatelyRetryable()
+                if (!retryable || attempt == maxAttempts) throw error
+
+                Log.w(
+                    TAG,
+                    "Connexion immédiatement réessayable; tentative " +
+                        "${attempt + 1}/$maxAttempts pour $url",
+                    error,
+                )
+            }
+        }
+
+        throw checkNotNull(lastFailure)
+    }
+
     private fun getOrCreateEngine(
         url: String,
         enableDnsHttpsRecords: Boolean,
+        engineNamespace: String,
     ): CronetEngine {
         val uri = Uri.parse(url)
         val host = uri.host
@@ -192,7 +233,9 @@ internal object AfterDarkCronetClient {
             ?: throw IllegalArgumentException("Hôte Cronet invalide : $url")
         val port = uri.port.takeIf { it > 0 } ?: 443
         val profile = if (enableDnsHttpsRecords) "dns-https" else "standard"
-        val engineKey = "$host:$port:$profile"
+        val namespace = engineNamespace.takeIf { it.isNotBlank() }
+            ?: DEFAULT_ENGINE_NAMESPACE
+        val engineKey = "$namespace:$host:$port:$profile"
 
         return synchronized(engineLock) {
             cronetEngines[engineKey]?.let { return@synchronized it }
