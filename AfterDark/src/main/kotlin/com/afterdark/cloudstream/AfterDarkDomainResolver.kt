@@ -158,7 +158,7 @@ internal class AfterDarkDomainResolver(
             Log.w(
                 TAG,
                 "Domaine AfterDark refusé : $finalOrigin; " +
-                    "HTTP ${response.statusCode}; ${page.size} caractères",
+                    "HTTP ${response.statusCode}; ${page.length} caractères",
             )
             return null
         }
