@@ -45,16 +45,25 @@ internal class FrembedDomainResolver(
                 )
             }
 
-            for (batch in candidates.chunked(MAX_PARALLEL_PROBES)) {
-                val results = coroutineScope {
-                    batch.map { candidate ->
-                        async { validateCandidate(candidate) }
-                    }.awaitAll()
-                }
+            // Candidates are already ordered from the newest certificate to
+            // the oldest one. Work through recent groups first and stop as
+            // soon as one group contains a usable domain.
+            for (recentBatch in candidates.chunked(MAX_PARALLEL_PRECHECKS)) {
+                val reachableCandidates = precheckCandidates(recentBatch)
 
-                results.firstOrNull { it != null }?.let { resolved ->
-                    remember(resolved)
-                    return@withLock resolved
+                for (validationBatch in reachableCandidates.chunked(MAX_PARALLEL_PROBES)) {
+                    val results = coroutineScope {
+                        validationBatch.map { candidate ->
+                            async { validateCandidate(candidate) }
+                        }.awaitAll()
+                    }
+
+                    // awaitAll keeps input order, so a successful newer
+                    // candidate wins over an older one from the same batch.
+                    results.firstOrNull { it != null }?.let { resolved ->
+                        remember(resolved)
+                        return@withLock resolved
+                    }
                 }
             }
 
@@ -136,7 +145,11 @@ internal class FrembedDomainResolver(
 
         for (index in 0 until certificates.length()) {
             val certificate = certificates.optJSONObject(index) ?: continue
-            val notBefore = certificate.optString("not_before", "")
+            // crt.sh's entry timestamp is the closest available signal for
+            // when this Frembed hostname was newly obtained/activated. Fall
+            // back to the certificate validity start on older responses.
+            val acquiredAt = certificate.optString("entry_timestamp", "")
+                .ifBlank { certificate.optString("not_before", "") }
 
             sequenceOf(
                 certificate.optString("common_name", ""),
@@ -145,8 +158,8 @@ internal class FrembedDomainResolver(
                 .mapNotNull(::normalizeDomain)
                 .forEach { domain ->
                     val previous = newestCertificateByDomain[domain]
-                    if (previous == null || notBefore > previous) {
-                        newestCertificateByDomain[domain] = notBefore
+                    if (previous == null || acquiredAt > previous) {
+                        newestCertificateByDomain[domain] = acquiredAt
                     }
                 }
         }
@@ -163,6 +176,29 @@ internal class FrembedDomainResolver(
 
         return value.takeIf { FREMBED_DOMAIN.matches(it) }
     }
+
+    /**
+     * Cheap reachability pass performed before the expensive Frembed API and
+     * playback checks. Any HTTP response proves that DNS, TCP and TLS reached
+     * the host; the full validation below still rejects parked, obsolete or
+     * otherwise unusable domains.
+     */
+    private suspend fun precheckCandidates(candidates: List<String>): List<String> =
+        coroutineScope {
+            candidates.map { candidate ->
+                async {
+                    val reachable = runCatching {
+                        app.head(
+                            url = "$candidate/",
+                            headers = requestHeaders,
+                            timeout = PRECHECK_TIMEOUT_SECONDS,
+                        )
+                    }.isSuccess
+
+                    candidate.takeIf { reachable }
+                }
+            }.awaitAll().filterNotNull()
+        }
 
     private suspend fun validateCandidate(candidateOrigin: String): String? {
         val probeUrl = "$candidateOrigin/api/films" +
@@ -192,6 +228,22 @@ internal class FrembedDomainResolver(
 
         val filmPage = "$finalOrigin/films?id=$VALIDATION_TMDB_ID"
         val serverUrls = extractServerUrls(root, finalOrigin)
+        if (serverUrls.isEmpty()) return null
+
+        // Validate the film page once per candidate. The previous flow fetched
+        // this exact page again for every server link, which multiplied the
+        // resolution time on domains exposing several players.
+        val filmPageResponse = runCatching {
+            app.get(
+                url = filmPage,
+                headers = requestHeaders,
+                referer = "$finalOrigin/",
+                cacheTime = 0,
+                timeout = PROBE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (filmPageResponse.okhttpResponse.code !in 200..299) return null
 
         for (serverUrl in serverUrls) {
             if (
@@ -251,18 +303,6 @@ internal class FrembedDomainResolver(
         filmPage: String,
         serverUrl: String,
     ): Boolean {
-        val pageResponse = runCatching {
-            app.get(
-                url = filmPage,
-                headers = requestHeaders,
-                referer = "$origin/",
-                cacheTime = 0,
-                timeout = PROBE_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return false
-
-        if (pageResponse.okhttpResponse.code !in 200..299) return false
-
         val response = runCatching {
             app.get(
                 url = serverUrl,
@@ -298,7 +338,9 @@ internal class FrembedDomainResolver(
         const val DISCOVERY_ATTEMPTS = 2
         const val DISCOVERY_TIMEOUT_SECONDS = 25L
         const val DISCOVERY_RETRY_DELAY_MS = 1_000L
+        const val PRECHECK_TIMEOUT_SECONDS = 3L
         const val PROBE_TIMEOUT_SECONDS = 8L
+        const val MAX_PARALLEL_PRECHECKS = 12
         const val MAX_PARALLEL_PROBES = 6
 
         val FREMBED_DOMAIN = Regex(
