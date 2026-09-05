@@ -1,4 +1,4 @@
-version = 43
+version = 44
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
