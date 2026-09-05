@@ -9,7 +9,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.chromium.net.CronetEngine
 import org.chromium.net.CronetException
-import org.chromium.net.DnsOptions
 import org.chromium.net.NetworkException
 import org.chromium.net.QuicException
 import org.chromium.net.UrlRequest
@@ -174,7 +173,6 @@ internal object AfterDarkCronetClient {
             .also(::synchronizeCookies)
     }
 
-    @OptIn(DnsOptions.Experimental::class)
     private fun getOrCreateEngine(url: String): CronetEngine {
         val uri = Uri.parse(url)
         val host = uri.host
@@ -184,8 +182,8 @@ internal object AfterDarkCronetClient {
         val port = uri.port.takeIf { it > 0 } ?: 443
         val engineKey = "$host:$port"
 
-        synchronized(engineLock) {
-            cronetEngines[engineKey]?.let { return it }
+        return synchronized(engineLock) {
+            cronetEngines[engineKey]?.let { return@synchronized it }
 
             val context = AfterDarkRuntime.applicationContext()
                 ?: throw IllegalStateException("Contexte AfterDark indisponible")
@@ -206,17 +204,11 @@ internal object AfterDarkCronetClient {
                 // visible. A per-host QUIC hint makes Cronet try HTTP/3 on the
                 // first request instead of waiting for an unreachable Alt-Svc.
                 .addQuicHint(host, port, port)
-                // Use Chromium's resolver rather than Android getaddrinfo so
-                // Cronet can process modern DNS records used by ECH/HTTP3.
-                .setDnsOptions(
-                    DnsOptions.builder()
-                        .useBuiltInDnsResolver(true),
-                )
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
                 .build()
                 .also { engine ->
                     cronetEngines[engineKey] = engine
-                    Log.i(TAG, "Moteur prêt pour $engineKey; QUIC immédiat + DNS interne")
+                    Log.i(TAG, "Moteur prêt pour $engineKey; QUIC immédiat")
                 }
         }
     }
