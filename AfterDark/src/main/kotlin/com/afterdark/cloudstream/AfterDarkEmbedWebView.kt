@@ -419,33 +419,61 @@ object AfterDarkEmbedWebView {
                               return rect.width > 0 && rect.height > 0;
                             };
 
-                            const isPeachifyPage = () => {
-                              if (!PEACHIFY_MODE) return false;
-                              const host = String(location.hostname || '').toLowerCase();
-                              return host === 'peachify.top' || host.endsWith('.peachify.top');
+                            const collectPeachifyRoots = () => {
+                              const roots = [];
+                              const visited = new Set();
+
+                              const visit = root => {
+                                if (!root || visited.has(root)) return;
+                                visited.add(root);
+                                roots.push(root);
+
+                                try {
+                                  root.querySelectorAll('*').forEach(element => {
+                                    if (element.shadowRoot) visit(element.shadowRoot);
+                                  });
+                                } catch (_) {}
+
+                                try {
+                                  root.querySelectorAll('iframe').forEach(frame => {
+                                    try { visit(frame.contentDocument); } catch (_) {}
+                                  });
+                                } catch (_) {}
+                              };
+
+                              visit(document);
+                              return roots;
                             };
 
                             const hasPeachifyNotFoundPanel = () => {
-                              if (!isPeachifyPage()) return false;
+                              if (!PEACHIFY_MODE) return false;
 
-                              const closeButtons = [...document.querySelectorAll(
-                                'button[aria-label="Close error message"]'
-                              )].filter(isVisible);
+                              return collectPeachifyRoots().some(root => {
+                                let closeButton = null;
+                                try {
+                                  closeButton = [...root.querySelectorAll('button')].find(
+                                    element => normalizedText(
+                                      element.getAttribute('aria-label')
+                                    ) === 'close error message'
+                                  );
+                                } catch (_) {
+                                  return false;
+                                }
+                                if (!closeButton) return false;
 
-                              return closeButtons.some(closeButton => {
                                 let panel = closeButton.parentElement;
                                 let depth = 0;
 
-                                while (panel && panel !== document.body && depth < 6) {
-                                  const exactTitle = [...panel.querySelectorAll('div')].some(
-                                    element =>
-                                      isVisible(element) &&
-                                      normalizedText(element.textContent) === '404 - not found'
+                                while (panel && depth < 12) {
+                                  const exactTitle = [...panel.querySelectorAll(
+                                    'div,h1,h2,h3,p,span'
+                                  )].some(element =>
+                                    normalizedText(element.textContent) === '404 - not found'
                                   );
-                                  const reloadButton = [...panel.querySelectorAll('button')].some(
-                                    element =>
-                                      isVisible(element) &&
-                                      normalizedText(element.textContent) === 'reload'
+                                  const reloadButton = [...panel.querySelectorAll(
+                                    'button,[role="button"]'
+                                  )].some(element =>
+                                    normalizedText(element.textContent) === 'reload'
                                   );
 
                                   if (exactTitle && reloadButton) return true;
@@ -460,8 +488,20 @@ object AfterDarkEmbedWebView {
                             const checkPeachifyDomState = () => {
                               if (hasPeachifyNotFoundPanel()) {
                                 bridge.unavailable('peachify-404-not-found');
+                                return true;
                               }
+                              return false;
                             };
+
+                            if (
+                              PEACHIFY_MODE &&
+                              !window.__afterdarkPeachifyNotFoundTimer
+                            ) {
+                              window.__afterdarkPeachifyNotFoundTimer = setInterval(
+                                checkPeachifyDomState,
+                                250
+                              );
+                            }
 
                             const hasGoBackError = () =>
                               [...document.querySelectorAll('a[href="/"]')].some(anchor =>

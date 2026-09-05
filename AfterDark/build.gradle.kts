@@ -1,4 +1,4 @@
-version = 47
+version = 48
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - Peachify sans timeout avec détection explicite des erreurs 404"
+    description = "AfterDark - détection persistante des erreurs 404 Peachify"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
