@@ -25,8 +25,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import java.io.ByteArrayInputStream
-import java.net.URI
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -50,9 +48,6 @@ internal object AfterDarkDomainWebView {
         var candidateOrigin: String? = null
         var mainFrameHttpCode: Int? = null
         var domPoll: Runnable? = null
-        val proxiedHosts = ConcurrentHashMap<String, Unit>().apply {
-            put(AfterDarkDomainResolver.SOURCE_HOST, Unit)
-        }
 
         lateinit var timeoutRunnable: Runnable
 
@@ -220,10 +215,6 @@ internal object AfterDarkDomainWebView {
                             }
 
                             candidateOrigin = origin
-                            URI(origin).host
-                                ?.lowercase()
-                                ?.removePrefix("www.")
-                                ?.let { proxiedHosts[it] = Unit }
                             mainFrameHttpCode = null
                             stopDomPolling()
                             showInfo("Adresse trouvée. Validation de $origin…")
@@ -315,10 +306,8 @@ internal object AfterDarkDomainWebView {
                         view: WebView?,
                         request: WebResourceRequest?,
                     ): WebResourceResponse? {
-                        return proxyResolverGet(
-                            request = request,
-                            allowedHosts = proxiedHosts,
-                            onMainFrameFailure = { message -> showInfo(message) },
+                        return proxyRegistryGet(
+                            webRequest = request,
                         ) ?: super.shouldInterceptRequest(view, request)
                     }
 
@@ -440,30 +429,33 @@ internal object AfterDarkDomainWebView {
         }
     }
 
-    private fun proxyResolverGet(
-        request: WebResourceRequest?,
-        allowedHosts: Map<String, Unit>,
-        onMainFrameFailure: (String) -> Unit,
-    ): WebResourceResponse? {
-        if (request == null) return null
-        if (!request.method.equals("GET", ignoreCase = true)) return null
+    /**
+     * Only the official registry is proxied here. In particular, the target
+     * AfterDark origin is deliberately left to the unchanged v38 flow so this
+     * resolver cannot create or poison the Cronet engine later used by
+     * AfterDarkProofWebView.
+     */
+    private fun proxyRegistryGet(webRequest: WebResourceRequest?): WebResourceResponse? {
+        if (webRequest == null) return null
+        if (!webRequest.method.equals("GET", ignoreCase = true)) return null
 
-        val uri = request.url
+        val uri = webRequest.url
         if (!uri.scheme.equals("https", ignoreCase = true)) return null
-        val host = uri.host
-            ?.lowercase()
-            ?.removePrefix("www.")
-            ?: return null
-        if (!allowedHosts.containsKey(host)) return null
+        if (!uri.host.equals(AfterDarkDomainResolver.SOURCE_HOST, ignoreCase = true)) return null
+
+        val headers = LinkedHashMap<String, String>()
+        webRequest.requestHeaders.forEach { (key, value) ->
+            if (key.isNotBlank() && value.isNotBlank()) headers[key] = value
+        }
 
         return runCatching {
             AfterDarkCronetClient.getBlocking(
                 url = uri.toString(),
-                headers = request.requestHeaders,
-                timeoutMs = if (request.isForMainFrame) 60_000L else 30_000L,
+                headers = headers,
+                timeoutMs = if (webRequest.isForMainFrame) 45_000L else 30_000L,
                 enableDnsHttpsRecords = true,
             ).toWebResponse(
-                defaultMimeType = if (request.isForMainFrame) {
+                defaultMimeType = if (webRequest.isForMainFrame) {
                     "text/html"
                 } else {
                     "application/octet-stream"
@@ -472,38 +464,31 @@ internal object AfterDarkDomainWebView {
         }.getOrElse { error ->
             Log.e(
                 AfterDarkDomainResolver.TAG,
-                "Proxy Cronet du resolver impossible pour $host",
+                "Proxy Cronet WebView impossible pour ${uri.host}",
                 error,
             )
-            if (!request.isForMainFrame) return null
+            if (!webRequest.isForMainFrame) return null
 
-            onMainFrameFailure(
-                "Le registre n'a pas pu être chargé par Cronet. " +
-                    "Tu peux utiliser Recharger.",
+            val diagnostic = TextUtils.htmlEncode(
+                "${error.javaClass.simpleName}: ${error.message ?: "aucun détail"}",
             )
-            cronetFailurePage(error)
-        }
-    }
 
-    private fun cronetFailurePage(error: Throwable): WebResourceResponse {
-        val diagnostic = TextUtils.htmlEncode(
-            "${error.javaClass.simpleName}: ${error.message ?: "aucun détail"}",
-        )
-        return WebResourceResponse(
-            "text/html",
-            "UTF-8",
-            ByteArrayInputStream(
-                """
-                <!doctype html>
-                <html lang="fr"><meta charset="utf-8">
-                <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
-                <h2>Registre AfterDark inaccessible</h2>
-                <p>La connexion Cronet HTTPS/SVCB du resolver a échoué.</p>
-                <p style="color:#aaa;word-break:break-word">$diagnostic</p>
-                </body></html>
-                """.trimIndent().toByteArray(),
-            ),
-        )
+            WebResourceResponse(
+                "text/html",
+                "UTF-8",
+                ByteArrayInputStream(
+                    """
+                    <!doctype html>
+                    <html lang="fr"><meta charset="utf-8">
+                    <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
+                    <h2>Registre AfterDark inaccessible</h2>
+                    <p>La connexion Cronet adaptative a échoué.</p>
+                    <p style="color:#aaa;word-break:break-word">$diagnostic</p>
+                    </body></html>
+                    """.trimIndent().toByteArray(),
+                ),
+            )
+        }
     }
 
     private fun AfterDarkCronetResponse.toWebResponse(
