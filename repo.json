@@ -1,0 +1,8 @@
+{
+  "name": "Yorik CloudStream",
+  "description": "Extensions AfterDark et Frembed pour CloudStream",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/plugins.json"
+  ]
+}
