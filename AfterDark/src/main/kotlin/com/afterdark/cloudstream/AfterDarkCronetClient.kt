@@ -50,12 +50,6 @@ internal object AfterDarkCronetClient {
     private const val DEFAULT_ENGINE_NAMESPACE = "playback"
 
     private const val TAG = "AfterDarkCronet"
-    private val EXPERIMENTAL_DNS_OPTIONS = """
-        {
-          "AsyncDNS": {"enable": true},
-          "UseDnsHttpsSvcb": {"use_alpn": true}
-        }
-    """.trimIndent()
 
     private val engineLock = Any()
     private val callbackExecutor = Executors.newCachedThreadPool { runnable ->
@@ -72,9 +66,10 @@ internal object AfterDarkCronetClient {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
         enableDnsHttpsRecords: Boolean = false,
+        hostResolverOverride: Pair<String, String>? = null,
         engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
     ): AfterDarkCronetResponse = withContext(Dispatchers.IO) {
-        getBlocking(url, headers, timeoutMs, enableDnsHttpsRecords, engineNamespace)
+        getBlocking(url, headers, timeoutMs, enableDnsHttpsRecords, hostResolverOverride, engineNamespace)
     }
 
     fun getBlocking(
@@ -82,13 +77,14 @@ internal object AfterDarkCronetClient {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
         enableDnsHttpsRecords: Boolean = false,
+        hostResolverOverride: Pair<String, String>? = null,
         engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
     ): AfterDarkCronetResponse {
         check(LooperGuard.isNotMainThread()) {
             "Une requête Cronet bloquante ne peut pas être lancée sur le thread UI"
         }
 
-        val engine = getOrCreateEngine(url, enableDnsHttpsRecords, engineNamespace)
+        val engine = getOrCreateEngine(url, enableDnsHttpsRecords, hostResolverOverride, engineNamespace)
         val finished = AtomicBoolean(false)
         val done = CountDownLatch(1)
         val output = ByteArrayOutputStream()
@@ -189,6 +185,7 @@ internal object AfterDarkCronetClient {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
         enableDnsHttpsRecords: Boolean = false,
+        hostResolverOverride: Pair<String, String>? = null,
         engineNamespace: String = DEFAULT_ENGINE_NAMESPACE,
         maxAttempts: Int = 2,
     ): AfterDarkCronetResponse {
@@ -202,6 +199,7 @@ internal object AfterDarkCronetClient {
                     headers = headers,
                     timeoutMs = timeoutMs,
                     enableDnsHttpsRecords = enableDnsHttpsRecords,
+                    hostResolverOverride = hostResolverOverride,
                     engineNamespace = engineNamespace,
                 )
             } catch (error: Throwable) {
@@ -224,6 +222,7 @@ internal object AfterDarkCronetClient {
     private fun getOrCreateEngine(
         url: String,
         enableDnsHttpsRecords: Boolean,
+        hostResolverOverride: Pair<String, String>?,
         engineNamespace: String,
     ): CronetEngine {
         val uri = Uri.parse(url)
@@ -233,9 +232,12 @@ internal object AfterDarkCronetClient {
             ?: throw IllegalArgumentException("Hôte Cronet invalide : $url")
         val port = uri.port.takeIf { it > 0 } ?: 443
         val profile = if (enableDnsHttpsRecords) "dns-https" else "standard"
+        val overrideKey = hostResolverOverride
+            ?.let { (overrideHost, overrideIp) -> "$overrideHost=$overrideIp" }
+            ?: "none"
         val namespace = engineNamespace.takeIf { it.isNotBlank() }
             ?: DEFAULT_ENGINE_NAMESPACE
-        val engineKey = "$namespace:$host:$port:$profile"
+        val engineKey = "$namespace:$host:$port:$profile:$overrideKey"
 
         return synchronized(engineLock) {
             cronetEngines[engineKey]?.let { return@synchronized it }
@@ -262,7 +264,9 @@ internal object AfterDarkCronetClient {
                 // its normal HTTP/2/QUIC negotiation and fallback behaviour.
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
 
-            val dnsHttpsEnabled = enableDnsHttpsRecords && enableCronetDnsHttps(builder)
+            val experimentalOptions = buildExperimentalOptions(enableDnsHttpsRecords, hostResolverOverride)
+            val experimentalOptionsApplied = experimentalOptions != null &&
+                applyCronetExperimentalOptions(builder, experimentalOptions)
 
             builder.build()
                 .also { engine ->
@@ -271,20 +275,55 @@ internal object AfterDarkCronetClient {
                         TAG,
                         "Moteur prêt pour $engineKey; protocole adaptatif; " +
                             "AsyncDNS/HTTPS-SVCB=" +
-                            (if (dnsHttpsEnabled) "actifs" else "inactifs"),
+                            (if (enableDnsHttpsRecords && experimentalOptionsApplied) "actifs" else "inactifs") +
+                            "; HostResolverRules=" +
+                            (if (hostResolverOverride != null && experimentalOptionsApplied) "actif" else "inactif"),
                     )
                 }
         }
     }
 
     /**
+     * Builds Cronet's experimental-options JSON. Two independent knobs share
+     * this payload:
+     *  - AsyncDNS/HTTPS-SVCB: Cronet's own resolver + HTTPS DNS records,
+     *    originally added for ECH discovery.
+     *  - HostResolverRules: forces Cronet to skip the network-provided DNS
+     *    resolver entirely for one host and connect directly to a given IP
+     *    (typically resolved beforehand via [AfterDarkDohResolver]). This is
+     *    what actually matters on networks that filter by poisoning DNS
+     *    answers rather than by inspecting TLS — the SNI sent to that IP is
+     *    still the real hostname, so certificate validation is unaffected.
+     */
+    private fun buildExperimentalOptions(
+        enableDnsHttpsRecords: Boolean,
+        hostResolverOverride: Pair<String, String>?,
+    ): String? {
+        if (!enableDnsHttpsRecords && hostResolverOverride == null) return null
+
+        val fields = mutableListOf<String>()
+        if (enableDnsHttpsRecords) {
+            fields += "\"AsyncDNS\": {\"enable\": true}"
+            fields += "\"UseDnsHttpsSvcb\": {\"use_alpn\": true}"
+        }
+        hostResolverOverride?.let { (overrideHost, overrideIp) ->
+            fields += "\"HostResolverRules\": " +
+                "{\"host_resolver_rules\": \"MAP $overrideHost $overrideIp\"}"
+        }
+
+        return "{${fields.joinToString(",\n")}}"
+    }
+
+    /**
      * play-services-cronet 18.0.1 exposes an older compile-time API even when
      * Google Play services installs a newer native provider. Calling the
      * long-standing experimental-options API reflectively keeps this source
-     * compatible while enabling Cronet's own asynchronous resolver and HTTPS
-     * DNS records, which are required for ECH discovery.
+     * compatible.
      */
-    private fun enableCronetDnsHttps(builder: CronetEngine.Builder): Boolean {
+    private fun applyCronetExperimentalOptions(
+        builder: CronetEngine.Builder,
+        options: String,
+    ): Boolean {
         val method = builder.javaClass.methods.firstOrNull { candidate ->
             candidate.name == "setExperimentalOptions" &&
                 candidate.parameterTypes.contentEquals(arrayOf(String::class.java))
@@ -295,10 +334,10 @@ internal object AfterDarkCronetClient {
         }
 
         return runCatching {
-            method.invoke(builder, EXPERIMENTAL_DNS_OPTIONS)
+            method.invoke(builder, options)
             true
         }.getOrElse { error ->
-            Log.w(TAG, "Options AsyncDNS/HTTPS-SVCB refusées par Cronet", error)
+            Log.w(TAG, "Options expérimentales Cronet refusées : $options", error)
             false
         }
     }

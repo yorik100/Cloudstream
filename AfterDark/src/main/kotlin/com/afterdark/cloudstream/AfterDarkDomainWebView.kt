@@ -460,12 +460,19 @@ internal object AfterDarkDomainWebView {
             if (key.isNotBlank() && value.isNotBlank()) headers[key] = value
         }
 
+        // The wifi's own DNS resolver is what's actually poisoned here (not
+        // TLS/SNI inspection) — resolve over DoH, bypassing it entirely, then
+        // pin Cronet to that IP for this host. SNI/certificate validation
+        // still use the real hostname, only the resolver step is skipped.
+        val overrideIp = AfterDarkDohResolver.resolveBlocking(host)
+
         return runCatching {
             AfterDarkCronetClient.getBlockingWithRetry(
                 url = uri.toString(),
                 headers = headers,
                 timeoutMs = if (request.isForMainFrame) 45_000L else 30_000L,
                 enableDnsHttpsRecords = true,
+                hostResolverOverride = overrideIp?.let { host to it },
                 engineNamespace = RESOLVER_ENGINE_NAMESPACE,
                 maxAttempts = 2,
             ).toWebResponse(

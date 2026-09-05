@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -14,11 +15,14 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.ByteArrayInputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -125,6 +129,19 @@ object AfterDarkEmbedWebView {
                     ?.takeIf { it.isNotBlank() }
                     ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                         "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+
+                val initialHeaders = mapOf(
+                    "Referer" to referer,
+                    "User-Agent" to browserUserAgent,
+                )
+
+                // Hosts that the plain WebView failed to reach at least once.
+                // Once a host lands here, every further request to it
+                // (including a reload of the main frame) is proxied through
+                // Cronet with a DNS-over-HTTPS-resolved IP instead of the
+                // network-provided resolver — see AfterDarkDohResolver.
+                val cronetFallbackHosts = ConcurrentHashMap<String, Unit>()
+                val cronetRetriedHosts = ConcurrentHashMap<String, Unit>()
 
                 fun originOf(url: String): String? =
                     runCatching {
@@ -743,6 +760,30 @@ object AfterDarkEmbedWebView {
                     ) {
                         super.onReceivedError(view, request, error)
 
+                        if (request != null) {
+                            val host = request.url?.host?.lowercase()
+                            if (host != null) {
+                                // This host failed on the plain WebView
+                                // (typically ERROR_HOST_LOOKUP / a connection
+                                // reset on networks whose DNS resolver is
+                                // poisoned). Route every further request to it
+                                // through Cronet + DoH instead of the
+                                // network's resolver.
+                                cronetFallbackHosts[host] = Unit
+
+                                if (
+                                    request.isForMainFrame &&
+                                    cronetRetriedHosts.putIfAbsent(host, Unit) == null
+                                ) {
+                                    // First failure for the main document:
+                                    // reload once now that this host is
+                                    // proxied.
+                                    browser.loadUrl(embedUrl, initialHeaders)
+                                    return
+                                }
+                            }
+                        }
+
                         if (videasyMode && request?.isForMainFrame == true) {
                             finish(null)
                         }
@@ -755,6 +796,13 @@ object AfterDarkEmbedWebView {
                         val media = captureMedia(request)
                         if (media != null) {
                             finish(media)
+                        }
+
+                        if (request != null) {
+                            val host = request.url?.host?.lowercase()
+                            if (host != null && cronetFallbackHosts.containsKey(host)) {
+                                proxyEmbedRequestThroughCronet(request, host)?.let { return it }
+                            }
                         }
 
                         return super.shouldInterceptRequest(view, request)
@@ -803,11 +851,6 @@ object AfterDarkEmbedWebView {
                     show()
                 }
 
-                val initialHeaders = mapOf(
-                    "Referer" to referer,
-                    "User-Agent" to browserUserAgent,
-                )
-
                 browser.loadUrl(embedUrl, initialHeaders)
 
                 // Videasy availability is decided from its rendered player/UI
@@ -820,5 +863,93 @@ object AfterDarkEmbedWebView {
                 finish(null)
             }
         }
+    }
+
+    /**
+     * Fetches [request] through Cronet, first resolving its host over
+     * DNS-over-HTTPS so the network's own (possibly poisoned) resolver is
+     * never consulted. Used only for hosts that already failed once on the
+     * plain WebView — see [cronetFallbackHosts] usage above.
+     *
+     * Only GET requests are proxied (Cronet's client here is GET-only); any
+     * other method falls back to the native WebView path unchanged.
+     */
+    private fun proxyEmbedRequestThroughCronet(
+        request: WebResourceRequest,
+        host: String,
+    ): WebResourceResponse? {
+        if (!request.method.equals("GET", ignoreCase = true)) return null
+        if (!request.url.scheme.equals("https", ignoreCase = true)) return null
+
+        val headers = LinkedHashMap<String, String>()
+        request.requestHeaders.forEach { (key, value) ->
+            if (key.isNotBlank() && value.isNotBlank()) headers[key] = value
+        }
+
+        val overrideIp = AfterDarkDohResolver.resolveBlocking(host)
+
+        return runCatching {
+            AfterDarkCronetClient.getBlockingWithRetry(
+                url = request.url.toString(),
+                headers = headers,
+                timeoutMs = if (request.isForMainFrame) 45_000L else 30_000L,
+                hostResolverOverride = overrideIp?.let { host to it },
+                engineNamespace = "embed-player",
+                maxAttempts = 2,
+            ).toEmbedWebResponse(
+                defaultMimeType = if (request.isForMainFrame) {
+                    "text/html"
+                } else {
+                    "application/octet-stream"
+                },
+            )
+        }.getOrElse { error ->
+            Log.e(
+                "AfterDarkEmbed",
+                "Proxy Cronet impossible pour $host (${request.url})",
+                error,
+            )
+            null
+        }
+    }
+
+    private fun AfterDarkCronetResponse.toEmbedWebResponse(
+        defaultMimeType: String,
+    ): WebResourceResponse {
+        val contentType = header("Content-Type").orEmpty()
+        val mimeType = contentType
+            .substringBefore(';')
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?: defaultMimeType
+        val charset = Regex("charset=([^;\\s]+)", RegexOption.IGNORE_CASE)
+            .find(contentType)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim('"', '\'')
+            ?: "UTF-8"
+
+        val responseHeaders = LinkedHashMap<String, String>()
+        headers.forEach { (key, values) ->
+            if (
+                !key.equals("Content-Encoding", ignoreCase = true) &&
+                !key.equals("Content-Length", ignoreCase = true) &&
+                !key.equals("Transfer-Encoding", ignoreCase = true) &&
+                !key.equals("Set-Cookie", ignoreCase = true) &&
+                values.isNotEmpty()
+            ) {
+                responseHeaders[key] = values.joinToString(", ")
+            }
+        }
+
+        val reason = if (statusCode in 200..299) "OK" else "HTTP $statusCode"
+        return WebResourceResponse(
+            mimeType,
+            charset,
+            statusCode,
+            reason,
+            responseHeaders,
+            ByteArrayInputStream(body),
+        )
     }
 }
