@@ -1,4 +1,4 @@
-# Yorik CloudStream — AfterDark + Frembed
+# CloudStream — AfterDark + Frembed
 
 Ce dépôt contient deux extensions CloudStream indépendantes :
 
@@ -26,18 +26,3 @@ dans la branche `builds` :
 URL du dépôt CloudStream :
 
 `https://raw.githubusercontent.com/yorik100/Cloudstream/builds/repo.json`
-
-## Test Frembed conseillé
-
-Film connu :
-
-- TMDB 533535 — Deadpool & Wolverine
-
-L'API Frembed redirige actuellement ce film vers une URL du type :
-
-`https://frembed.casa/embed/movie/533535?id=533535`
-
-Pour une série, l'extension utilise l'endpoint public `api/serie.php` avec
-TMDB + saison + épisode.
-
-Le scanner de lecteur est volontairement limité aux routes média/API/embed et aux hôtes tiers afin de ne pas crawler le site Frembed.
