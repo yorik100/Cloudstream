@@ -212,10 +212,11 @@ internal object AfterDarkCronetClient {
             val builder = CronetEngine.Builder(context)
                 .enableHttp2(true)
                 .enableQuic(true)
-                // The hospital network closes TCP/TLS when the AfterDark SNI is
-                // visible. A per-host QUIC hint makes Cronet try HTTP/3 on the
-                // first request instead of waiting for an unreachable Alt-Svc.
-                .addQuicHint(host, port, port)
+                // Do not force HTTP/3 with addQuicHint(). Some filtered Wi-Fi
+                // networks reject the first QUIC exchange with
+                // ERR_QUIC_PROTOCOL_ERROR and Cronet then marks that request as
+                // non-retryable. Leaving protocol selection to Cronet restores
+                // its normal HTTP/2/QUIC negotiation and fallback behaviour.
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
 
             val dnsHttpsEnabled = enableDnsHttpsRecords && enableCronetDnsHttps(builder)
@@ -225,7 +226,7 @@ internal object AfterDarkCronetClient {
                     cronetEngines[engineKey] = engine
                     Log.i(
                         TAG,
-                        "Moteur prêt pour $engineKey; QUIC immédiat; " +
+                        "Moteur prêt pour $engineKey; protocole adaptatif; " +
                             "AsyncDNS/HTTPS-SVCB=" +
                             (if (dnsHttpsEnabled) "actifs" else "inactifs"),
                     )

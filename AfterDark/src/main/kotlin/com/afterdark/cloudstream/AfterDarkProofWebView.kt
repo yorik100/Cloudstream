@@ -637,7 +637,7 @@ object AfterDarkProofWebView {
                     <html lang="fr"><meta charset="utf-8">
                     <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
                     <h2>Connexion AfterDark impossible</h2>
-                    <p>La tentative QUIC immédiate et la connexion Cronet ont échoué.</p>
+                    <p>La connexion Cronet adaptative a échoué.</p>
                     <p style="color:#aaa;word-break:break-word">$diagnostic</p>
                     </body></html>
                     """.trimIndent().toByteArray(),
