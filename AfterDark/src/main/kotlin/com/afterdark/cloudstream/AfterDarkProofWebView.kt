@@ -571,6 +571,7 @@ object AfterDarkProofWebView {
             url = requestInfo.url,
             headers = requestInfo.headers,
             timeoutMs = 150_000L,
+            enableDnsHttpsRecords = true,
         )
 
         val captured = CapturedSourceResponse(
@@ -609,6 +610,7 @@ object AfterDarkProofWebView {
                 url = uri.toString(),
                 headers = headers,
                 timeoutMs = if (webRequest.isForMainFrame) 45_000L else 30_000L,
+                enableDnsHttpsRecords = true,
             ).toWebResponse(
                 defaultMimeType = if (webRequest.isForMainFrame) {
                     "text/html"

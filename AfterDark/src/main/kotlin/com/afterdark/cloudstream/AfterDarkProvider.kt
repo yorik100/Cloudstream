@@ -436,6 +436,7 @@ class AfterDarkProvider : MainAPI() {
             url = sourceUrl,
             headers = headers,
             timeoutMs = 150_000L,
+            enableDnsHttpsRecords = true,
         )
 
         return response.statusCode to response.text
