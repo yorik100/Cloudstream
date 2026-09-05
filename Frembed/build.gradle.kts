@@ -1,4 +1,4 @@
-version = 18
+version = 19
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "Frembed - dernier domaine validé en priorité, découverte automatique"
+    description = "Frembed - résolution KeepLink prioritaire avec fallback crt.sh"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")

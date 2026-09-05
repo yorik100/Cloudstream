@@ -1,6 +1,5 @@
 package com.frembed.cloudstream
 
-import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -38,9 +37,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
-class FrembedProvider(
-    preferences: SharedPreferences,
-) : MainAPI() {
+class FrembedProvider : MainAPI() {
     private companion object {
         const val CATALOGUE_CACHE_SECONDS = 60
         const val CATALOGUE_TIMEOUT_SECONDS = 10L
@@ -68,7 +65,7 @@ class FrembedProvider(
         val REGISTRY_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
     }
 
-    override var mainUrl = FrembedDomainResolver.DISCOVERY_ORIGIN
+    override var mainUrl = FrembedDomainResolver.KEEP_LINK_ORIGIN
     override var name = "Frembed"
     override var lang = "fr"
 
@@ -117,7 +114,6 @@ class FrembedProvider(
 
     private val domainResolver = FrembedDomainResolver(
         requestHeaders = browserHeaders,
-        preferences = preferences,
     )
 
     private suspend fun ensureFrembedDomain(): String {
@@ -265,8 +261,7 @@ class FrembedProvider(
     /**
      * Frembed publishes its real catalogue in these two paginated pages. Using
      * them avoids both false positives from TMDB and one availability request
-     * per title. The persisted domain is tried first without a preliminary
-     * network probe, so a normal application restart needs only this request.
+     * per title.
      */
     private suspend fun loadFrembedCatalogue(
         type: String,
@@ -275,8 +270,8 @@ class FrembedProvider(
         val firstOrigin = ensureFrembedDomain()
         fetchFrembedCatalogue(firstOrigin, type, page)?.let { return it }
 
-        // A cached domain can become obsolete between two application starts.
-        // Only then discard it, rediscover a domain and retry once.
+        // A domain can become obsolete during the current application session.
+        // Discard the RAM-only value, resolve again and retry once.
         domainResolver.invalidate(firstOrigin)
         val refreshedOrigin = ensureFrembedDomain()
         return fetchFrembedCatalogue(refreshedOrigin, type, page)

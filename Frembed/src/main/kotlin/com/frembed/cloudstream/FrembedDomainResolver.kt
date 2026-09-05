@@ -1,6 +1,6 @@
 package com.frembed.cloudstream
 
-import android.content.SharedPreferences
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.async
@@ -10,11 +10,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
+import org.json.JSONObject
 import java.net.URI
 
 internal class FrembedDomainResolver(
     private val requestHeaders: Map<String, String>,
-    private val preferences: SharedPreferences,
 ) {
     private val resolutionMutex = Mutex()
 
@@ -27,13 +27,13 @@ internal class FrembedDomainResolver(
         return resolutionMutex.withLock {
             cachedOrigin?.let { return@withLock it }
 
-            readPersistedOrigin()?.let { persistedOrigin ->
-                // The provider's catalogue request is itself the validation.
-                // Avoid duplicate API/page/player probes on every restart.
-                remember(persistedOrigin)
-                return@withLock persistedOrigin
+            resolveFromKeepLink()?.let { resolved ->
+                cachedOrigin = resolved
+                Log.i(TAG, "Domaine Frembed obtenu depuis KeepLink.txt : $resolved")
+                return@withLock resolved
             }
 
+            Log.w(TAG, "KeepLink.txt invalide ou indisponible, recours à crt.sh")
             val candidates = discoverCandidates()
             if (candidates.isEmpty()) {
                 throw ErrorLoadingException(
@@ -52,7 +52,7 @@ internal class FrembedDomainResolver(
 
                 // awaitAll preserves input order: a newer valid domain wins.
                 results.firstOrNull { it != null }?.let { resolved ->
-                    remember(resolved)
+                    cachedOrigin = resolved
                     return@withLock resolved
                 }
             }
@@ -63,15 +63,7 @@ internal class FrembedDomainResolver(
         }
     }
 
-    private fun readPersistedOrigin(): String? {
-        val rawValue = preferences.getString(PREFERENCE_LAST_ORIGIN, null)
-            ?: return null
-        val origin = normalizePersistedOrigin(rawValue)
-        if (origin == null) clearPersistedOrigin()
-        return origin
-    }
-
-    private fun normalizePersistedOrigin(rawValue: String): String? {
+    private fun normalizeOrigin(rawValue: String): String? {
         val uri = runCatching { URI(rawValue.trim()) }.getOrNull() ?: return null
         val host = uri.host?.lowercase() ?: return null
 
@@ -83,24 +75,77 @@ internal class FrembedDomainResolver(
         return "https://$host"
     }
 
-    private fun remember(origin: String) {
-        cachedOrigin = origin
-        preferences.edit()
-            .putString(PREFERENCE_LAST_ORIGIN, origin)
-            .commit()
-    }
-
-    private fun clearPersistedOrigin() {
-        preferences.edit()
-            .remove(PREFERENCE_LAST_ORIGIN)
-            .commit()
-    }
-
     suspend fun invalidate(origin: String) {
         resolutionMutex.withLock {
             if (cachedOrigin == origin) cachedOrigin = null
-            if (readPersistedOrigin() == origin) clearPersistedOrigin()
         }
+    }
+
+    /**
+     * Fast path: only GitHub's KeepLink.txt, the announced Frembed site and
+     * that site's own public API are contacted. Nothing is persisted.
+     */
+    private suspend fun resolveFromKeepLink(): String? {
+        val response = runCatching {
+            app.get(
+                url = KEEP_LINK_URL,
+                headers = mapOf(
+                    "Accept" to "text/plain",
+                    "User-Agent" to requestHeaders["User-Agent"].orEmpty(),
+                ),
+                cacheTime = 0,
+                timeout = KEEP_LINK_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "Lecture de KeepLink.txt impossible", error)
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        val candidate = response.text
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .mapNotNull(::normalizeOrigin)
+            .firstOrNull()
+            ?: return null
+
+        val validatedOrigin = validateCandidate(candidate) ?: return null
+        return validatedOrigin.takeIf { validatePublicApi(it) }
+    }
+
+    private suspend fun validatePublicApi(candidateOrigin: String): Boolean {
+        val response = runCatching {
+            app.get(
+                url = "$candidateOrigin/api/public/v1/movies?limit=1&page=1",
+                headers = requestHeaders + ("Accept" to "application/json"),
+                referer = "$candidateOrigin/api-docs",
+                cacheTime = 0,
+                timeout = API_PROBE_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "API Frembed inaccessible sur $candidateOrigin", error)
+        }.getOrNull() ?: return false
+
+        if (response.okhttpResponse.code !in 200..299) return false
+
+        val finalOrigin = response.okhttpResponse.request.url.let { url ->
+            val port = if (url.port != 443) ":${url.port}" else ""
+            normalizeOrigin("${url.scheme}://${url.host}$port")
+        } ?: return false
+        if (finalOrigin != candidateOrigin) return false
+
+        val payload = runCatching { JSONObject(response.text) }.getOrNull()
+            ?: return false
+        if (payload.optInt("status", 0) != 200) return false
+
+        val items = payload.optJSONObject("result")
+            ?.optJSONArray("items")
+            ?: return false
+        val firstItem = items.optJSONObject(0) ?: return false
+
+        return firstItem.optString("title").isNotBlank() &&
+            firstItem.optString("tmdb").isNotBlank()
     }
 
     private suspend fun discoverCandidates(): List<String> {
@@ -209,8 +254,10 @@ internal class FrembedDomainResolver(
     }
 
     internal companion object {
-        const val PREFERENCES_NAME = "frembed_domain_resolver"
-        const val PREFERENCE_LAST_ORIGIN = "last_valid_origin"
+        const val TAG = "FrembedResolver"
+        const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
+        const val KEEP_LINK_URL =
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink.txt"
 
         const val DISCOVERY_ORIGIN = "https://crt.sh"
         const val DISCOVERY_URL =
@@ -219,6 +266,8 @@ internal class FrembedDomainResolver(
         const val DISCOVERY_ATTEMPTS = 2
         const val DISCOVERY_TIMEOUT_SECONDS = 25L
         const val DISCOVERY_RETRY_DELAY_MS = 1_000L
+        const val KEEP_LINK_TIMEOUT_SECONDS = 8L
+        const val API_PROBE_TIMEOUT_SECONDS = 8L
         const val PROBE_TIMEOUT_SECONDS = 8L
         const val MAX_PARALLEL_PROBES = 10
 
