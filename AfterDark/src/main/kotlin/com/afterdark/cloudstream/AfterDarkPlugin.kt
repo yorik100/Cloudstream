@@ -15,7 +15,11 @@ class AfterDarkPlugin : Plugin() {
 
     override fun load(context: Context) {
         AfterDarkRuntime.init(context)
-        val provider = AfterDarkProvider()
+        val preferences = context.getSharedPreferences(
+            AfterDarkDomainResolver.PREFERENCES_NAME,
+            Context.MODE_PRIVATE,
+        )
+        val provider = AfterDarkProvider(preferences)
         registerMainAPI(provider)
 
         discoveryScope.launch {

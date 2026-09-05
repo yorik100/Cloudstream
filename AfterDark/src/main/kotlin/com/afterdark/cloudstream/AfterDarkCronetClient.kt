@@ -49,6 +49,12 @@ internal object AfterDarkCronetClient {
     private const val MAX_BODY_BYTES = 16 * 1024 * 1024
 
     private const val TAG = "AfterDarkCronet"
+    private val EXPERIMENTAL_DNS_OPTIONS = """
+        {
+          "AsyncDNS": {"enable": true},
+          "UseDnsHttpsSvcb": {"use_alpn": true}
+        }
+    """.trimIndent()
 
     private val engineLock = Any()
     private val callbackExecutor = Executors.newCachedThreadPool { runnable ->
@@ -197,7 +203,7 @@ internal object AfterDarkCronetClient {
                 providerReady = true
             }
 
-            CronetEngine.Builder(context)
+            val builder = CronetEngine.Builder(context)
                 .enableHttp2(true)
                 .enableQuic(true)
                 // The hospital network closes TCP/TLS when the AfterDark SNI is
@@ -205,11 +211,43 @@ internal object AfterDarkCronetClient {
                 // first request instead of waiting for an unreachable Alt-Svc.
                 .addQuicHint(host, port, port)
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
-                .build()
+
+            enableCronetDnsHttps(builder)
+
+            builder.build()
                 .also { engine ->
                     cronetEngines[engineKey] = engine
-                    Log.i(TAG, "Moteur prêt pour $engineKey; QUIC immédiat")
+                    Log.i(
+                        TAG,
+                        "Moteur prêt pour $engineKey; QUIC immédiat; " +
+                            "AsyncDNS/HTTPS-SVCB actifs",
+                    )
                 }
+        }
+    }
+
+    /**
+     * play-services-cronet 18.0.1 exposes an older compile-time API even when
+     * Google Play services installs a newer native provider. Calling the
+     * long-standing experimental-options API reflectively keeps this source
+     * compatible while enabling Cronet's own asynchronous resolver and HTTPS
+     * DNS records, which are required for ECH discovery.
+     */
+    private fun enableCronetDnsHttps(builder: CronetEngine.Builder) {
+        val method = builder.javaClass.methods.firstOrNull { candidate ->
+            candidate.name == "setExperimentalOptions" &&
+                candidate.parameterTypes.contentEquals(arrayOf(String::class.java))
+        } ?: throw IllegalStateException(
+            "Ce fournisseur Cronet ne permet pas d'activer AsyncDNS/HTTPS-SVCB",
+        )
+
+        runCatching {
+            method.invoke(builder, EXPERIMENTAL_DNS_OPTIONS)
+        }.getOrElse { error ->
+            throw IllegalStateException(
+                "Impossible d'activer AsyncDNS/HTTPS-SVCB dans Cronet",
+                error,
+            )
         }
     }
 
