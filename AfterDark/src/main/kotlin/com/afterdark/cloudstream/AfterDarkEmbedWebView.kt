@@ -24,9 +24,6 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 object AfterDarkEmbedWebView {
-    private const val TIMEOUT_MS = 45_000L
-    private const val USER_ACTIVITY_EXTENSION_MS = 60_000L
-
     private val mediaExtensions = listOf(
         ".m3u8",
         ".mpd",
@@ -43,16 +40,14 @@ object AfterDarkEmbedWebView {
     ): ResolvedWebMedia? = suspendCoroutine { continuation ->
         val finished = AtomicBoolean(false)
         val videasyMode = sourceName.equals("videasy", ignoreCase = true)
+        val peachifyMode = sourceName.equals("peachify", ignoreCase = true)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
 
-        lateinit var timeoutRunnable: Runnable
-
         fun finish(result: ResolvedWebMedia?) {
             if (!finished.compareAndSet(false, true)) return
 
-            handler.removeCallbacks(timeoutRunnable)
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
                 runCatching { dialog?.dismiss() }
@@ -67,18 +62,6 @@ object AfterDarkEmbedWebView {
             }
 
             continuation.resume(result)
-        }
-
-        timeoutRunnable = Runnable {
-            // Peachify/other fallbacks keep a safety timeout. Videasy must not
-            // be declared unavailable from elapsed loading time.
-            if (!videasyMode) finish(null)
-        }
-
-        fun extendTimeout(delayMs: Long = USER_ACTIVITY_EXTENSION_MS) {
-            if (finished.get() || videasyMode) return
-            handler.removeCallbacks(timeoutRunnable)
-            handler.postDelayed(timeoutRunnable, delayMs)
         }
 
         handler.post {
@@ -208,17 +191,14 @@ object AfterDarkEmbedWebView {
                     }
 
                     @JavascriptInterface
-                    fun activity() {
-                        extendTimeout()
-                    }
+                    fun activity() = Unit
 
                     @JavascriptInterface
                     fun unavailable(reason: String?) {
-                        if (!videasyMode) return
+                        if (!videasyMode && !peachifyMode) return
 
-                        // Only explicit Videasy UI/player states call this:
-                        // error page, missing rendered player, main-frame error,
-                        // or an explicit HTML5 media error.
+                        // Only explicit rendered player/error states may end a
+                        // fallback. Peachify is never stopped by elapsed time.
                         finish(null)
                     }
                 }
@@ -305,6 +285,7 @@ object AfterDarkEmbedWebView {
                             if (!bridge) return;
 
                             const VIDEASY_MODE = ${if (videasyMode) "true" else "false"};
+                            const PEACHIFY_MODE = ${if (peachifyMode) "true" else "false"};
 
                             const report = (url, contentType = '') => {
                               try {
@@ -436,6 +417,50 @@ object AfterDarkEmbedWebView {
                               ) return false;
                               const rect = element.getBoundingClientRect();
                               return rect.width > 0 && rect.height > 0;
+                            };
+
+                            const isPeachifyPage = () => {
+                              if (!PEACHIFY_MODE) return false;
+                              const host = String(location.hostname || '').toLowerCase();
+                              return host === 'peachify.top' || host.endsWith('.peachify.top');
+                            };
+
+                            const hasPeachifyNotFoundPanel = () => {
+                              if (!isPeachifyPage()) return false;
+
+                              const closeButtons = [...document.querySelectorAll(
+                                'button[aria-label="Close error message"]'
+                              )].filter(isVisible);
+
+                              return closeButtons.some(closeButton => {
+                                let panel = closeButton.parentElement;
+                                let depth = 0;
+
+                                while (panel && panel !== document.body && depth < 6) {
+                                  const exactTitle = [...panel.querySelectorAll('div')].some(
+                                    element =>
+                                      isVisible(element) &&
+                                      normalizedText(element.textContent) === '404 - not found'
+                                  );
+                                  const reloadButton = [...panel.querySelectorAll('button')].some(
+                                    element =>
+                                      isVisible(element) &&
+                                      normalizedText(element.textContent) === 'reload'
+                                  );
+
+                                  if (exactTitle && reloadButton) return true;
+                                  panel = panel.parentElement;
+                                  depth += 1;
+                                }
+
+                                return false;
+                              });
+                            };
+
+                            const checkPeachifyDomState = () => {
+                              if (hasPeachifyNotFoundPanel()) {
+                                bridge.unavailable('peachify-404-not-found');
+                              }
                             };
 
                             const hasGoBackError = () =>
@@ -623,18 +648,20 @@ object AfterDarkEmbedWebView {
                             scanMedia();
                             tryVideasyAutoPlay();
                             checkVideasyDomState();
+                            checkPeachifyDomState();
 
                             if (!window.__afterdarkMediaObserver) {
                               window.__afterdarkMediaObserver = new MutationObserver(() => {
                                 scanMedia();
                                 tryVideasyAutoPlay();
                                 checkVideasyDomState();
+                                checkPeachifyDomState();
                               });
                               window.__afterdarkMediaObserver.observe(document.documentElement, {
                                 childList: true,
                                 subtree: true,
                                 attributes: true,
-                                attributeFilter: ['src']
+                                attributeFilter: ['src', 'class', 'style', 'aria-label']
                               });
                             }
 
@@ -770,7 +797,6 @@ object AfterDarkEmbedWebView {
                         url: String?,
                     ) {
                         super.onPageFinished(view, url)
-                        extendTimeout()
                         installHooksAndNudge()
 
                         if (!videasyMode) {
@@ -809,13 +835,6 @@ object AfterDarkEmbedWebView {
                 }
 
                 browser.loadUrl(embedUrl, initialHeaders)
-
-                // Videasy availability is decided from its rendered player/UI
-                // state and explicit main-frame/media failures. It never falls
-                // through to Peachify because an arbitrary timer expired.
-                if (!videasyMode) {
-                    handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
-                }
             } catch (_: Exception) {
                 finish(null)
             }
