@@ -7,6 +7,7 @@ import android.graphics.drawable.ColorDrawable
 import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
+import android.text.TextUtils
 import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
@@ -23,6 +24,9 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.io.ByteArrayInputStream
+import java.net.URI
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -46,6 +50,9 @@ internal object AfterDarkDomainWebView {
         var candidateOrigin: String? = null
         var mainFrameHttpCode: Int? = null
         var domPoll: Runnable? = null
+        val proxiedHosts = ConcurrentHashMap<String, Unit>().apply {
+            put(AfterDarkDomainResolver.SOURCE_HOST, Unit)
+        }
 
         lateinit var timeoutRunnable: Runnable
 
@@ -213,6 +220,10 @@ internal object AfterDarkDomainWebView {
                             }
 
                             candidateOrigin = origin
+                            URI(origin).host
+                                ?.lowercase()
+                                ?.removePrefix("www.")
+                                ?.let { proxiedHosts[it] = Unit }
                             mainFrameHttpCode = null
                             stopDomPolling()
                             showInfo("Adresse trouvée. Validation de $origin…")
@@ -298,6 +309,17 @@ internal object AfterDarkDomainWebView {
                     ): Boolean {
                         val scheme = request?.url?.scheme?.lowercase()
                         return scheme != "http" && scheme != "https"
+                    }
+
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                    ): WebResourceResponse? {
+                        return proxyResolverGet(
+                            request = request,
+                            allowedHosts = proxiedHosts,
+                            onMainFrameFailure = { message -> showInfo(message) },
+                        ) ?: super.shouldInterceptRequest(view, request)
                     }
 
                     override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -416,5 +438,127 @@ internal object AfterDarkDomainWebView {
                 finish(null)
             }
         }
+    }
+
+    private fun proxyResolverGet(
+        request: WebResourceRequest?,
+        allowedHosts: Map<String, Unit>,
+        onMainFrameFailure: (String) -> Unit,
+    ): WebResourceResponse? {
+        if (request == null) return null
+        if (!request.method.equals("GET", ignoreCase = true)) return null
+
+        val uri = request.url
+        if (!uri.scheme.equals("https", ignoreCase = true)) return null
+        val host = uri.host
+            ?.lowercase()
+            ?.removePrefix("www.")
+            ?: return null
+        if (!allowedHosts.containsKey(host)) return null
+
+        return runCatching {
+            AfterDarkCronetClient.getBlocking(
+                url = uri.toString(),
+                headers = request.requestHeaders,
+                timeoutMs = if (request.isForMainFrame) 60_000L else 30_000L,
+                enableDnsHttpsRecords = true,
+            ).toWebResponse(
+                defaultMimeType = if (request.isForMainFrame) {
+                    "text/html"
+                } else {
+                    "application/octet-stream"
+                },
+            )
+        }.getOrElse { error ->
+            Log.e(
+                AfterDarkDomainResolver.TAG,
+                "Proxy Cronet du resolver impossible pour $host",
+                error,
+            )
+            if (!request.isForMainFrame) return null
+
+            onMainFrameFailure(
+                "Le registre n'a pas pu être chargé par Cronet. " +
+                    "Tu peux utiliser Recharger.",
+            )
+            cronetFailurePage(error)
+        }
+    }
+
+    private fun cronetFailurePage(error: Throwable): WebResourceResponse {
+        val diagnostic = TextUtils.htmlEncode(
+            "${error.javaClass.simpleName}: ${error.message ?: "aucun détail"}",
+        )
+        return WebResourceResponse(
+            "text/html",
+            "UTF-8",
+            ByteArrayInputStream(
+                """
+                <!doctype html>
+                <html lang="fr"><meta charset="utf-8">
+                <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
+                <h2>Registre AfterDark inaccessible</h2>
+                <p>La connexion Cronet HTTPS/SVCB du resolver a échoué.</p>
+                <p style="color:#aaa;word-break:break-word">$diagnostic</p>
+                </body></html>
+                """.trimIndent().toByteArray(),
+            ),
+        )
+    }
+
+    private fun AfterDarkCronetResponse.toWebResponse(
+        defaultMimeType: String,
+    ): WebResourceResponse {
+        val contentType = header("Content-Type").orEmpty()
+        val mimeType = contentType
+            .substringBefore(';')
+            .trim()
+            .takeIf { it.isNotBlank() }
+            ?: defaultMimeType
+        val charset = Regex("charset=([^;\\s]+)", RegexOption.IGNORE_CASE)
+            .find(contentType)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.trim('"', '\'')
+            ?: "UTF-8"
+
+        val responseHeaders = LinkedHashMap<String, String>()
+        headers.forEach { (key, values) ->
+            if (
+                !key.equals("Content-Encoding", ignoreCase = true) &&
+                !key.equals("Content-Length", ignoreCase = true) &&
+                !key.equals("Transfer-Encoding", ignoreCase = true) &&
+                !key.equals("Set-Cookie", ignoreCase = true) &&
+                values.isNotEmpty()
+            ) {
+                responseHeaders[key] = values.joinToString(", ")
+            }
+        }
+
+        return WebResourceResponse(
+            mimeType,
+            charset,
+            statusCode,
+            reasonPhrase(statusCode),
+            responseHeaders,
+            ByteArrayInputStream(body),
+        )
+    }
+
+    private fun reasonPhrase(statusCode: Int): String = when (statusCode) {
+        200 -> "OK"
+        201 -> "Created"
+        204 -> "No Content"
+        206 -> "Partial Content"
+        400 -> "Bad Request"
+        401 -> "Unauthorized"
+        403 -> "Forbidden"
+        404 -> "Not Found"
+        410 -> "Gone"
+        429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
+        502 -> "Bad Gateway"
+        503 -> "Service Unavailable"
+        else -> "HTTP $statusCode"
     }
 }
