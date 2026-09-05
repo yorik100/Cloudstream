@@ -1,4 +1,4 @@
-version = 36
+version = 37
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -12,7 +12,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - résolution HTTP puis WebView avec cache mémoire"
+    description = "AfterDark - résolution dynamique et Cronet adaptatif"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
