@@ -1,7 +1,6 @@
 package com.afterdark.cloudstream
 
 import android.content.Context
-import android.util.Log
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import kotlinx.coroutines.CoroutineScope
@@ -15,22 +14,21 @@ class AfterDarkPlugin : Plugin() {
 
     override fun load(context: Context) {
         AfterDarkRuntime.init(context)
-        val preferences = context.getSharedPreferences(
-            AfterDarkDomainResolver.PREFERENCES_NAME,
+
+        // Delete values written by older resolver versions. The current
+        // domain is deliberately cached in RAM only.
+        context.getSharedPreferences(
+            AfterDarkDomainResolver.LEGACY_PREFERENCES_NAME,
             Context.MODE_PRIVATE,
-        )
-        val provider = AfterDarkProvider(preferences)
+        ).edit().clear().apply()
+
+        val provider = AfterDarkProvider()
         registerMainAPI(provider)
 
+        // Background discovery is HTTP-only. It cannot display the fallback
+        // WebView while CloudStream is starting.
         discoveryScope.launch {
-            runCatching { provider.prepareDomain() }
-                .onFailure { error ->
-                    Log.e(
-                        AfterDarkDomainResolver.TAG,
-                        "Découverte initiale du domaine impossible",
-                        error,
-                    )
-                }
+            provider.prepareDomainInBackground()
         }
     }
 }

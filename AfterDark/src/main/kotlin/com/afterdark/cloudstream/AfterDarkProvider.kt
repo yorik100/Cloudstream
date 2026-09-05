@@ -1,6 +1,5 @@
 package com.afterdark.cloudstream
 
-import android.content.SharedPreferences
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
@@ -35,7 +34,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
-class AfterDarkProvider(preferences: SharedPreferences) : MainAPI() {
+class AfterDarkProvider : MainAPI() {
     override var mainUrl = AfterDarkDomainResolver.SOURCE_ORIGIN
     override var name = "AfterDark"
     override var lang = "fr"
@@ -44,7 +43,9 @@ class AfterDarkProvider(preferences: SharedPreferences) : MainAPI() {
     override val usesWebView = true
     override val hasDownloadSupport = false
     override val hasChromecastSupport = false
-    override val loadLinksTimeoutMs: Long? = 210_000L
+    // First playback may need both the domain WebView and the official proof
+    // WebView. Leave enough time for the user to complete both interactions.
+    override val loadLinksTimeoutMs: Long? = 420_000L
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     private val tmdbApi = "https://api.themoviedb.org/3"
@@ -54,16 +55,18 @@ class AfterDarkProvider(preferences: SharedPreferences) : MainAPI() {
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
 
     private val proofCache = ConcurrentHashMap<String, ProofSession>()
-    private val domainResolver = AfterDarkDomainResolver(preferences)
+    private val domainResolver = AfterDarkDomainResolver()
 
     private suspend fun ensureAfterDarkDomain(): String {
-        val resolved = domainResolver.resolve()
+        val resolved = domainResolver.resolveForPlayback()
         mainUrl = resolved
         return resolved
     }
 
-    internal suspend fun prepareDomain() {
-        ensureAfterDarkDomain()
+    internal suspend fun prepareDomainInBackground() {
+        domainResolver.resolveInBackground()?.let { resolved ->
+            mainUrl = resolved
+        }
     }
 
     override val mainPage = mainPageOf(
