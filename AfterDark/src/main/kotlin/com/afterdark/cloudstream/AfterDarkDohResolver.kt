@@ -20,37 +20,68 @@ import javax.net.ssl.HttpsURLConnection
  * Resolving here and feeding the result into Cronet's HostResolverRules
  * (see [AfterDarkCronetClient]) reproduces what Chrome/Firefox do natively.
  */
+internal data class AfterDarkDohResult(val ip: String?, val detail: String)
+
 internal object AfterDarkDohResolver {
     private const val TAG = "AfterDarkDoh"
     private const val TIMEOUT_MS = 8_000
 
-    // Cloudflare's DoH certificate carries IP SAN entries for these
-    // addresses, so TLS hostname verification succeeds even though we never
-    // resolve "cloudflare-dns.com" through any DNS resolver.
-    private val DOH_ENDPOINT_IPS = listOf("1.1.1.1", "1.0.0.1")
+    // Cloudflare and Google's DoH JSON endpoints, contacted by raw IP so no
+    // DNS lookup is needed to reach them. Both carry IP SAN entries for
+    // these addresses, and both speak the same "Answer" JSON schema, so one
+    // parser (extractFirstIp) covers all of them. Google is tried second in
+    // case a given network specifically blocks Cloudflare's resolver IPs.
+    private data class DohEndpoint(val ip: String, val path: String)
+
+    private val DOH_ENDPOINTS = listOf(
+        DohEndpoint("1.1.1.1", "/dns-query"),
+        DohEndpoint("1.0.0.1", "/dns-query"),
+        DohEndpoint("8.8.8.8", "/resolve"),
+        DohEndpoint("8.8.4.4", "/resolve"),
+    )
 
     private val cache = ConcurrentHashMap<String, String>()
 
     /** Blocking; call from a background thread only. */
-    fun resolveBlocking(host: String): String? {
-        cache[host]?.let { return it }
+    fun resolveBlocking(host: String): String? = resolveWithDetail(host).ip
 
-        for (endpointIp in DOH_ENDPOINT_IPS) {
-            val resolved = runCatching { query(endpointIp, host) }
-                .onFailure { error -> Log.w(TAG, "Échec DoH pour $host via $endpointIp", error) }
-                .getOrNull()
+    /**
+     * Same resolution as [resolveBlocking], but also reports why it failed
+     * when it does — which DoH endpoints were tried and what happened to
+     * each. Needed right now to tell apart "DoH itself is blocked on this
+     * network" from "DoH worked but Cronet still can't reach the real IP"
+     * without another guess-and-test round trip.
+     */
+    fun resolveWithDetail(host: String): AfterDarkDohResult {
+        cache[host]?.let { return AfterDarkDohResult(it, "IP en cache : $it") }
 
+        val attempts = mutableListOf<String>()
+        for (endpoint in DOH_ENDPOINTS) {
+            val outcome = runCatching { query(endpoint, host) }
+            outcome.onFailure { error ->
+                Log.w(TAG, "Échec DoH pour $host via ${endpoint.ip}", error)
+                attempts += "${endpoint.ip}${endpoint.path} : " +
+                    "${error.javaClass.simpleName}${error.message?.let { " ($it)" }.orEmpty()}"
+            }
+
+            val resolved = outcome.getOrNull()
             if (resolved != null) {
                 cache[host] = resolved
-                return resolved
+                return AfterDarkDohResult(resolved, "résolu $host → $resolved via ${endpoint.ip}")
+            }
+            if (outcome.isSuccess) {
+                attempts += "${endpoint.ip}${endpoint.path} : réponse reçue sans enregistrement A"
             }
         }
 
-        return null
+        val detail = "DoH indisponible pour $host : " +
+            attempts.joinToString("; ").ifBlank { "aucun résolveur n'a répondu" }
+        Log.w(TAG, detail)
+        return AfterDarkDohResult(null, detail)
     }
 
-    private fun query(endpointIp: String, host: String): String? {
-        val url = URL("https://$endpointIp/dns-query?name=$host&type=A")
+    private fun query(endpoint: DohEndpoint, host: String): String? {
+        val url = URL("https://${endpoint.ip}${endpoint.path}?name=$host&type=A")
         val connection = url.openConnection() as HttpsURLConnection
 
         return try {

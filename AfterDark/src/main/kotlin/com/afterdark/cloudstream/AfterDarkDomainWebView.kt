@@ -464,7 +464,7 @@ internal object AfterDarkDomainWebView {
         // TLS/SNI inspection) — resolve over DoH, bypassing it entirely, then
         // pin Cronet to that IP for this host. SNI/certificate validation
         // still use the real hostname, only the resolver step is skipped.
-        val overrideIp = AfterDarkDohResolver.resolveBlocking(host)
+        val dohResult = AfterDarkDohResolver.resolveWithDetail(host)
 
         return runCatching {
             AfterDarkCronetClient.getBlockingWithRetry(
@@ -472,7 +472,7 @@ internal object AfterDarkDomainWebView {
                 headers = headers,
                 timeoutMs = if (request.isForMainFrame) 45_000L else 30_000L,
                 enableDnsHttpsRecords = true,
-                hostResolverOverride = overrideIp?.let { host to it },
+                hostResolverOverride = dohResult.ip?.let { host to it },
                 engineNamespace = RESOLVER_ENGINE_NAMESPACE,
                 maxAttempts = 2,
             ).toWebResponse(
@@ -493,14 +493,15 @@ internal object AfterDarkDomainWebView {
             onMainFrameFailure(
                 "Connexion Cronet au registre impossible. Utilise Recharger pour réessayer.",
             )
-            resolverFailureResponse(error)
+            resolverFailureResponse(error, dohResult.detail)
         }
     }
 
-    private fun resolverFailureResponse(error: Throwable): WebResourceResponse {
+    private fun resolverFailureResponse(error: Throwable, dohDetail: String): WebResourceResponse {
         val diagnostic = TextUtils.htmlEncode(
             "${error.javaClass.simpleName}: ${error.message ?: "aucun détail"}",
         )
+        val doh = TextUtils.htmlEncode(dohDetail)
         return WebResourceResponse(
             "text/html",
             "UTF-8",
@@ -511,6 +512,7 @@ internal object AfterDarkDomainWebView {
                 <body style="background:#000;color:#fff;font-family:sans-serif;padding:24px">
                 <h2>Registre AfterDark inaccessible</h2>
                 <p>Les deux tentatives Cronet ont échoué.</p>
+                <p style="color:#8cf;word-break:break-word">DoH : $doh</p>
                 <p style="color:#aaa;word-break:break-word">$diagnostic</p>
                 </body></html>
                 """.trimIndent().toByteArray(),

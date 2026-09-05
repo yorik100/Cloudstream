@@ -886,14 +886,17 @@ object AfterDarkEmbedWebView {
             if (key.isNotBlank() && value.isNotBlank()) headers[key] = value
         }
 
-        val overrideIp = AfterDarkDohResolver.resolveBlocking(host)
+        val dohResult = AfterDarkDohResolver.resolveWithDetail(host)
+        if (dohResult.ip == null) {
+            Log.w("AfterDarkEmbed", "DoH: ${dohResult.detail}")
+        }
 
         return runCatching {
             AfterDarkCronetClient.getBlockingWithRetry(
                 url = request.url.toString(),
                 headers = headers,
                 timeoutMs = if (request.isForMainFrame) 45_000L else 30_000L,
-                hostResolverOverride = overrideIp?.let { host to it },
+                hostResolverOverride = dohResult.ip?.let { host to it },
                 engineNamespace = "embed-player",
                 maxAttempts = 2,
             ).toEmbedWebResponse(
