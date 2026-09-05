@@ -1,4 +1,4 @@
-version = 19
+version = 20
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "Frembed - résolution KeepLink prioritaire avec fallback crt.sh"
+    description = "Frembed - résolution config main, KeepLink puis fallback crt.sh"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")

@@ -27,6 +27,13 @@ internal class FrembedDomainResolver(
         return resolutionMutex.withLock {
             cachedOrigin?.let { return@withLock it }
 
+            resolveFromConfig()?.let { resolved ->
+                cachedOrigin = resolved
+                Log.i(TAG, "Domaine Frembed obtenu depuis config.json/main : $resolved")
+                return@withLock resolved
+            }
+
+            Log.w(TAG, "config.json/main invalide ou indisponible, essai de KeepLink.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
                 Log.i(TAG, "Domaine Frembed obtenu depuis KeepLink.txt : $resolved")
@@ -53,6 +60,7 @@ internal class FrembedDomainResolver(
                 // awaitAll preserves input order: a newer valid domain wins.
                 results.firstOrNull { it != null }?.let { resolved ->
                     cachedOrigin = resolved
+                    Log.i(TAG, "Domaine Frembed obtenu via crt.sh : $resolved")
                     return@withLock resolved
                 }
             }
@@ -61,6 +69,37 @@ internal class FrembedDomainResolver(
                 "Aucun domaine Frembed actuellement utilisable",
             )
         }
+    }
+
+    /**
+     * First source: read only the JSON field named "main". The "backup"
+     * field and every other value are deliberately ignored.
+     */
+    private suspend fun resolveFromConfig(): String? {
+        val response = runCatching {
+            app.get(
+                url = CONFIG_URL,
+                headers = mapOf(
+                    "Accept" to "application/json",
+                    "User-Agent" to requestHeaders["User-Agent"].orEmpty(),
+                ),
+                cacheTime = 0,
+                timeout = CONFIG_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "Lecture de config.json impossible", error)
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        val candidate = runCatching {
+            JSONObject(response.text).optString("main", "")
+        }.getOrNull()
+            ?.let(::normalizeOrigin)
+            ?: return null
+
+        val validatedOrigin = validateCandidate(candidate) ?: return null
+        return validatedOrigin.takeIf { validatePublicApi(it) }
     }
 
     private fun normalizeOrigin(rawValue: String): String? {
@@ -255,6 +294,10 @@ internal class FrembedDomainResolver(
 
     internal companion object {
         const val TAG = "FrembedResolver"
+        const val CONFIG_ORIGIN = "https://raw.githubusercontent.com"
+        const val CONFIG_URL =
+            "$CONFIG_ORIGIN/kingofthrone73-dotcom/frembed-config/refs/heads/main/config.json"
+
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
             "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink.txt"
@@ -266,6 +309,7 @@ internal class FrembedDomainResolver(
         const val DISCOVERY_ATTEMPTS = 2
         const val DISCOVERY_TIMEOUT_SECONDS = 25L
         const val DISCOVERY_RETRY_DELAY_MS = 1_000L
+        const val CONFIG_TIMEOUT_SECONDS = 8L
         const val KEEP_LINK_TIMEOUT_SECONDS = 8L
         const val API_PROBE_TIMEOUT_SECONDS = 8L
         const val PROBE_TIMEOUT_SECONDS = 8L
