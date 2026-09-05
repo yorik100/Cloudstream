@@ -25,9 +25,13 @@ import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.extractorApis
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -37,6 +41,33 @@ import java.util.TimeZone
 class FrembedProvider(
     preferences: SharedPreferences,
 ) : MainAPI() {
+    private companion object {
+        const val CATALOGUE_CACHE_SECONDS = 60
+        const val CATALOGUE_TIMEOUT_SECONDS = 10L
+        const val SEARCH_AVAILABILITY_BATCH_SIZE = 6
+
+        val ANCHOR_REGEX = Regex(
+            """<a\b[^>]*\bhref\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val IMAGE_REGEX = Regex(
+            """<img\b[^>]*>""",
+            RegexOption.IGNORE_CASE,
+        )
+        val TAG_REGEX = Regex("""<[^>]+>""")
+        val CATALOGUE_ITEM_PATH = Regex(
+            """^/(movies|tv-show)/([^/?#]+)/([0-9]+)/*$""",
+            RegexOption.IGNORE_CASE,
+        )
+        val PAGE_COUNT_REGEX = Regex(
+            """(?i)\bpage\s+\d+\s*/\s*(\d+)""",
+        )
+        val YEAR_REGEX = Regex("""\b(?:19|20)\d{2}\b""")
+        val HEX_ENTITY_REGEX = Regex("""&#x([0-9a-fA-F]+);""")
+        val DECIMAL_ENTITY_REGEX = Regex("""&#(\d+);""")
+        val REGISTRY_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
+    }
+
     override var mainUrl = FrembedDomainResolver.DISCOVERY_ORIGIN
     override var name = "Frembed"
     override var lang = "fr"
@@ -86,7 +117,6 @@ class FrembedProvider(
 
     private val domainResolver = FrembedDomainResolver(
         requestHeaders = browserHeaders,
-        streamHeaders = streamNavigationHeaders,
         preferences = preferences,
     )
 
@@ -101,8 +131,13 @@ class FrembedProvider(
     }
 
     override val mainPage = mainPageOf(
-        "movie" to "Films populaires",
-        "tv" to "Séries populaires",
+        "movie" to "Derniers films Frembed",
+        "tv" to "Dernières séries Frembed",
+    )
+
+    private data class FrembedCataloguePage(
+        val items: List<SearchResponse>,
+        val totalPages: Int,
     )
 
     private fun encode(value: String): String =
@@ -218,20 +253,180 @@ class FrembedProvider(
         page: Int,
         request: MainPageRequest,
     ): HomePageResponse {
-        ensureFrembedDomain()
-
         val type = if (request.data == "tv") "tv" else "movie"
-        val endpoint = if (type == "tv") "/tv/popular" else "/movie/popular"
+        val catalogue = loadFrembedCatalogue(type, page)
+        return newHomePageResponse(
+            request,
+            catalogue.items,
+            page < catalogue.totalPages,
+        )
+    }
 
-        val root = tmdbGet(endpoint, mapOf("page" to page.toString()))
-        val results = root.optJSONArray("results") ?: JSONArray()
+    /**
+     * Frembed publishes its real catalogue in these two paginated pages. Using
+     * them avoids both false positives from TMDB and one availability request
+     * per title. The persisted domain is tried first without a preliminary
+     * network probe, so a normal application restart needs only this request.
+     */
+    private suspend fun loadFrembedCatalogue(
+        type: String,
+        page: Int,
+    ): FrembedCataloguePage {
+        val firstOrigin = ensureFrembedDomain()
+        fetchFrembedCatalogue(firstOrigin, type, page)?.let { return it }
 
-        val items = results.objects()
-            .mapNotNull { it.toSearchResponse(type) }
-            .toList()
+        // A cached domain can become obsolete between two application starts.
+        // Only then discard it, rediscover a domain and retry once.
+        domainResolver.invalidate(firstOrigin)
+        val refreshedOrigin = ensureFrembedDomain()
+        return fetchFrembedCatalogue(refreshedOrigin, type, page)
+            ?: throw ErrorLoadingException("Catalogue Frembed inaccessible")
+    }
 
-        val totalPages = root.optInt("total_pages", page)
-        return newHomePageResponse(request, items, page < totalPages)
+    private suspend fun fetchFrembedCatalogue(
+        origin: String,
+        type: String,
+        page: Int,
+    ): FrembedCataloguePage? {
+        val route = if (type == "tv") "/tv-show" else "/movies"
+        val pageUrl = "$origin$route" +
+            if (page > 1) "?page=$page" else ""
+
+        val response = runCatching {
+            app.get(
+                url = pageUrl,
+                headers = browserHeaders,
+                referer = "$origin/",
+                cacheTime = CATALOGUE_CACHE_SECONDS,
+                timeout = CATALOGUE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        val parsed = parseFrembedCatalogue(
+            html = response.text,
+            origin = origin,
+            expectedType = type,
+        ) ?: return null
+
+        // An empty page beyond the end is valid. An empty page inside the
+        // advertised range means this is not a usable Frembed catalogue.
+        if (parsed.items.isEmpty() && page <= parsed.totalPages) return null
+        return parsed
+    }
+
+    private fun parseFrembedCatalogue(
+        html: String,
+        origin: String,
+        expectedType: String,
+    ): FrembedCataloguePage? {
+        val plainText = decodeHtml(
+            TAG_REGEX.replace(html, " ")
+        ).replace(Regex("\\s+"), " ")
+
+        if (REGISTRY_PAGE_MARKERS.any { plainText.contains(it, ignoreCase = true) }) {
+            return null
+        }
+
+        val totalPages = PAGE_COUNT_REGEX.find(plainText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?: return null
+
+        val expectedRoute = if (expectedType == "tv") "tv-show" else "movies"
+        val results = LinkedHashMap<String, SearchResponse>()
+
+        for (anchor in ANCHOR_REGEX.findAll(html)) {
+            val href = decodeHtml(anchor.groupValues[1]).trim()
+            val uri = runCatching { URI(origin).resolve(href) }.getOrNull() ?: continue
+            val pathMatch = CATALOGUE_ITEM_PATH.matchEntire(uri.path ?: "") ?: continue
+            if (!pathMatch.groupValues[1].equals(expectedRoute, ignoreCase = true)) continue
+
+            val tmdbId = pathMatch.groupValues[3].toIntOrNull()
+                ?.takeIf { it > 0 }
+                ?: continue
+            val body = anchor.groupValues[2]
+            val imageTag = IMAGE_REGEX.find(body)?.value.orEmpty()
+            val slug = pathMatch.groupValues[2]
+
+            val title = attribute(imageTag, "alt")
+                ?.let(::decodeHtml)
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+                ?: slugToTitle(slug)
+
+            val rawPoster = sequenceOf("src", "data-src", "data-lazy-src")
+                .mapNotNull { attribute(imageTag, it) }
+                .firstOrNull { it.isNotBlank() }
+            val posterUrl = rawPoster?.let { resolveUrl("$origin/", decodeHtml(it)) }
+
+            val itemText = decodeHtml(TAG_REGEX.replace(body, " "))
+            val itemYear = YEAR_REGEX.find(itemText)?.value?.toIntOrNull()
+            val item = if (expectedType == "movie") {
+                newMovieSearchResponse(
+                    name = title,
+                    url = catalogUrl("movie", tmdbId),
+                    type = TvType.Movie,
+                ) {
+                    this.posterUrl = posterUrl
+                    year = itemYear
+                }
+            } else {
+                newTvSeriesSearchResponse(
+                    name = title,
+                    url = catalogUrl("tv", tmdbId),
+                    type = TvType.TvSeries,
+                ) {
+                    this.posterUrl = posterUrl
+                    year = itemYear
+                }
+            }
+
+            results.putIfAbsent(item.url, item)
+        }
+
+        return FrembedCataloguePage(results.values.toList(), totalPages)
+    }
+
+    private fun attribute(tag: String, name: String): String? =
+        Regex(
+            """(?i)\b${Regex.escape(name)}\s*=\s*[\"']([^\"']*)[\"']""",
+        ).find(tag)?.groupValues?.getOrNull(1)
+
+    private fun slugToTitle(slug: String): String =
+        runCatching { URLDecoder.decode(slug, "UTF-8") }
+            .getOrDefault(slug)
+            .replace('-', ' ')
+            .trim()
+            .split(Regex("\\s+"))
+            .joinToString(" ") { word ->
+                word.replaceFirstChar { first ->
+                    if (first.isLowerCase()) first.titlecase(Locale.FRENCH)
+                    else first.toString()
+                }
+            }
+
+    private fun decodeHtml(value: String): String {
+        var decoded = value
+            .replace("&amp;", "&", ignoreCase = true)
+            .replace("&quot;", "\"", ignoreCase = true)
+            .replace("&#39;", "'", ignoreCase = true)
+            .replace("&apos;", "'", ignoreCase = true)
+            .replace("&lt;", "<", ignoreCase = true)
+            .replace("&gt;", ">", ignoreCase = true)
+
+        decoded = HEX_ENTITY_REGEX.replace(decoded) { match ->
+            match.groupValues[1].toIntOrNull(16)
+                ?.let { Character.toChars(it).concatToString() }
+                ?: match.value
+        }
+        return DECIMAL_ENTITY_REGEX.replace(decoded) { match ->
+            match.groupValues[1].toIntOrNull()
+                ?.let { Character.toChars(it).concatToString() }
+                ?: match.value
+        }
     }
 
     private suspend fun isAvailableOnFrembed(item: JSONObject): Boolean {
@@ -270,15 +465,30 @@ class FrembedProvider(
                 "page" to "1",
             ),
         )
-        val results = root.optJSONArray("results") ?: JSONArray()
-        val output = ArrayList<SearchResponse>()
+        val results = (root.optJSONArray("results") ?: JSONArray())
+            .objects()
+            .toList()
+        val output = ArrayList<SearchResponse>(results.size)
 
-        for (item in results.objects()) {
-            if (!runCatching { isAvailableOnFrembed(item) }.getOrDefault(false)) {
-                continue
+        // Keep Frembed availability authoritative, but do the independent API
+        // checks in small parallel batches instead of waiting for every TMDB
+        // result sequentially.
+        for (batch in results.chunked(SEARCH_AVAILABILITY_BATCH_SIZE)) {
+            val checked = coroutineScope {
+                batch.map { item ->
+                    async {
+                        if (
+                            runCatching { isAvailableOnFrembed(item) }
+                                .getOrDefault(false)
+                        ) {
+                            item.toSearchResponse()
+                        } else {
+                            null
+                        }
+                    }
+                }.awaitAll()
             }
-
-            item.toSearchResponse()?.let { output += it }
+            output += checked.filterNotNull()
         }
 
         return output

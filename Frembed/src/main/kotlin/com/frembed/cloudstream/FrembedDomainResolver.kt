@@ -10,12 +10,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
-import org.json.JSONObject
 import java.net.URI
 
 internal class FrembedDomainResolver(
     private val requestHeaders: Map<String, String>,
-    private val streamHeaders: Map<String, String>,
     private val preferences: SharedPreferences,
 ) {
     private val resolutionMutex = Mutex()
@@ -30,12 +28,10 @@ internal class FrembedDomainResolver(
             cachedOrigin?.let { return@withLock it }
 
             readPersistedOrigin()?.let { persistedOrigin ->
-                validateCandidate(persistedOrigin)?.let { resolved ->
-                    remember(resolved)
-                    return@withLock resolved
-                }
-
-                clearPersistedOrigin()
+                // The provider's catalogue request is itself the validation.
+                // Avoid duplicate API/page/player probes on every restart.
+                remember(persistedOrigin)
+                return@withLock persistedOrigin
             }
 
             val candidates = discoverCandidates()
@@ -45,25 +41,19 @@ internal class FrembedDomainResolver(
                 )
             }
 
-            // Candidates are already ordered from the newest certificate to
-            // the oldest one. Work through recent groups first and stop as
-            // soon as one group contains a usable domain.
-            for (recentBatch in candidates.chunked(MAX_PARALLEL_PRECHECKS)) {
-                val reachableCandidates = precheckCandidates(recentBatch)
+            // Candidates are ordered by certificate acquisition date. A real
+            // catalogue page is both the reachability and identity check.
+            for (validationBatch in candidates.chunked(MAX_PARALLEL_PROBES)) {
+                val results = coroutineScope {
+                    validationBatch.map { candidate ->
+                        async { validateCandidate(candidate) }
+                    }.awaitAll()
+                }
 
-                for (validationBatch in reachableCandidates.chunked(MAX_PARALLEL_PROBES)) {
-                    val results = coroutineScope {
-                        validationBatch.map { candidate ->
-                            async { validateCandidate(candidate) }
-                        }.awaitAll()
-                    }
-
-                    // awaitAll keeps input order, so a successful newer
-                    // candidate wins over an older one from the same batch.
-                    results.firstOrNull { it != null }?.let { resolved ->
-                        remember(resolved)
-                        return@withLock resolved
-                    }
+                // awaitAll preserves input order: a newer valid domain wins.
+                results.firstOrNull { it != null }?.let { resolved ->
+                    remember(resolved)
+                    return@withLock resolved
                 }
             }
 
@@ -104,6 +94,13 @@ internal class FrembedDomainResolver(
         preferences.edit()
             .remove(PREFERENCE_LAST_ORIGIN)
             .commit()
+    }
+
+    suspend fun invalidate(origin: String) {
+        resolutionMutex.withLock {
+            if (cachedOrigin == origin) cachedOrigin = null
+            if (readPersistedOrigin() == origin) clearPersistedOrigin()
+        }
     }
 
     private suspend fun discoverCandidates(): List<String> {
@@ -177,38 +174,12 @@ internal class FrembedDomainResolver(
         return value.takeIf { FREMBED_DOMAIN.matches(it) }
     }
 
-    /**
-     * Cheap reachability pass performed before the expensive Frembed API and
-     * playback checks. Any HTTP response proves that DNS, TCP and TLS reached
-     * the host; the full validation below still rejects parked, obsolete or
-     * otherwise unusable domains.
-     */
-    private suspend fun precheckCandidates(candidates: List<String>): List<String> =
-        coroutineScope {
-            candidates.map { candidate ->
-                async {
-                    val reachable = runCatching {
-                        app.head(
-                            url = "$candidate/",
-                            headers = requestHeaders,
-                            timeout = PRECHECK_TIMEOUT_SECONDS,
-                        )
-                    }.isSuccess
-
-                    candidate.takeIf { reachable }
-                }
-            }.awaitAll().filterNotNull()
-        }
-
     private suspend fun validateCandidate(candidateOrigin: String): String? {
-        val probeUrl = "$candidateOrigin/api/films" +
-            "?id=$VALIDATION_TMDB_ID&idType=tmdb"
-
         val response = runCatching {
             app.get(
-                url = probeUrl,
+                url = "$candidateOrigin/movies",
                 headers = requestHeaders,
-                referer = "$candidateOrigin/films?id=$VALIDATION_TMDB_ID",
+                referer = "$candidateOrigin/",
                 cacheTime = 0,
                 timeout = PROBE_TIMEOUT_SECONDS,
             )
@@ -223,107 +194,18 @@ internal class FrembedDomainResolver(
             "$scheme://$host" + if (url.port != 443) ":${url.port}" else ""
         }
 
-        val root = runCatching { JSONObject(response.text) }.getOrNull()
-            ?: return null
-
-        val filmPage = "$finalOrigin/films?id=$VALIDATION_TMDB_ID"
-        val serverUrls = extractServerUrls(root, finalOrigin)
-        if (serverUrls.isEmpty()) return null
-
-        // Validate the film page once per candidate. The previous flow fetched
-        // this exact page again for every server link, which multiplied the
-        // resolution time on domains exposing several players.
-        val filmPageResponse = runCatching {
-            app.get(
-                url = filmPage,
-                headers = requestHeaders,
-                referer = "$finalOrigin/",
-                cacheTime = 0,
-                timeout = PROBE_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return null
-
-        if (filmPageResponse.okhttpResponse.code !in 200..299) return null
-
-        for (serverUrl in serverUrls) {
-            if (
-                validatesPlaybackRedirect(
-                    origin = finalOrigin,
-                    filmPage = filmPage,
-                    serverUrl = serverUrl,
-                )
-            ) {
-                return finalOrigin
-            }
+        val html = response.text
+        val plainText = TAG_REGEX.replace(html, " ")
+        if (REJECTED_PAGE_MARKERS.any { plainText.contains(it, ignoreCase = true) }) {
+            return null
         }
 
-        return null
-    }
-
-    private fun extractServerUrls(root: JSONObject, origin: String): List<String> {
-        val result = LinkedHashSet<String>()
-        val links = root.optJSONArray("links")
-        if (links != null) {
-            for (index in 0 until links.length()) {
-                val item = links.optJSONObject(index) ?: continue
-                resolveServerUrl(origin, item.optString("url", ""))
-                    ?.let(result::add)
-            }
+        // A usable domain exposes several genuine film detail links and a
+        // pagination marker. This rejects blank/404/parked/address pages.
+        val catalogueLinks = CATALOGUE_LINK_REGEX.findAll(html).take(3).count()
+        return finalOrigin.takeIf {
+            catalogueLinks >= 3 && PAGE_COUNT_REGEX.containsMatchIn(plainText)
         }
-
-        val keys = root.keys()
-        while (keys.hasNext()) {
-            val key = keys.next()
-            if (!LEGACY_LINK_KEY.matches(key)) continue
-            resolveServerUrl(origin, root.optString(key, ""))
-                ?.let(result::add)
-        }
-
-        return result.toList()
-    }
-
-    private fun resolveServerUrl(origin: String, rawUrl: String): String? {
-        if (rawUrl.isBlank()) return null
-
-        return runCatching {
-            val absolute = when {
-                rawUrl.startsWith("//") -> "https:$rawUrl"
-                else -> URI(origin).resolve(rawUrl).toString()
-            }
-            val uri = URI(absolute)
-            absolute.takeIf {
-                (uri.scheme == "https" || uri.scheme == "http") &&
-                    !uri.host.isNullOrBlank()
-            }
-        }.getOrNull()
-    }
-
-    private suspend fun validatesPlaybackRedirect(
-        origin: String,
-        filmPage: String,
-        serverUrl: String,
-    ): Boolean {
-        val response = runCatching {
-            app.get(
-                url = serverUrl,
-                headers = streamHeaders,
-                referer = filmPage,
-                allowRedirects = false,
-                cacheTime = 0,
-                timeout = PROBE_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return false
-
-        if (response.okhttpResponse.code !in 300..399) return false
-
-        val location = response.headers["Location"] ?: return false
-        val target = resolveServerUrl(serverUrl, location) ?: return false
-        if ("test-video" in target.lowercase()) return false
-
-        val originHost = runCatching { URI(origin).host }.getOrNull() ?: return false
-        val targetHost = runCatching { URI(target).host }.getOrNull() ?: return false
-
-        return !targetHost.equals(originHost, ignoreCase = true)
     }
 
     internal companion object {
@@ -334,19 +216,24 @@ internal class FrembedDomainResolver(
         const val DISCOVERY_URL =
             "$DISCOVERY_ORIGIN/?Identity=frembed.%25&output=json"
 
-        const val VALIDATION_TMDB_ID = 533535
         const val DISCOVERY_ATTEMPTS = 2
         const val DISCOVERY_TIMEOUT_SECONDS = 25L
         const val DISCOVERY_RETRY_DELAY_MS = 1_000L
-        const val PRECHECK_TIMEOUT_SECONDS = 3L
         const val PROBE_TIMEOUT_SECONDS = 8L
-        const val MAX_PARALLEL_PRECHECKS = 12
-        const val MAX_PARALLEL_PROBES = 6
+        const val MAX_PARALLEL_PROBES = 10
 
         val FREMBED_DOMAIN = Regex(
             "^frembed\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
             RegexOption.IGNORE_CASE,
         )
-        val LEGACY_LINK_KEY = Regex("^link\\d+(?:vostfr|vo)?$", RegexOption.IGNORE_CASE)
+        val CATALOGUE_LINK_REGEX = Regex(
+            """href\s*=\s*[\"'][^\"']*/movies/[^\"'/]+/\d+/?[\"']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val PAGE_COUNT_REGEX = Regex(
+            """(?i)\bpage\s+\d+\s*/\s*\d+""",
+        )
+        val TAG_REGEX = Regex("""<[^>]+>""")
+        val REJECTED_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
     }
 }
