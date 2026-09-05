@@ -36,13 +36,24 @@ internal class AfterDarkDomainResolver(
             var lastHttpCode: Int? = null
             var lastFailure: Throwable? = null
 
-            for (attempt in 1..SOURCE_ATTEMPTS) {
+            for ((index, enableDnsHttpsRecords) in SOURCE_PROFILES.withIndex()) {
+                val attempt = index + 1
+                val profile = if (enableDnsHttpsRecords) {
+                    "AsyncDNS/HTTPS-SVCB"
+                } else {
+                    "standard"
+                }
                 val responseResult = runCatching {
-                    Log.i(TAG, "Résolution AfterDark via Cronet : tentative $attempt")
+                    Log.i(TAG, "Résolution AfterDark via Cronet $profile")
                     AfterDarkCronetClient.get(
                         url = SOURCE_URL,
                         headers = SOURCE_HEADERS,
-                        timeoutMs = SOURCE_TIMEOUT_MS,
+                        timeoutMs = if (enableDnsHttpsRecords) {
+                            SOURCE_DNS_HTTPS_TIMEOUT_MS
+                        } else {
+                            SOURCE_STANDARD_TIMEOUT_MS
+                        },
+                        enableDnsHttpsRecords = enableDnsHttpsRecords,
                     )
                 }
                 lastFailure = responseResult.exceptionOrNull() ?: lastFailure
@@ -57,7 +68,8 @@ internal class AfterDarkDomainResolver(
                     )
 
                     if (response.statusCode in 200..299) {
-                        extractCurrentOrigin(response.text)?.let { candidate ->
+                        val candidate = extractCurrentOrigin(response.text)
+                        candidate?.let {
                             validateCandidate(candidate)?.let { resolved ->
                                 remember(resolved)
                                 return@withLock resolved
@@ -66,10 +78,15 @@ internal class AfterDarkDomainResolver(
                                 "Le domaine publié par le registre n'est pas un site AfterDark utilisable",
                             )
                         }
+                        if (candidate == null) {
+                            lastFailure = IllegalStateException(
+                                "Le registre ne contient aucun lien AfterDark exploitable",
+                            )
+                        }
                     }
                 }
 
-                if (attempt < SOURCE_ATTEMPTS) delay(SOURCE_RETRY_DELAY_MS)
+                if (attempt < SOURCE_PROFILES.size) delay(SOURCE_RETRY_DELAY_MS)
             }
 
             val detail = lastHttpCode?.let { " (HTTP $it)" }.orEmpty()
@@ -121,8 +138,6 @@ internal class AfterDarkDomainResolver(
             Log.w(TAG, "Validation Cronet impossible pour $normalizedCandidate", error)
         }.getOrNull() ?: return null
 
-        if (response.statusCode !in 200..299) return null
-
         val finalOrigin = normalizeOrigin(response.finalUrl) ?: return null
         if (isSourceOrigin(finalOrigin)) return null
 
@@ -131,7 +146,22 @@ internal class AfterDarkDomainResolver(
             Log.w(TAG, "Page annuaire refusée comme domaine AfterDark : $finalOrigin")
             return null
         }
-        if (!page.contains("AfterDark", ignoreCase = true)) return null
+
+        val isNormalPage = response.statusCode in 200..299 && page.isNotBlank()
+        val isInteractiveCloudflarePage =
+            response.statusCode in setOf(403, 429, 503) &&
+                CLOUDFLARE_CHALLENGE_MARKERS.any {
+                    page.contains(it, ignoreCase = true)
+                }
+
+        if (!isNormalPage && !isInteractiveCloudflarePage) {
+            Log.w(
+                TAG,
+                "Domaine AfterDark refusé : $finalOrigin; " +
+                    "HTTP ${response.statusCode}; ${page.size} caractères",
+            )
+            return null
+        }
 
         Log.i(
             TAG,
@@ -185,8 +215,9 @@ internal class AfterDarkDomainResolver(
         const val SOURCE_URL = "$SOURCE_ORIGIN/"
         private const val SOURCE_HOST = "cherishmylove.space"
 
-        const val SOURCE_ATTEMPTS = 2
-        const val SOURCE_TIMEOUT_MS = 20_000L
+        val SOURCE_PROFILES = listOf(false, true)
+        const val SOURCE_STANDARD_TIMEOUT_MS = 12_000L
+        const val SOURCE_DNS_HTTPS_TIMEOUT_MS = 20_000L
         const val VALIDATION_TIMEOUT_MS = 20_000L
         const val SOURCE_RETRY_DELAY_MS = 1_000L
         const val TAG = "AfterDarkCronet"
@@ -203,6 +234,11 @@ internal class AfterDarkDomainResolver(
         val REJECTED_DIRECTORY_MARKERS = listOf(
             "Nouvelle adresse",
             "Ouvrir le site",
+        )
+        val CLOUDFLARE_CHALLENGE_MARKERS = listOf(
+            "Just a moment",
+            "cf-chl-",
+            "challenge-platform",
         )
         val ANCHOR_TAG = Regex(
             "<a\\b[^>]*>.*?</a>",

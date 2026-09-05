@@ -70,20 +70,22 @@ internal object AfterDarkCronetClient {
         url: String,
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
+        enableDnsHttpsRecords: Boolean = false,
     ): AfterDarkCronetResponse = withContext(Dispatchers.IO) {
-        getBlocking(url, headers, timeoutMs)
+        getBlocking(url, headers, timeoutMs, enableDnsHttpsRecords)
     }
 
     fun getBlocking(
         url: String,
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Long = 30_000L,
+        enableDnsHttpsRecords: Boolean = false,
     ): AfterDarkCronetResponse {
         check(LooperGuard.isNotMainThread()) {
             "Une requête Cronet bloquante ne peut pas être lancée sur le thread UI"
         }
 
-        val engine = getOrCreateEngine(url)
+        val engine = getOrCreateEngine(url, enableDnsHttpsRecords)
         val finished = AtomicBoolean(false)
         val done = CountDownLatch(1)
         val output = ByteArrayOutputStream()
@@ -179,14 +181,18 @@ internal object AfterDarkCronetClient {
             .also(::synchronizeCookies)
     }
 
-    private fun getOrCreateEngine(url: String): CronetEngine {
+    private fun getOrCreateEngine(
+        url: String,
+        enableDnsHttpsRecords: Boolean,
+    ): CronetEngine {
         val uri = Uri.parse(url)
         val host = uri.host
             ?.lowercase()
             ?.takeIf { it.isNotBlank() }
             ?: throw IllegalArgumentException("Hôte Cronet invalide : $url")
         val port = uri.port.takeIf { it > 0 } ?: 443
-        val engineKey = "$host:$port"
+        val profile = if (enableDnsHttpsRecords) "dns-https" else "standard"
+        val engineKey = "$host:$port:$profile"
 
         return synchronized(engineLock) {
             cronetEngines[engineKey]?.let { return@synchronized it }
@@ -212,7 +218,7 @@ internal object AfterDarkCronetClient {
                 .addQuicHint(host, port, port)
                 .enableHttpCache(CronetEngine.Builder.HTTP_CACHE_DISABLED, 0L)
 
-            enableCronetDnsHttps(builder)
+            val dnsHttpsEnabled = enableDnsHttpsRecords && enableCronetDnsHttps(builder)
 
             builder.build()
                 .also { engine ->
@@ -220,7 +226,8 @@ internal object AfterDarkCronetClient {
                     Log.i(
                         TAG,
                         "Moteur prêt pour $engineKey; QUIC immédiat; " +
-                            "AsyncDNS/HTTPS-SVCB actifs",
+                            "AsyncDNS/HTTPS-SVCB=" +
+                            (if (dnsHttpsEnabled) "actifs" else "inactifs"),
                     )
                 }
         }
@@ -233,21 +240,22 @@ internal object AfterDarkCronetClient {
      * compatible while enabling Cronet's own asynchronous resolver and HTTPS
      * DNS records, which are required for ECH discovery.
      */
-    private fun enableCronetDnsHttps(builder: CronetEngine.Builder) {
+    private fun enableCronetDnsHttps(builder: CronetEngine.Builder): Boolean {
         val method = builder.javaClass.methods.firstOrNull { candidate ->
             candidate.name == "setExperimentalOptions" &&
                 candidate.parameterTypes.contentEquals(arrayOf(String::class.java))
-        } ?: throw IllegalStateException(
-            "Ce fournisseur Cronet ne permet pas d'activer AsyncDNS/HTTPS-SVCB",
-        )
+        }
+        if (method == null) {
+            Log.w(TAG, "Ce fournisseur Cronet n'expose pas setExperimentalOptions")
+            return false
+        }
 
-        runCatching {
+        return runCatching {
             method.invoke(builder, EXPERIMENTAL_DNS_OPTIONS)
+            true
         }.getOrElse { error ->
-            throw IllegalStateException(
-                "Impossible d'activer AsyncDNS/HTTPS-SVCB dans Cronet",
-                error,
-            )
+            Log.w(TAG, "Options AsyncDNS/HTTPS-SVCB refusées par Cronet", error)
+            false
         }
     }
 
