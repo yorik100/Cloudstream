@@ -1,4 +1,4 @@
-version = 40
+version = 41
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -12,7 +12,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - resolver et lecture via Cronet ECH avec reprise QUIC"
+    description = "AfterDark v41 - transport v38 et registre via Cronet ECH"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
