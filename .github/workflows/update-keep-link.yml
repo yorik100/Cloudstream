@@ -21,7 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Follow redirect and update KeepLink.txt
+      - name: Resolve the current Frembed address
         id: keep-link
         shell: bash
         run: |
@@ -34,56 +34,136 @@ jobs:
           fi
 
           current_url="$(awk 'NF { sub(/\r$/, ""); print; exit }' "$file")"
-          if [[ ! "$current_url" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "::error file=$file::KeepLink.txt must contain one valid HTTPS URL"
+
+          frembed_origin() {
+            local value="$1"
+            local host
+
+            if [[ ! "$value" =~ ^https://([^/:?#]+)([/?#]|$) ]]; then
+              return 1
+            fi
+
+            host="${BASH_REMATCH[1],,}"
+            if [[ ! "$host" =~ ^(www\.)?frembed\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+              return 1
+            fi
+
+            printf 'https://%s/\n' "$host"
+          }
+
+          if ! current_origin="$(frembed_origin "$current_url")"; then
+            echo "::error file=$file::KeepLink.txt must contain one Frembed HTTPS URL"
             exit 1
           fi
 
-          if ! curl_output="$(
-            curl \
-              --silent \
-              --show-error \
-              --location \
-              --max-redirs 10 \
-              --connect-timeout 15 \
-              --max-time 60 \
-              --retry 2 \
-              --retry-delay 2 \
-              --retry-all-errors \
-              --proto '=https' \
-              --proto-redir '=https' \
-              --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
-              --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
-              --header 'Cache-Control: no-cache' \
-              --output /dev/null \
-              --write-out $'%{url_effective}\n%{http_code}' \
-              "$current_url"
-          )"; then
-            echo "The current URL could not be reached; KeepLink.txt is unchanged."
+          body_file="$(mktemp)"
+          trap 'rm -f "$body_file"' EXIT
+
+          fetch_page() {
+            local requested_url="$1"
+            local curl_output
+
+            if ! curl_output="$(
+              curl \
+                --silent \
+                --show-error \
+                --location \
+                --max-redirs 10 \
+                --connect-timeout 15 \
+                --max-time 60 \
+                --retry 2 \
+                --retry-delay 2 \
+                --retry-all-errors \
+                --proto '=https' \
+                --proto-redir '=https' \
+                --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
+                --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
+                --header 'Cache-Control: no-cache' \
+                --output "$body_file" \
+                --write-out $'%{url_effective}\n%{http_code}' \
+                "$requested_url"
+            )"; then
+              return 1
+            fi
+
+            effective_url="$(sed -n '1p' <<< "$curl_output")"
+            status_code="$(sed -n '2p' <<< "$curl_output")"
+          }
+
+          resolved_url=""
+          candidate_url="$current_origin"
+
+          # Follow both real HTTP redirects and redirects implemented in HTML,
+          # meta-refresh or JavaScript. No Frembed domain suffix is hardcoded.
+          for _ in {1..8}; do
+            if ! fetch_page "$candidate_url"; then
+              echo "The current URL could not be reached; KeepLink.txt is unchanged."
+              exit 0
+            fi
+
+            if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
+              echo "Final HTTP status is $status_code; KeepLink.txt is unchanged."
+              exit 0
+            fi
+
+            if ! effective_origin="$(frembed_origin "$effective_url")"; then
+              echo "::warning::The redirect target is not a Frembed HTTPS URL."
+              exit 0
+            fi
+
+            next_url="$effective_origin"
+            discovered_urls="$(
+              sed \
+                -e 's#\\/#/#g' \
+                -e 's#\\u002[fF]#/#g' \
+                "$body_file" |
+                grep -Eio '(https:)?//(www\.)?frembed\.[a-z0-9]([a-z0-9.-]*[a-z0-9])?' |
+                awk '!seen[tolower($0)]++' || true
+            )"
+
+            while IFS= read -r discovered_url; do
+              [[ -n "$discovered_url" ]] || continue
+
+              if [[ "$discovered_url" == //* ]]; then
+                discovered_url="https:$discovered_url"
+              fi
+
+              if discovered_origin="$(frembed_origin "${discovered_url,,}")" &&
+                 [[ "$discovered_origin" != "$effective_origin" ]]; then
+                next_url="$discovered_origin"
+                break
+              fi
+            done <<< "$discovered_urls"
+
+            if [[ "$next_url" == "$effective_origin" ]]; then
+              if grep -Eiq \
+                "a changé d'adresse|ancienne adresse n'est plus utilisée|redirection dans [0-9]+s" \
+                "$body_file"; then
+                echo "The page announces another address but exposes no usable Frembed URL; KeepLink.txt is unchanged."
+                exit 0
+              fi
+
+              resolved_url="$effective_origin"
+              break
+            fi
+
+            echo "Found a browser-side Frembed redirect: $effective_origin -> $next_url"
+            candidate_url="$next_url"
+          done
+
+          if [[ -z "$resolved_url" ]]; then
+            echo "Too many consecutive Frembed redirects; KeepLink.txt is unchanged."
             exit 0
           fi
 
-          final_url="$(sed -n '1p' <<< "$curl_output")"
-          status_code="$(sed -n '2p' <<< "$curl_output")"
-
-          if [[ ! "$status_code" =~ ^[23][0-9][0-9]$ ]]; then
-            echo "Final HTTP status is $status_code; KeepLink.txt is unchanged."
-            exit 0
-          fi
-
-          if [[ ! "$final_url" =~ ^https://[^[:space:]]+$ ]]; then
-            echo "::warning::The redirect target is not a valid HTTPS URL."
-            exit 0
-          fi
-
-          if [[ "$final_url" == "$current_url" ]]; then
+          if [[ "$resolved_url" == "$current_url" ]]; then
             echo "KeepLink.txt is already current: $current_url"
             exit 0
           fi
 
-          printf '%s\n' "$final_url" > "$file"
+          printf '%s\n' "$resolved_url" > "$file"
           echo "old_url=$current_url" >> "$GITHUB_OUTPUT"
-          echo "new_url=$final_url" >> "$GITHUB_OUTPUT"
+          echo "new_url=$resolved_url" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       - name: Commit updated URL
