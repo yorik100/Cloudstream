@@ -2,16 +2,15 @@
 
 Ce dépôt contient deux extensions CloudStream indépendantes :
 
-- **AfterDark** — version de travail actuelle, conservée sans modification.
-- **Frembed** — utilise les endpoints publics Frembed basés sur TMDB :
-  - film : `/api/film.php?id=<TMDB>`
-  - série : `/api/serie.php?id=<TMDB>&sa=<saison>&epi=<episode>`
+- **AfterDark** — vérification automatique et lancement automatique de la vidéo + support videasy et peachify presque natif + indicateur de temps si épisode de série pas encore sorti + description et nom des épisodes pour les séries.
+- **Frembed** — support natif de toutes les vidéos et séries + indicateur de temps si épisode de série pas encore sorti + description et nom des épisodes pour les séries.
 
 Le module Frembed ne génère aucun `x-nabi-proof`, n'utilise pas Turnstile et
 n'ouvre pas de WebView. Il suit les redirections de l'API, récupère les URLs
 de serveurs présentes dans la réponse/lecteur, délègue les hébergeurs connus
 aux extracteurs CloudStream, et sait également récupérer les liens directs
 HLS/DASH/MP4 trouvés dans les pages.
+Les deux extensions sont capables de suivre les changements d'URL dont elles dépendent.
 
 ## Publication
 
