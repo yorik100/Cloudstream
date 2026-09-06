@@ -434,6 +434,21 @@ object AfterDarkProofWebView {
 
                           if (!isCloudflareFrame()) return;
 
+                          const roots = new Set([document]);
+
+                          // Le widget Turnstile place son input dans un ShadowRoot
+                          // fermé. Un script document-start peut conserver la racine
+                          // au moment exact où Cloudflare la crée, même si shadowRoot
+                          // retourne ensuite null pour le code JavaScript ordinaire.
+                          try {
+                            const nativeAttachShadow = Element.prototype.attachShadow;
+                            Element.prototype.attachShadow = function() {
+                              const shadowRoot = nativeAttachShadow.apply(this, arguments);
+                              roots.add(shadowRoot);
+                              return shadowRoot;
+                            };
+                          } catch (_) {}
+
                           // Turnstile masque l'input natif et dessine la case autour.
                           // Sa présence dans l'iframe Cloudflare suffit donc : contrôler
                           // ses dimensions ou sa visibilité rejetterait la vraie case.
@@ -441,15 +456,13 @@ object AfterDarkProofWebView {
                             Boolean(element) && !element.disabled;
 
                           const report = () => {
-                            const roots = [document];
-                            for (let index = 0; index < roots.length; index++) {
-                              const root = roots[index];
+                            for (const root of Array.from(roots)) {
                               for (const element of root.querySelectorAll("*")) {
-                                if (element.shadowRoot) roots.push(element.shadowRoot);
+                                if (element.shadowRoot) roots.add(element.shadowRoot);
                               }
                             }
 
-                            const checkbox = roots
+                            const checkbox = Array.from(roots)
                               .flatMap(root => Array.from(root.querySelectorAll(
                                 'input[type="checkbox"], [role="checkbox"]'
                               )))

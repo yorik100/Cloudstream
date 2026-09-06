@@ -2,7 +2,7 @@ import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.tasks.Sync
 
-version = 57
+version = 58
 
 val embeddedWebkit by configurations.creating
 val androidClassesJar = Attribute.of("artifactType", String::class.java)
@@ -37,7 +37,7 @@ tasks.named<CompileDexTask>("compileDex") {
 }
 
 cloudstream {
-    description = "AfterDark - détection directe de la checkbox Cloudflare"
+    description = "AfterDark - détection checkbox dans le Shadow DOM fermé"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
