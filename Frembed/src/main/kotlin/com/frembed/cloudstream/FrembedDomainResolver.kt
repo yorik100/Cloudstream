@@ -29,11 +29,11 @@ internal class FrembedDomainResolver(
 
             resolveFromConfig()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Frembed obtenu depuis config.json/main : $resolved")
+                Log.i(TAG, "Domaine Frembed obtenu depuis config.json : $resolved")
                 return@withLock resolved
             }
 
-            Log.w(TAG, "config.json/main invalide ou indisponible, essai de KeepLink.txt")
+            Log.w(TAG, "config.json invalide ou indisponible, essai de KeepLink.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
                 Log.i(TAG, "Domaine Frembed obtenu depuis KeepLink.txt : $resolved")
@@ -72,8 +72,9 @@ internal class FrembedDomainResolver(
     }
 
     /**
-     * First source: read only the JSON field named "main". The "backup"
-     * field and every other value are deliberately ignored.
+     * First source: validate "main", then validate "backup" only when main
+     * failed and both normalized origins are different. Every other JSON
+     * field is deliberately ignored.
      */
     private suspend fun resolveFromConfig(): String? {
         val response = runCatching {
@@ -92,12 +93,41 @@ internal class FrembedDomainResolver(
 
         if (response.okhttpResponse.code !in 200..299) return null
 
-        val candidate = runCatching {
-            JSONObject(response.text).optString("main", "")
-        }.getOrNull()
-            ?.let(::normalizeOrigin)
+        val config = runCatching { JSONObject(response.text) }.getOrNull()
             ?: return null
+        val main = normalizeOrigin(config.optString("main", ""))
+        val backup = normalizeOrigin(config.optString("backup", ""))
 
+        if (main != null) {
+            validateConfiguredOrigin(main)?.let { resolved ->
+                Log.i(TAG, "config.json/main validé : $resolved")
+                return resolved
+            }
+            Log.w(TAG, "config.json/main invalide ou inaccessible : $main")
+        } else {
+            Log.w(TAG, "config.json/main absent ou invalide")
+        }
+
+        if (backup == null) {
+            Log.w(TAG, "config.json/backup absent ou invalide")
+            return null
+        }
+        if (backup == main) {
+            Log.i(TAG, "config.json/backup identique à main, second test ignoré")
+            return null
+        }
+
+        Log.i(TAG, "Échec de main, validation de config.json/backup : $backup")
+        return validateConfiguredOrigin(backup).also { resolved ->
+            if (resolved != null) {
+                Log.i(TAG, "config.json/backup validé : $resolved")
+            } else {
+                Log.w(TAG, "config.json/backup invalide ou inaccessible : $backup")
+            }
+        }
+    }
+
+    private suspend fun validateConfiguredOrigin(candidate: String): String? {
         val validatedOrigin = validateCandidate(candidate) ?: return null
         return validatedOrigin.takeIf { validatePublicApi(it) }
     }
