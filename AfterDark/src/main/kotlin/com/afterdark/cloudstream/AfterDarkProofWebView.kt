@@ -9,7 +9,9 @@ import android.os.Looper
 import android.os.Message
 import android.view.Gravity
 import android.view.ViewGroup
+import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -22,6 +24,7 @@ import android.widget.TextView
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
@@ -29,6 +32,7 @@ import kotlin.coroutines.suspendCoroutine
 object AfterDarkProofWebView {
     private const val PROOF_HEADER = "x-nabi-proof"
     private const val TIMEOUT_MS = 180_000L
+    private const val CHECKBOX_POLL_INTERVAL_MS = 250L
 
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun acquire(
@@ -37,9 +41,12 @@ object AfterDarkProofWebView {
     ): ProofSession? = suspendCoroutine { continuation ->
         val finished = AtomicBoolean(false)
         val sourceInterceptStarted = AtomicBoolean(false)
+        val verificationButtonHasAppeared = AtomicBoolean(false)
+        val checkboxReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
+        var checkboxWatcher: Runnable? = null
 
         lateinit var timeoutRunnable: Runnable
 
@@ -47,6 +54,7 @@ object AfterDarkProofWebView {
             if (!finished.compareAndSet(false, true)) return
 
             handler.removeCallbacks(timeoutRunnable)
+            checkboxWatcher?.let(handler::removeCallbacks)
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
                 runCatching { dialog?.dismiss() }
@@ -145,7 +153,7 @@ object AfterDarkProofWebView {
 
             fun installAutoOpenAndPlay(
                 target: WebView?,
-                reloadIfStuck: Boolean,
+                reloadOnInteractiveCheckbox: Boolean,
             ) {
                 if (target == null || finished.get()) return
 
@@ -153,9 +161,10 @@ object AfterDarkProofWebView {
                     """
                     (() => {
                       const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
+                      const HUMAN_CHECKBOX_TEXT = "vérifiez que vous êtes humain";
                       const EXPECTED_HOST = '$verificationHostForJs';
-                      const RELOAD_IF_STUCK = ${if (reloadIfStuck) "true" else "false"};
-                      const RELOAD_DELAY_MS = 20000;
+                      const RELOAD_ON_INTERACTIVE_CHECKBOX =
+                        ${if (reloadOnInteractiveCheckbox) "true" else "false"};
                       const SEEN_KEY = "__afterdark_verification_button_seen";
 
                       if (
@@ -181,11 +190,11 @@ object AfterDarkProofWebView {
                         }
                       };
 
-                      const cancelReload = () => {
-                        const timer = window.__afterdarkVerificationReloadTimer;
+                      const stopCheckboxWatcher = () => {
+                        const timer = window.__afterdarkCheckboxWatcher;
                         if (timer) {
-                          clearTimeout(timer);
-                          window.__afterdarkVerificationReloadTimer = null;
+                          clearInterval(timer);
+                          window.__afterdarkCheckboxWatcher = null;
                         }
                       };
 
@@ -194,7 +203,10 @@ object AfterDarkProofWebView {
                         try {
                           sessionStorage.setItem(SEEN_KEY, "1");
                         } catch (_) {}
-                        cancelReload();
+                        stopCheckboxWatcher();
+                        try {
+                          window.AfterDarkNative.verificationButtonSeen();
+                        } catch (_) {}
                       };
 
                       const findAndClick = () => {
@@ -209,8 +221,8 @@ object AfterDarkProofWebView {
 
                         if (!button) return false;
 
-                        // Once the button has appeared, never reload this
-                        // verification because of the 10-second watchdog.
+                        // Once this button has appeared, a later/disappearing
+                        // checkbox must never reload this verification.
                         markSeen();
 
                         if (button.dataset.afterdarkAutoOpened === "1") return true;
@@ -220,7 +232,73 @@ object AfterDarkProofWebView {
                         return true;
                       };
 
+                      const isVisibleInteractiveCheckbox = element => {
+                        if (!element || element.disabled) return false;
+
+                        const label = normalize(
+                          element.getAttribute("aria-label") ||
+                          element.textContent ||
+                          ""
+                        ).toLowerCase();
+                        if (!label.includes(HUMAN_CHECKBOX_TEXT)) return false;
+
+                        try {
+                          const style = element.ownerDocument.defaultView
+                            .getComputedStyle(element);
+                          if (
+                            style.display === "none" ||
+                            style.visibility === "hidden"
+                          ) return false;
+                        } catch (_) {}
+
+                        return true;
+                      };
+
+                      const documentHasHumanCheckbox = documentRoot => {
+                        if (!documentRoot) return false;
+
+                        const candidates = Array.from(
+                          documentRoot.querySelectorAll(
+                            'input[type="checkbox"], [role="checkbox"]'
+                          )
+                        );
+                        if (candidates.some(isVisibleInteractiveCheckbox)) {
+                          return true;
+                        }
+
+                        // Same-origin frames can be inspected directly. The
+                        // native accessibility watcher handles Cloudflare's
+                        // usual cross-origin Turnstile frame.
+                        for (const frame of documentRoot.querySelectorAll("iframe")) {
+                          try {
+                            if (documentHasHumanCheckbox(frame.contentDocument)) {
+                              return true;
+                            }
+                          } catch (_) {}
+                        }
+
+                        return false;
+                      };
+
+                      const reportInteractiveCheckbox = () => {
+                        if (
+                          !RELOAD_ON_INTERACTIVE_CHECKBOX ||
+                          wasSeen() ||
+                          window.__afterdarkCheckboxReported === true
+                        ) return false;
+
+                        if (!documentHasHumanCheckbox(document)) return false;
+
+                        window.__afterdarkCheckboxReported = true;
+                        stopCheckboxWatcher();
+                        try {
+                          window.AfterDarkNative.interactiveCheckboxSeen();
+                        } catch (_) {}
+                        return true;
+                      };
+
                       if (findAndClick()) return;
+                      if (reportInteractiveCheckbox()) return;
 
                       if (window.__afterdarkAutoOpenObserver) {
                         try { window.__afterdarkAutoOpenObserver.disconnect(); } catch (_) {}
@@ -228,6 +306,11 @@ object AfterDarkProofWebView {
 
                       const observer = new MutationObserver(() => {
                         if (findAndClick()) {
+                          try { observer.disconnect(); } catch (_) {}
+                          window.__afterdarkAutoOpenObserver = null;
+                          return;
+                        }
+                        if (reportInteractiveCheckbox()) {
                           try { observer.disconnect(); } catch (_) {}
                           window.__afterdarkAutoOpenObserver = null;
                         }
@@ -241,34 +324,122 @@ object AfterDarkProofWebView {
 
                       window.__afterdarkAutoOpenObserver = observer;
 
-                      // This function is called from onPageFinished(), so the
-                      // countdown begins only after WebView considers the page loaded.
-                      // Popup WebViews keep auto-click support but get no reload timer.
-                      if (RELOAD_IF_STUCK && !wasSeen()) {
-                        cancelReload();
-
-                        window.__afterdarkVerificationReloadTimer = setTimeout(() => {
-                          window.__afterdarkVerificationReloadTimer = null;
-
-                          // The button may have appeared and disappeared before
-                          // the ten seconds elapsed. Persisting the flag in
-                          // sessionStorage prevents an unwanted reload.
-                          if (wasSeen()) return;
-
-                          try {
-                            location.reload();
-                          } catch (_) {
-                            try {
-                              location.href = location.href;
-                            } catch (_) {}
+                      stopCheckboxWatcher();
+                      if (RELOAD_ON_INTERACTIVE_CHECKBOX && !wasSeen()) {
+                        window.__afterdarkCheckboxWatcher = setInterval(() => {
+                          if (findAndClick() || reportInteractiveCheckbox()) {
+                            stopCheckboxWatcher();
                           }
-                        }, RELOAD_DELAY_MS);
+                        }, 250);
                       }
                     })();
                     """.trimIndent(),
                     null,
                 )
             }
+
+            fun hasInteractiveHumanCheckbox(target: WebView): Boolean {
+                val rootNode = runCatching {
+                    target.createAccessibilityNodeInfo()
+                }.getOrNull() ?: return false
+                val pendingNodes = ArrayDeque<AccessibilityNodeInfo>()
+                pendingNodes.add(rootNode)
+                var visitedNodes = 0
+
+                try {
+                    while (pendingNodes.isNotEmpty() && visitedNodes < 512) {
+                        val node = pendingNodes.removeFirst()
+                        visitedNodes++
+
+                        val label = buildString {
+                            append(node.text.orEmpty())
+                            append(' ')
+                            append(node.contentDescription.orEmpty())
+                        }
+                        val isCheckbox = node.isCheckable ||
+                            node.className
+                                ?.toString()
+                                ?.contains("CheckBox", ignoreCase = true) == true
+
+                        if (
+                            isCheckbox &&
+                            node.isEnabled &&
+                            node.isVisibleToUser &&
+                            label.contains(
+                                "Vérifiez que vous êtes humain",
+                                ignoreCase = true,
+                            )
+                        ) {
+                            runCatching { node.recycle() }
+                            return true
+                        }
+
+                        for (index in 0 until node.childCount) {
+                            runCatching { node.getChild(index) }
+                                .getOrNull()
+                                ?.let(pendingNodes::addLast)
+                        }
+                        runCatching { node.recycle() }
+                    }
+                } finally {
+                    while (pendingNodes.isNotEmpty()) {
+                        runCatching { pendingNodes.removeFirst().recycle() }
+                    }
+                }
+
+                return false
+            }
+
+            fun reloadForInteractiveCheckbox() {
+                if (
+                    finished.get() ||
+                    verificationButtonHasAppeared.get() ||
+                    !checkboxReloadInProgress.compareAndSet(false, true)
+                ) return
+
+                browser.post {
+                    if (!finished.get() && !verificationButtonHasAppeared.get()) {
+                        browser.reload()
+                    }
+                }
+            }
+
+            browser.addJavascriptInterface(
+                object {
+                    @JavascriptInterface
+                    fun verificationButtonSeen() {
+                        verificationButtonHasAppeared.set(true)
+                    }
+
+                    @JavascriptInterface
+                    fun interactiveCheckboxSeen() {
+                        handler.post { reloadForInteractiveCheckbox() }
+                    }
+                },
+                "AfterDarkNative",
+            )
+
+            // Cloudflare Turnstile usually lives in a cross-origin iframe,
+            // which page JavaScript cannot inspect. The rendered interactive
+            // checkbox is still exposed through WebView's accessibility tree.
+            checkboxWatcher = object : Runnable {
+                override fun run() {
+                    if (finished.get()) return
+
+                    if (
+                        !verificationButtonHasAppeared.get() &&
+                        !checkboxReloadInProgress.get() &&
+                        hasInteractiveHumanCheckbox(browser)
+                    ) {
+                        reloadForInteractiveCheckbox()
+                    }
+
+                    if (!finished.get()) {
+                        handler.postDelayed(this, CHECKBOX_POLL_INTERVAL_MS)
+                    }
+                }
+            }
+            handler.post(checkboxWatcher!!)
 
             fun finishWithCapturedResponse(captured: CapturedSourceResponse) {
                 // shouldInterceptRequest() is not a UI-thread callback.
@@ -368,7 +539,10 @@ object AfterDarkProofWebView {
                             url: String?,
                         ) {
                             super.onPageFinished(view, url)
-                            installAutoOpenAndPlay(view, reloadIfStuck = false)
+                            installAutoOpenAndPlay(
+                                view,
+                                reloadOnInteractiveCheckbox = false,
+                            )
                         }
 
                         override fun shouldOverrideUrlLoading(
@@ -419,12 +593,25 @@ object AfterDarkProofWebView {
             }
 
             browser.webViewClient = object : WebViewClient() {
+                override fun onPageStarted(
+                    view: WebView?,
+                    url: String?,
+                    favicon: android.graphics.Bitmap?,
+                ) {
+                    checkboxReloadInProgress.set(true)
+                    super.onPageStarted(view, url, favicon)
+                }
+
                 override fun onPageFinished(
                     view: WebView?,
                     url: String?,
                 ) {
                     super.onPageFinished(view, url)
-                    installAutoOpenAndPlay(view, reloadIfStuck = true)
+                    checkboxReloadInProgress.set(false)
+                    installAutoOpenAndPlay(
+                        view,
+                        reloadOnInteractiveCheckbox = true,
+                    )
                 }
 
                 override fun shouldOverrideUrlLoading(

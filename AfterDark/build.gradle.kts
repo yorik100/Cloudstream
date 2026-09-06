@@ -1,4 +1,4 @@
-version = 50
+version = 51
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - résolution HTTP avant lecture sans WebView de registre"
+    description = "AfterDark - recharge la vérification si la checkbox Cloudflare apparaît"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
