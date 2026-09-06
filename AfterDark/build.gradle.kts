@@ -1,4 +1,4 @@
-version = 53
+version = 54
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -6,7 +6,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "AfterDark - détection native de la checkbox Cloudflare"
+    description = "AfterDark - détection de l'iframe checkbox Cloudflare"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")

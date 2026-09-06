@@ -250,6 +250,38 @@ object AfterDarkProofWebView {
                         return true;
                       };
 
+                      const isVisibleCloudflareChallengeFrame = frame => {
+                        if (!frame) return false;
+
+                        try {
+                          const source = new URL(
+                            frame.getAttribute("src") || frame.src || "",
+                            location.href
+                          );
+                          const host = source.hostname.toLowerCase();
+                          if (
+                            host !== "challenges.cloudflare.com" &&
+                            !host.endsWith(".challenges.cloudflare.com")
+                          ) return false;
+
+                          const style = getComputedStyle(frame);
+                          if (
+                            style.display === "none" ||
+                            style.visibility === "hidden" ||
+                            Number(style.opacity || "1") === 0
+                          ) return false;
+
+                          const bounds = frame.getBoundingClientRect();
+                          const standardWidget =
+                            bounds.width >= 250 && bounds.height >= 50;
+                          const compactWidget =
+                            bounds.width >= 130 && bounds.height >= 120;
+                          return standardWidget || compactWidget;
+                        } catch (_) {
+                          return false;
+                        }
+                      };
+
                       const documentHasInteractiveCheckbox = documentRoot => {
                         if (!documentRoot) return false;
 
@@ -283,12 +315,21 @@ object AfterDarkProofWebView {
                           window.__afterdarkCheckboxReported === true
                         ) return false;
 
-                        if (!documentHasInteractiveCheckbox(document)) return false;
+                        const directCheckbox =
+                          documentHasInteractiveCheckbox(document);
+                        const cloudflareFrame = Array.from(
+                          document.querySelectorAll("iframe")
+                        ).some(isVisibleCloudflareChallengeFrame);
+                        if (!directCheckbox && !cloudflareFrame) return false;
 
                         window.__afterdarkCheckboxReported = true;
                         stopCheckboxWatcher();
                         try {
-                          window.AfterDarkNative.interactiveCheckboxSeen();
+                          if (cloudflareFrame && !directCheckbox) {
+                            window.AfterDarkNative.cloudflareCheckboxFrameSeen();
+                          } else {
+                            window.AfterDarkNative.interactiveCheckboxSeen();
+                          }
                         } catch (_) {}
                         return true;
                       };
@@ -315,7 +356,16 @@ object AfterDarkProofWebView {
                       observer.observe(document.documentElement, {
                         childList: true,
                         subtree: true,
-                        characterData: true
+                        characterData: true,
+                        attributes: true,
+                        attributeFilter: [
+                          "src",
+                          "style",
+                          "class",
+                          "width",
+                          "height",
+                          "hidden"
+                        ]
                       });
 
                       window.__afterdarkAutoOpenObserver = observer;
@@ -377,14 +427,14 @@ object AfterDarkProofWebView {
                 return false
             }
 
-            fun reloadForInteractiveCheckbox() {
+            fun reloadForInteractiveCheckbox(source: String) {
                 if (
                     finished.get() ||
                     verificationButtonHasAppeared.get() ||
                     !checkboxReloadInProgress.compareAndSet(false, true)
                 ) return
 
-                Log.i(TAG, "Checkbox interactive détectée, rechargement de la vérification")
+                Log.i(TAG, "Checkbox interactive détectée via $source, rechargement")
                 browser.post {
                     if (!finished.get() && !verificationButtonHasAppeared.get()) {
                         browser.reload()
@@ -401,7 +451,12 @@ object AfterDarkProofWebView {
 
                     @JavascriptInterface
                     fun interactiveCheckboxSeen() {
-                        handler.post { reloadForInteractiveCheckbox() }
+                        handler.post { reloadForInteractiveCheckbox("DOM") }
+                    }
+
+                    @JavascriptInterface
+                    fun cloudflareCheckboxFrameSeen() {
+                        handler.post { reloadForInteractiveCheckbox("iframe Cloudflare") }
                     }
                 },
                 "AfterDarkNative",
@@ -419,7 +474,7 @@ object AfterDarkProofWebView {
                         !checkboxReloadInProgress.get() &&
                         hasInteractiveCheckbox(browser)
                     ) {
-                        reloadForInteractiveCheckbox()
+                        reloadForInteractiveCheckbox("accessibilité WebView")
                     }
 
                     if (!finished.get()) {
