@@ -155,7 +155,7 @@ object AfterDarkProofWebView {
                       const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
                       const EXPECTED_HOST = '$verificationHostForJs';
                       const RELOAD_IF_STUCK = ${if (reloadIfStuck) "true" else "false"};
-                      const RELOAD_DELAY_MS = 10000;
+                      const RELOAD_DELAY_MS = 20000;
                       const SEEN_KEY = "__afterdark_verification_button_seen";
 
                       if (
