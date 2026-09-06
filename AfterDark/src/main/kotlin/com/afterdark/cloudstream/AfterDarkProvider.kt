@@ -1,5 +1,6 @@
 package com.afterdark.cloudstream
 
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.Episode
 import com.lagradost.cloudstream3.HomePageResponse
@@ -40,7 +41,10 @@ class AfterDarkProvider : MainAPI() {
     override var lang = "fr"
 
     override val hasMainPage = true
-    override val usesWebView = true
+    // Verification and fallback players open their own WebViews explicitly.
+    // Keep CloudStream from treating the unresolved registry URL as a page to
+    // open automatically when link loading fails.
+    override val usesWebView = false
     override val hasDownloadSupport = false
     override val hasChromecastSupport = false
     override val loadLinksTimeoutMs: Long? = 210_000L
@@ -62,9 +66,25 @@ class AfterDarkProvider : MainAPI() {
     }
 
     internal suspend fun prepareDomainInBackground() {
+        Log.i(PROVIDER_TAG, "Résolution AfterDark en arrière-plan démarrée")
         domainResolver.resolve()?.let { resolved ->
             mainUrl = resolved
+            Log.i(PROVIDER_TAG, "Résolution AfterDark en arrière-plan réussie : $resolved")
+        } ?: run {
+            Log.w(PROVIDER_TAG, "Résolution AfterDark en arrière-plan sans résultat")
         }
+    }
+
+    private suspend fun requireAfterDarkDomainForPlayback() {
+        Log.i(PROVIDER_TAG, "Résolution AfterDark demandée par le lancement vidéo")
+
+        val resolved = ensureAfterDarkDomain()
+        if (resolved == null) {
+            Log.w(PROVIDER_TAG, "Lancement vidéo annulé : aucun lien AfterDark trouvé")
+            throw ErrorLoadingException("Le lien AfterDark n'a pas été trouvé")
+        }
+
+        Log.i(PROVIDER_TAG, "Résolution AfterDark pour la vidéo réussie : $resolved")
     }
 
     override val mainPage = mainPageOf(
@@ -759,7 +779,11 @@ class AfterDarkProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        if (ensureAfterDarkDomain() == null) return false
+        // Keep CloudStream's player in its normal loading state while the same
+        // HTTP-only resolver used at extension startup runs. Throwing here on
+        // failure prevents CloudStream from opening mainUrl (the registry) as
+        // a fallback WebView.
+        requireAfterDarkDomainForPlayback()
 
         val request = PlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données AfterDark invalides")
@@ -922,5 +946,9 @@ class AfterDarkProvider : MainAPI() {
         }
 
         return emitted
+    }
+
+    private companion object {
+        const val PROVIDER_TAG = "AfterDarkProvider"
     }
 }
