@@ -352,9 +352,9 @@ object AfterDarkProofWebView {
                         visitedNodes++
 
                         val label = buildString {
-                            append(node.text.orEmpty())
+                            append(node.text ?: "")
                             append(' ')
-                            append(node.contentDescription.orEmpty())
+                            append(node.contentDescription ?: "")
                         }
                         val isCheckbox = node.isCheckable ||
                             node.className
