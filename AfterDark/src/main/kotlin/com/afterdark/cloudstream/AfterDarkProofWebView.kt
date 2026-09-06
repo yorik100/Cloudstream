@@ -22,8 +22,6 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.webkit.WebViewCompat
-import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -165,7 +163,6 @@ object AfterDarkProofWebView {
                     """
                     (() => {
                       const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
-                      const HUMAN_CHECKBOX_TEXT = "vérifiez que vous êtes humain";
                       const EXPECTED_HOST = '$verificationHostForJs';
                       const RELOAD_ON_INTERACTIVE_CHECKBOX =
                         ${if (reloadOnInteractiveCheckbox) "true" else "false"};
@@ -239,13 +236,6 @@ object AfterDarkProofWebView {
                       const isVisibleInteractiveCheckbox = element => {
                         if (!element || element.disabled) return false;
 
-                        const label = normalize(
-                          element.getAttribute("aria-label") ||
-                          element.textContent ||
-                          ""
-                        ).toLowerCase();
-                        if (!label.includes(HUMAN_CHECKBOX_TEXT)) return false;
-
                         try {
                           const style = element.ownerDocument.defaultView
                             .getComputedStyle(element);
@@ -253,12 +243,14 @@ object AfterDarkProofWebView {
                             style.display === "none" ||
                             style.visibility === "hidden"
                           ) return false;
+                          const bounds = element.getBoundingClientRect();
+                          if (bounds.width <= 0 || bounds.height <= 0) return false;
                         } catch (_) {}
 
                         return true;
                       };
 
-                      const documentHasHumanCheckbox = documentRoot => {
+                      const documentHasInteractiveCheckbox = documentRoot => {
                         if (!documentRoot) return false;
 
                         const candidates = Array.from(
@@ -275,7 +267,7 @@ object AfterDarkProofWebView {
                         // usual cross-origin Turnstile frame.
                         for (const frame of documentRoot.querySelectorAll("iframe")) {
                           try {
-                            if (documentHasHumanCheckbox(frame.contentDocument)) {
+                            if (documentHasInteractiveCheckbox(frame.contentDocument)) {
                               return true;
                             }
                           } catch (_) {}
@@ -291,7 +283,7 @@ object AfterDarkProofWebView {
                           window.__afterdarkCheckboxReported === true
                         ) return false;
 
-                        if (!documentHasHumanCheckbox(document)) return false;
+                        if (!documentHasInteractiveCheckbox(document)) return false;
 
                         window.__afterdarkCheckboxReported = true;
                         stopCheckboxWatcher();
@@ -342,7 +334,7 @@ object AfterDarkProofWebView {
                 )
             }
 
-            fun hasInteractiveHumanCheckbox(target: WebView): Boolean {
+            fun hasInteractiveCheckbox(target: WebView): Boolean {
                 val rootNode = runCatching {
                     target.createAccessibilityNodeInfo()
                 }.getOrNull() ?: return false
@@ -355,11 +347,6 @@ object AfterDarkProofWebView {
                         val node = pendingNodes.removeFirst()
                         visitedNodes++
 
-                        val label = buildString {
-                            append(node.text ?: "")
-                            append(' ')
-                            append(node.contentDescription ?: "")
-                        }
                         val isCheckbox = node.isCheckable ||
                             node.className
                                 ?.toString()
@@ -368,11 +355,7 @@ object AfterDarkProofWebView {
                         if (
                             isCheckbox &&
                             node.isEnabled &&
-                            node.isVisibleToUser &&
-                            label.contains(
-                                "Vérifiez que vous êtes humain",
-                                ignoreCase = true,
-                            )
+                            node.isVisibleToUser
                         ) {
                             runCatching { node.recycle() }
                             return true
@@ -401,7 +384,7 @@ object AfterDarkProofWebView {
                     !checkboxReloadInProgress.compareAndSet(false, true)
                 ) return
 
-                Log.i(TAG, "Checkbox Cloudflare interactive détectée, rechargement")
+                Log.i(TAG, "Checkbox interactive détectée, rechargement de la vérification")
                 browser.post {
                     if (!finished.get() && !verificationButtonHasAppeared.get()) {
                         browser.reload()
@@ -424,174 +407,6 @@ object AfterDarkProofWebView {
                 "AfterDarkNative",
             )
 
-            // evaluateJavascript() only reaches the top document. Turnstile's
-            // checkbox lives in a cross-origin Cloudflare iframe, so install a
-            // document-start detector in every frame before the first load.
-            val frameDetectorInstalled =
-                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-                    runCatching {
-                        WebViewCompat.addDocumentStartJavaScript(
-                            browser,
-                            """
-                        (() => {
-                          if (window.__afterdarkFrameCheckboxDetector) return;
-                          window.__afterdarkFrameCheckboxDetector = true;
-
-                          const TARGETS = [
-                            "vérifiez que vous êtes humain",
-                            "verifiez que vous etes humain",
-                            "verify you are human"
-                          ];
-                          const normalize = value =>
-                            String(value || "")
-                              .replace(/\s+/g, " ")
-                              .trim()
-                              .toLowerCase();
-
-                          const isCloudflareChallengeFrame = () => {
-                            try {
-                              const host = String(location.hostname || "")
-                                .toLowerCase();
-                              return host === "challenges.cloudflare.com" ||
-                                host.endsWith(".challenges.cloudflare.com");
-                            } catch (_) {
-                              return false;
-                            }
-                          };
-
-                          const associatedText = element => {
-                            const parts = [
-                              element.getAttribute("aria-label"),
-                              element.textContent
-                            ];
-
-                            const labelledBy = String(
-                              element.getAttribute("aria-labelledby") || ""
-                            ).split(/\s+/).filter(Boolean);
-                            for (const id of labelledBy) {
-                              parts.push(document.getElementById(id)?.textContent);
-                            }
-
-                            try {
-                              for (const label of Array.from(element.labels || [])) {
-                                parts.push(label.textContent);
-                              }
-                            } catch (_) {}
-
-                            try {
-                              parts.push(element.closest("label")?.textContent);
-                              parts.push(element.parentElement?.textContent);
-                            } catch (_) {}
-
-                            return normalize(parts.filter(Boolean).join(" "));
-                          };
-
-                          const isVisible = element => {
-                            if (!element || element.disabled) return false;
-                            try {
-                              const style = getComputedStyle(element);
-                              if (
-                                style.display === "none" ||
-                                style.visibility === "hidden"
-                              ) return false;
-                              const rect = element.getBoundingClientRect();
-                              return rect.width > 0 && rect.height > 0;
-                            } catch (_) {
-                              return true;
-                            }
-                          };
-
-                          const findInteractiveCheckbox = () => {
-                            const candidates = Array.from(
-                              document.querySelectorAll(
-                                'input[type="checkbox"], [role="checkbox"]'
-                              )
-                            );
-
-                            return candidates.some(element => {
-                              if (!isVisible(element)) return false;
-
-                              // In Cloudflare's own Turnstile frame, the arrival
-                              // of a visible checkbox is itself the interaction
-                              // request. Elsewhere, require its human-check label.
-                              if (isCloudflareChallengeFrame()) return true;
-
-                              const label = associatedText(element);
-                              if (TARGETS.some(target => label.includes(target))) {
-                                return true;
-                              }
-
-                              const pageText = normalize(document.body?.innerText);
-                              return TARGETS.some(target => pageText.includes(target));
-                            });
-                          };
-
-                          const report = () => {
-                            if (!findInteractiveCheckbox()) return false;
-
-                            try {
-                              if (
-                                window.AfterDarkNative &&
-                                typeof window.AfterDarkNative
-                                  .interactiveCheckboxSeen === "function"
-                              ) {
-                                window.AfterDarkNative.interactiveCheckboxSeen();
-                                return true;
-                              }
-                            } catch (_) {}
-
-                            return false;
-                          };
-
-                          const start = () => {
-                            if (report()) return;
-
-                            const root = document.documentElement;
-                            if (root) {
-                              const observer = new MutationObserver(() => {
-                                if (report()) observer.disconnect();
-                              });
-                              observer.observe(root, {
-                                childList: true,
-                                subtree: true,
-                                attributes: true,
-                                attributeFilter: [
-                                  "aria-label",
-                                  "disabled",
-                                  "style",
-                                  "class"
-                                ]
-                              });
-                            }
-
-                            const poller = setInterval(() => {
-                              if (report()) clearInterval(poller);
-                            }, 100);
-                          };
-
-                          if (document.readyState === "loading") {
-                            document.addEventListener(
-                              "DOMContentLoaded",
-                              start,
-                              { once: true }
-                            );
-                          } else {
-                            start();
-                          }
-                        })();
-                            """.trimIndent(),
-                            setOf("*"),
-                        )
-                    }.isSuccess
-                } else {
-                    false
-                }
-            if (frameDetectorInstalled) {
-                Log.i(TAG, "Détecteur Cloudflare installé dans toutes les frames")
-            } else {
-                Log.w(TAG, "Injection multi-frame indisponible, détection de secours active")
-            }
-
             // Cloudflare Turnstile usually lives in a cross-origin iframe,
             // which page JavaScript cannot inspect. The rendered interactive
             // checkbox is still exposed through WebView's accessibility tree.
@@ -602,7 +417,7 @@ object AfterDarkProofWebView {
                     if (
                         !verificationButtonHasAppeared.get() &&
                         !checkboxReloadInProgress.get() &&
-                        hasInteractiveHumanCheckbox(browser)
+                        hasInteractiveCheckbox(browser)
                     ) {
                         reloadForInteractiveCheckbox()
                     }
