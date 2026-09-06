@@ -1,12 +1,13 @@
-version = 51
+version = 52
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
     compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("androidx.webkit:webkit:1.14.0")
 }
 
 cloudstream {
-    description = "AfterDark - recharge la vérification si la checkbox Cloudflare apparaît"
+    description = "AfterDark - détection Turnstile dans toutes les frames WebView"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
