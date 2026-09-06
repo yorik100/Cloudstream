@@ -1,13 +1,15 @@
 import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
+import org.gradle.api.tasks.Sync
 
-version = 56
+version = 57
 
 val embeddedWebkit by configurations.creating
 val androidClassesJar = Attribute.of("artifactType", String::class.java)
 val embeddedWebkitClasses = embeddedWebkit.incoming.artifactView {
     attributes.attribute(androidClassesJar, "android-classes-jar")
 }.files
+val unpackedWebkitClasses = layout.buildDirectory.dir("embedded-webkit-classes")
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -21,8 +23,17 @@ dependencies {
     }
 }
 
+val unpackEmbeddedWebkit by tasks.registering(Sync::class) {
+    from({ embeddedWebkitClasses.files.map { zipTree(it) } })
+    include("**/*.class")
+    into(unpackedWebkitClasses)
+}
+
 tasks.named<CompileDexTask>("compileDex") {
-    input.from(embeddedWebkitClasses)
+    dependsOn(unpackEmbeddedWebkit)
+    // CompileDexTask closes JAR inputs before D8 consumes their entries.
+    // Supplying extracted class files avoids the resulting "zip file closed".
+    input.from(unpackedWebkitClasses)
 }
 
 cloudstream {
