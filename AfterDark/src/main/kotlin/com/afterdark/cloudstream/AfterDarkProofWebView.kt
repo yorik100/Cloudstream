@@ -22,6 +22,8 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -250,38 +252,6 @@ object AfterDarkProofWebView {
                         return true;
                       };
 
-                      const isVisibleCloudflareChallengeFrame = frame => {
-                        if (!frame) return false;
-
-                        try {
-                          const source = new URL(
-                            frame.getAttribute("src") || frame.src || "",
-                            location.href
-                          );
-                          const host = source.hostname.toLowerCase();
-                          if (
-                            host !== "challenges.cloudflare.com" &&
-                            !host.endsWith(".challenges.cloudflare.com")
-                          ) return false;
-
-                          const style = getComputedStyle(frame);
-                          if (
-                            style.display === "none" ||
-                            style.visibility === "hidden" ||
-                            Number(style.opacity || "1") === 0
-                          ) return false;
-
-                          const bounds = frame.getBoundingClientRect();
-                          const standardWidget =
-                            bounds.width >= 250 && bounds.height >= 50;
-                          const compactWidget =
-                            bounds.width >= 130 && bounds.height >= 120;
-                          return standardWidget || compactWidget;
-                        } catch (_) {
-                          return false;
-                        }
-                      };
-
                       const documentHasInteractiveCheckbox = documentRoot => {
                         if (!documentRoot) return false;
 
@@ -315,21 +285,12 @@ object AfterDarkProofWebView {
                           window.__afterdarkCheckboxReported === true
                         ) return false;
 
-                        const directCheckbox =
-                          documentHasInteractiveCheckbox(document);
-                        const cloudflareFrame = Array.from(
-                          document.querySelectorAll("iframe")
-                        ).some(isVisibleCloudflareChallengeFrame);
-                        if (!directCheckbox && !cloudflareFrame) return false;
+                        if (!documentHasInteractiveCheckbox(document)) return false;
 
                         window.__afterdarkCheckboxReported = true;
                         stopCheckboxWatcher();
                         try {
-                          if (cloudflareFrame && !directCheckbox) {
-                            window.AfterDarkNative.cloudflareCheckboxFrameSeen();
-                          } else {
-                            window.AfterDarkNative.interactiveCheckboxSeen();
-                          }
+                          window.AfterDarkNative.interactiveCheckboxSeen();
                         } catch (_) {}
                         return true;
                       };
@@ -356,16 +317,7 @@ object AfterDarkProofWebView {
                       observer.observe(document.documentElement, {
                         childList: true,
                         subtree: true,
-                        characterData: true,
-                        attributes: true,
-                        attributeFilter: [
-                          "src",
-                          "style",
-                          "class",
-                          "width",
-                          "height",
-                          "hidden"
-                        ]
+                        characterData: true
                       });
 
                       window.__afterdarkAutoOpenObserver = observer;
@@ -427,14 +379,14 @@ object AfterDarkProofWebView {
                 return false
             }
 
-            fun reloadForInteractiveCheckbox(source: String) {
+            fun reloadForInteractiveCheckbox() {
                 if (
                     finished.get() ||
                     verificationButtonHasAppeared.get() ||
                     !checkboxReloadInProgress.compareAndSet(false, true)
                 ) return
 
-                Log.i(TAG, "Checkbox interactive détectée via $source, rechargement")
+                Log.i(TAG, "Checkbox interactive détectée, rechargement de la vérification")
                 browser.post {
                     if (!finished.get() && !verificationButtonHasAppeared.get()) {
                         browser.reload()
@@ -451,16 +403,116 @@ object AfterDarkProofWebView {
 
                     @JavascriptInterface
                     fun interactiveCheckboxSeen() {
-                        handler.post { reloadForInteractiveCheckbox("DOM") }
-                    }
-
-                    @JavascriptInterface
-                    fun cloudflareCheckboxFrameSeen() {
-                        handler.post { reloadForInteractiveCheckbox("iframe Cloudflare") }
+                        handler.post { reloadForInteractiveCheckbox() }
                     }
                 },
                 "AfterDarkNative",
             )
+
+            // Unlike evaluateJavascript(), a document-start script is installed
+            // in every frame, including Cloudflare's cross-origin Turnstile frame.
+            val frameDetectorInstalled = runCatching {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    false
+                } else {
+                    WebViewCompat.addDocumentStartJavaScript(
+                        browser,
+                        """
+                        (() => {
+                          if (window.__afterdarkCheckboxFrameDetector) return;
+                          window.__afterdarkCheckboxFrameDetector = true;
+
+                          const isCloudflareFrame = () => {
+                            try {
+                              const host = String(location.hostname || "").toLowerCase();
+                              return host === "challenges.cloudflare.com" ||
+                                host.endsWith(".challenges.cloudflare.com");
+                            } catch (_) {
+                              return false;
+                            }
+                          };
+
+                          if (!isCloudflareFrame()) return;
+
+                          // Turnstile masque l'input natif et dessine la case autour.
+                          // Sa présence dans l'iframe Cloudflare suffit donc : contrôler
+                          // ses dimensions ou sa visibilité rejetterait la vraie case.
+                          const isInteractiveCheckbox = element =>
+                            Boolean(element) && !element.disabled;
+
+                          const report = () => {
+                            const roots = [document];
+                            for (let index = 0; index < roots.length; index++) {
+                              const root = roots[index];
+                              for (const element of root.querySelectorAll("*")) {
+                                if (element.shadowRoot) roots.push(element.shadowRoot);
+                              }
+                            }
+
+                            const checkbox = roots
+                              .flatMap(root => Array.from(root.querySelectorAll(
+                                'input[type="checkbox"], [role="checkbox"]'
+                              )))
+                              .find(isInteractiveCheckbox);
+                            if (!checkbox) return false;
+
+                            try {
+                              window.AfterDarkNative.interactiveCheckboxSeen();
+                              return true;
+                            } catch (_) {
+                              return false;
+                            }
+                          };
+
+                          const start = () => {
+                            if (report()) return;
+
+                            const observer = new MutationObserver(() => {
+                              if (report()) observer.disconnect();
+                            });
+                            observer.observe(document.documentElement, {
+                              childList: true,
+                              subtree: true,
+                              attributes: true,
+                              attributeFilter: [
+                                "type",
+                                "role",
+                                "disabled",
+                                "style",
+                                "class"
+                              ]
+                            });
+
+                            const poller = setInterval(() => {
+                              if (report()) clearInterval(poller);
+                            }, 100);
+                          };
+
+                          if (document.readyState === "loading") {
+                            document.addEventListener(
+                              "DOMContentLoaded",
+                              start,
+                              { once: true }
+                            );
+                          } else {
+                            start();
+                          }
+                        })();
+                        """.trimIndent(),
+                        setOf("*"),
+                    )
+                    true
+                }
+            }.getOrElse { error ->
+                Log.e(TAG, "Impossible d'installer le détecteur multi-frame", error)
+                false
+            }
+
+            if (frameDetectorInstalled) {
+                Log.i(TAG, "Détecteur checkbox installé dans toutes les frames")
+            } else {
+                Log.w(TAG, "Détecteur multi-frame indisponible")
+            }
 
             // Cloudflare Turnstile usually lives in a cross-origin iframe,
             // which page JavaScript cannot inspect. The rendered interactive
@@ -474,7 +526,7 @@ object AfterDarkProofWebView {
                         !checkboxReloadInProgress.get() &&
                         hasInteractiveCheckbox(browser)
                     ) {
-                        reloadForInteractiveCheckbox("accessibilité WebView")
+                        reloadForInteractiveCheckbox()
                     }
 
                     if (!finished.get()) {
