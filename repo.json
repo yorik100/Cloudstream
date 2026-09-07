@@ -1,6 +1,6 @@
 {
-  "name": "Yorik CloudStream",
-  "description": "Extensions AfterDark et Frembed pour CloudStream",
+  "name": "French providers repository",
+  "description": "AfterDark & Frembed",
   "manifestVersion": 1,
   "pluginLists": [
     "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/plugins.json"
