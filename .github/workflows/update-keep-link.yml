@@ -74,6 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          echo "Resolver revision: browser-final-origin-v3"
 
           shopt -s nullglob
           files=(KeepLink*.txt)
@@ -663,19 +664,6 @@ jobs:
               for match in re.finditer(pattern, source, re.I):
                   add_candidate(match.group(1), 800)
 
-          # Liens HTML ordinaires.
-          for href, _ in parser.links:
-              if href:
-                  add_candidate(href, 500)
-
-          # Dernier recours : toutes les URL HTTPS présentes dans la page.
-          for match in re.finditer(
-              r"https://[a-z0-9.-]+\.[a-z]{2,}(?:/[^\s\"'<>]*)?",
-              source,
-              re.I,
-          ):
-              add_candidate(match.group(0), 100)
-
           base_host = (urlparse(base_url).hostname or "").lower()
 
           for _, _, candidate in sorted(
@@ -764,6 +752,17 @@ jobs:
               if ! effective_origin="$(url_origin "$effective_url")"; then
                 echo "::warning file=$file::Effective URL could not be parsed"
                 return 0
+              fi
+
+              # If the HTTP client or Chrome has already navigated to another
+              # HTTPS origin and the resulting page is no longer an
+              # interstitial, that navigation itself is the resolution. Do
+              # not scan the destination page for another external link: it
+              # may contain advertisements unrelated to the address change.
+              if [[ "$effective_origin" != "$candidate_url" ]]; then
+                resolved_url="$effective_origin"
+                echo "$file: browser reached final origin: $resolved_url"
+                break
               fi
 
               # Une véritable redirection HTTP a déjà été suivie par le client.
