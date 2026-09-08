@@ -322,6 +322,7 @@ jobs:
               r"redirection\s+dans\s+[0-9]+\s*s",
               r"redirection.{0,240}?\b(?:vers|sur)\b",
               r"(?:allez|serez)\s+(?:etre\s+)?redirige",
+              r"acceder\s+(?:a|au|vers)\s+(?:la\s+)?(?:page\s+d['’]accueil|site)",
               r"nouvelle\s+adresse",
               r"adresse\s+officielle\s+disponible",
               r"nouveau\s+nom\s+de\s+domaine",
@@ -489,6 +490,7 @@ jobs:
               r"(?:window\.)?location(?:\.href)?\s*=\s*['\"](https://[^'\"]+)",
               r"location\.replace\(\s*['\"](https://[^'\"]+)",
               r"location\.assign\(\s*['\"](https://[^'\"]+)",
+              r"window\.open\(\s*['\"](https://[^'\"]+)['\"]",
           )
 
           for pattern in javascript_patterns:
