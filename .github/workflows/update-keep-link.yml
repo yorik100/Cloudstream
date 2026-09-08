@@ -15,59 +15,51 @@ concurrency:
 jobs:
   update-links:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Route resolver traffic through Cloudflare WARP
-        uses: fscarmen/warp-on-actions@37ce1997e075435a827991dabcce1d080c1fe512
-        with:
-          stack: dual
-          mode: client
-
-      - name: Verify Cloudflare WARP connection
+      - name: Install and start Tor proxy
         shell: bash
         run: |
           set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends tor
 
-          # Match the working device configuration: all traffic and DNS are
-          # already enabled by warp+doh; WireGuard forces the UDP tunnel.
-          sudo warp-cli --accept-tos tunnel protocol set WireGuard
-          sudo warp-cli --accept-tos disconnect || true
-          sudo warp-cli --accept-tos connect
+          sudo tee /etc/tor/torrc.d/keep-link.conf > /dev/null <<'TORRC'
+          SocksPort 9050 IsolateSOCKSAuth
+          ExitNodes {fr},{be},{ch},{lu},{de},{nl},{es},{it}
+          StrictNodes 1
+          AvoidDiskWrites 1
+          TORRC
 
-          for attempt in {1..20}; do
-            echo "WARP check $attempt/20"
-            sudo warp-cli --accept-tos status || true
+          sudo systemctl restart tor@default
 
-            trace="$(
+          for attempt in {1..30}; do
+            if trace="$(
               curl \
                 --silent \
                 --show-error \
-                --connect-timeout 5 \
-                --max-time 10 \
-                https://www.cloudflare.com/cdn-cgi/trace ||
-              true
-            )"
-
-            if grep -Eq '^warp=(on|plus)$' <<< "$trace"; then
-              echo "Cloudflare WARP is active."
+                --proxy socks5h://127.0.0.1:9050 \
+                --connect-timeout 10 \
+                --max-time 20 \
+                https://www.cloudflare.com/cdn-cgi/trace
+            )"; then
+              echo "Tor proxy is active."
               grep -E '^(ip|loc|colo|warp)=' <<< "$trace" || true
-              exit 0
+              break
+            fi
+
+            if (( attempt == 30 )); then
+              echo "::error::Tor proxy did not become active"
+              exit 1
             fi
 
             sleep 2
           done
 
-          echo "::error::Cloudflare WARP did not become active"
-          exit 1
-
-      - name: Install browser HTTP client
-        shell: bash
-        run: |
-          set -euo pipefail
           python3 -m pip install --disable-pip-version-check curl-cffi selenium
 
       - name: Resolve all KeepLink files
@@ -113,7 +105,6 @@ jobs:
           from urllib.parse import urlparse
 
           from curl_cffi import requests
-          from curl_cffi.const import CurlIpResolve, CurlOpt
 
 
           def fetch_with_chrome(url):
@@ -127,6 +118,7 @@ jobs:
               options.add_argument("--disable-blink-features=AutomationControlled")
               options.add_argument("--lang=fr-FR")
               options.add_argument("--window-size=1365,768")
+              options.add_argument("--proxy-server=socks5://127.0.0.1:9050")
               options.add_experimental_option(
                   "excludeSwitches",
                   ["enable-automation"],
@@ -186,60 +178,54 @@ jobs:
               finally:
                   driver.quit()
 
-          def fetch_with_family(url, family, label):
-              last_error = None
-
-              for attempt in range(1, 3):
-                  try:
-                      response = requests.get(
-                          url,
-                          impersonate="chrome",
-                          headers={
-                              "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-                              "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
-                          },
-                          curl_options={CurlOpt.IPRESOLVE: family},
-                          allow_redirects=True,
-                          timeout=60,
-                      )
-                  except requests.RequestsError as error:
-                      last_error = error
-                      if attempt < 2:
-                          time.sleep(attempt * 2)
-                      continue
-
-                  ray = response.headers.get("cf-ray", "absent")
+          def fetch_with_circuit(url, circuit):
+              # IsolateSOCKSAuth gives every username a separate Tor circuit.
+              # DNS resolution is also performed by Tor through socks5h.
+              proxy = (
+                  f"socks5h://keeplink-{circuit}:isolated@127.0.0.1:9050"
+              )
+              try:
+                  response = requests.get(
+                      url,
+                      impersonate="chrome",
+                      headers={
+                          "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                          "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
+                      },
+                      proxies={"http": proxy, "https": proxy},
+                      allow_redirects=True,
+                      timeout=60,
+                  )
+              except requests.RequestsError as error:
                   print(
-                      f"WARP {label}: HTTP {response.status_code}; CF-Ray={ray}",
+                      f"Tor circuit {circuit}: {type(error).__name__}",
                       file=sys.stderr,
                   )
-                  if response.status_code != 429 and response.status_code < 500:
-                      return response
-                  if attempt < 2:
-                      time.sleep(attempt * 2)
+                  return None
 
-              if last_error is not None:
-                  print(
-                      f"WARP {label}: {type(last_error).__name__}",
-                      file=sys.stderr,
-                  )
-              return None
+              ray = response.headers.get("cf-ray", "absent")
+              print(
+                  f"Tor circuit {circuit}: HTTP {response.status_code}; "
+                  f"CF-Ray={ray}",
+                  file=sys.stderr,
+              )
+              return response
 
 
           requested_url, body_file = sys.argv[1:]
           response = None
 
-          # Test both WARP addresses explicitly. A block on one egress family
-          # must not hide a working path on the other one.
-          for family, label in (
-              (CurlIpResolve.V6, "IPv6"),
-              (CurlIpResolve.V4, "IPv4"),
-          ):
-              candidate = fetch_with_family(requested_url, family, label)
+          # Try several independent European Tor exits. Stop at the first
+          # response which is not an access denial or temporary server error.
+          for circuit in range(1, 7):
+              candidate = fetch_with_circuit(requested_url, circuit)
               if candidate is None:
                   continue
               response = candidate
-              if candidate.status_code != 403:
+              if (
+                  candidate.status_code not in (403, 429)
+                  and candidate.status_code < 500
+              ):
                   break
 
           if response is None:
@@ -248,7 +234,7 @@ jobs:
           if response.status_code == 403:
               final_url, status_code, content = fetch_with_chrome(requested_url)
               print(
-                  f"WARP Chrome: HTTP {status_code}",
+                  f"Tor Chrome: HTTP {status_code}",
                   file=sys.stderr,
               )
               redirect_urls = [requested_url, final_url]
