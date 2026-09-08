@@ -2,7 +2,12 @@ import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.tasks.Sync
 
-version = 58
+version = 60
+
+val publishedIconBase =
+    "https://raw.githubusercontent.com/" +
+        (System.getenv("GITHUB_REPOSITORY") ?: "yorik100/Cloudstream") +
+        "/refs/heads/main/icons"
 
 val embeddedWebkit by configurations.creating
 val androidClassesJar = Attribute.of("artifactType", String::class.java)
@@ -42,5 +47,6 @@ cloudstream {
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
+    iconUrl = "$publishedIconBase/KeepLink2.png"
     isCrossPlatform = false
 }

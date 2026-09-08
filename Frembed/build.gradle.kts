@@ -1,4 +1,9 @@
-version = 21
+version = 23
+
+val publishedIconBase =
+    "https://raw.githubusercontent.com/" +
+        (System.getenv("GITHUB_REPOSITORY") ?: "yorik100/Cloudstream") +
+        "/refs/heads/main/icons"
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -11,5 +16,6 @@ cloudstream {
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
+    iconUrl = "$publishedIconBase/KeepLink.png"
     isCrossPlatform = false
 }
