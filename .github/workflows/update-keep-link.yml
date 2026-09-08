@@ -25,7 +25,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check curl-cffi
+          python3 -m pip install --disable-pip-version-check curl-cffi selenium
 
       - name: Resolve all KeepLink files
         id: keep-links
@@ -71,6 +71,77 @@ jobs:
 
           from curl_cffi import requests
 
+
+          def fetch_with_chrome(url):
+              from selenium import webdriver
+              from selenium.webdriver.chrome.options import Options
+
+              options = Options()
+              options.add_argument("--headless=new")
+              options.add_argument("--no-sandbox")
+              options.add_argument("--disable-dev-shm-usage")
+              options.add_argument("--disable-blink-features=AutomationControlled")
+              options.add_argument("--lang=fr-FR")
+              options.add_argument("--window-size=1365,768")
+              options.add_experimental_option(
+                  "excludeSwitches",
+                  ["enable-automation"],
+              )
+              options.add_experimental_option("useAutomationExtension", False)
+
+              driver = webdriver.Chrome(options=options)
+              try:
+                  driver.set_page_load_timeout(60)
+                  browser = driver.execute_cdp_cmd("Browser.getVersion", {})
+                  user_agent = browser["userAgent"].replace(
+                      "HeadlessChrome/",
+                      "Chrome/",
+                  )
+                  driver.execute_cdp_cmd(
+                      "Network.setUserAgentOverride",
+                      {
+                          "userAgent": user_agent,
+                          "acceptLanguage": "fr-FR,fr;q=0.9,en;q=0.7",
+                          "platform": "Linux x86_64",
+                      },
+                  )
+                  driver.execute_cdp_cmd(
+                      "Page.addScriptToEvaluateOnNewDocument",
+                      {
+                          "source": (
+                              "Object.defineProperty(navigator, 'webdriver', "
+                              "{get: () => undefined});"
+                          ),
+                      },
+                  )
+                  driver.get(url)
+
+                  # Allow a JavaScript challenge or client redirect to finish.
+                  deadline = time.monotonic() + 20
+                  while time.monotonic() < deadline:
+                      title = driver.title.lower()
+                      source = driver.page_source.lower()
+                      challenge = (
+                          "just a moment" in title
+                          or "checking your browser" in source
+                          or "cf-chl-" in source
+                      )
+                      if not challenge:
+                          break
+                      time.sleep(1)
+
+                  status = driver.execute_script(
+                      "const nav = performance.getEntriesByType('navigation')[0];"
+                      "return nav ? nav.responseStatus : 0;"
+                  )
+                  return (
+                      driver.current_url,
+                      int(status or 0),
+                      driver.page_source.encode("utf-8"),
+                  )
+              finally:
+                  driver.quit()
+
           requested_url, body_file = sys.argv[1:]
           response = None
 
@@ -100,17 +171,25 @@ jobs:
           if response is None:
               raise RuntimeError("No HTTP response")
 
-          redirect_chain = [*response.history, response]
-          if len(response.history) > 10:
-              raise RuntimeError("Too many redirects")
-          if any(urlparse(item.url).scheme != "https" for item in redirect_chain):
+          if response.status_code == 403:
+              final_url, status_code, content = fetch_with_chrome(requested_url)
+              redirect_urls = [requested_url, final_url]
+          else:
+              final_url = response.url
+              status_code = response.status_code
+              content = response.content
+              if len(response.history) > 10:
+                  raise RuntimeError("Too many redirects")
+              redirect_urls = [item.url for item in [*response.history, response]]
+
+          if any(urlparse(url).scheme != "https" for url in redirect_urls):
               raise RuntimeError("Refusing a non-HTTPS redirect")
 
           with open(body_file, "wb") as output:
-              output.write(response.content)
+              output.write(content)
 
-          print(response.url)
-          print(response.status_code)
+          print(final_url)
+          print(status_code)
           PY
             )"; then
               return 1
