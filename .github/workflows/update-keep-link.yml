@@ -22,10 +22,40 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Route resolver traffic through Cloudflare WARP
-        uses: fscarmen/warp-on-actions@v1.4
+        uses: fscarmen/warp-on-actions@37ce1997e075435a827991dabcce1d080c1fe512
         with:
-          stack: ipv4
-          mode: wireguard
+          stack: dual
+          mode: client
+
+      - name: Verify Cloudflare WARP connection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in {1..20}; do
+            echo "WARP check $attempt/20"
+            sudo warp-cli --accept-tos status || true
+
+            trace="$(
+              curl \
+                --silent \
+                --show-error \
+                --connect-timeout 5 \
+                --max-time 10 \
+                https://www.cloudflare.com/cdn-cgi/trace ||
+              true
+            )"
+
+            if grep -Eq '^warp=(on|plus)$' <<< "$trace"; then
+              echo "Cloudflare WARP is active."
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "::error::Cloudflare WARP did not become active"
+          exit 1
 
       - name: Install browser HTTP client
         shell: bash
