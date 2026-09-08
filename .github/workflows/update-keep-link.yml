@@ -53,33 +53,55 @@ jobs:
             local requested_url="$1"
             local body_file="$2"
             local curl_output
+            local attempt
 
-            if ! curl_output="$(
-              curl \
-                --silent \
-                --show-error \
-                --location \
-                --max-redirs 10 \
-                --connect-timeout 15 \
-                --max-time 60 \
-                --retry 2 \
-                --retry-delay 2 \
-                --retry-all-errors \
-                --proto '=https' \
-                --proto-redir '=https' \
-                --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
-                --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
-                --header 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.7' \
-                --header 'Cache-Control: no-cache' \
-                --output "$body_file" \
-                --write-out $'%{url_effective}\n%{http_code}' \
-                "$requested_url"
-            )"; then
-              return 1
-            fi
+            # Same request profile as the CloudStream domain resolvers.  In
+            # particular, do not send Cache-Control: no-cache: some directory
+            # pages intermittently reject that desktop/crawler-like request.
+            # A fresh cookie jar is shared across the redirects and consecutive
+            # announcement pages, just like the app's HTTP client session.
+            for attempt in {1..4}; do
+              if curl_output="$(
+                curl \
+                  --silent \
+                  --show-error \
+                  --location \
+                  --max-redirs 10 \
+                  --connect-timeout 15 \
+                  --max-time 60 \
+                  --retry 2 \
+                  --retry-delay 2 \
+                  --retry-all-errors \
+                  --proto '=https' \
+                  --proto-redir '=https' \
+                  --compressed \
+                  --cookie "$temp_dir/cookies.txt" \
+                  --cookie-jar "$temp_dir/cookies.txt" \
+                  --user-agent 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36' \
+                  --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
+                  --header 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.7' \
+                  --output "$body_file" \
+                  --write-out $'%{url_effective}\n%{http_code}' \
+                  "$requested_url"
+              )"; then
+                effective_url="$(sed -n '1p' <<< "$curl_output")"
+                status_code="$(sed -n '2p' <<< "$curl_output")"
 
-            effective_url="$(sed -n '1p' <<< "$curl_output")"
-            status_code="$(sed -n '2p' <<< "$curl_output")"
+                # curl does not retry HTTP 403 by itself. The same public page
+                # can answer transiently with 403/429 from a GitHub runner, so
+                # retry those responses without any host-specific exception.
+                if [[ ! "$status_code" =~ ^(403|429|5[0-9][0-9])$ ]] ||
+                   (( attempt == 4 )); then
+                  return 0
+                fi
+
+                echo "HTTP $status_code for $requested_url; retry $attempt/4." >&2
+              elif (( attempt == 4 )); then
+                return 1
+              fi
+
+              sleep "$((attempt * 2))"
+            done
           }
 
           page_announces_move() {
