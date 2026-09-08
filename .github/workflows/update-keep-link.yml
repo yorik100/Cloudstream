@@ -21,6 +21,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Install browser HTTP client
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check curl-cffi
+
       - name: Resolve all KeepLink files
         id: keep-links
         shell: bash
@@ -52,56 +58,66 @@ jobs:
           fetch_page() {
             local requested_url="$1"
             local body_file="$2"
-            local curl_output
-            local attempt
 
-            # Same request profile as the CloudStream domain resolvers.  In
-            # particular, do not send Cache-Control: no-cache: some directory
-            # pages intermittently reject that desktop/crawler-like request.
-            # A fresh cookie jar is shared across the redirects and consecutive
-            # announcement pages, just like the app's HTTP client session.
-            for attempt in {1..4}; do
-              if curl_output="$(
-                curl \
-                  --silent \
-                  --show-error \
-                  --location \
-                  --max-redirs 10 \
-                  --connect-timeout 15 \
-                  --max-time 60 \
-                  --retry 2 \
-                  --retry-delay 2 \
-                  --retry-all-errors \
-                  --proto '=https' \
-                  --proto-redir '=https' \
-                  --compressed \
-                  --cookie "$temp_dir/cookies.txt" \
-                  --cookie-jar "$temp_dir/cookies.txt" \
-                  --user-agent 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36' \
-                  --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
-                  --header 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.7' \
-                  --output "$body_file" \
-                  --write-out $'%{url_effective}\n%{http_code}' \
-                  "$requested_url"
-              )"; then
-                effective_url="$(sed -n '1p' <<< "$curl_output")"
-                status_code="$(sed -n '2p' <<< "$curl_output")"
+            # A User-Agent alone does not make curl behave like Chrome: the TLS
+            # and HTTP/2 fingerprints still identify libcurl. curl-cffi sends a
+            # genuine browser network fingerprint while keeping this resolver
+            # fully driven by the URL stored in each KeepLink file.
+            if ! fetch_output="$(
+              python3 - "$requested_url" "$body_file" <<'PY'
+          import sys
+          import time
+          from urllib.parse import urlparse
 
-                # curl does not retry HTTP 403 by itself. The same public page
-                # can answer transiently with 403/429 from a GitHub runner, so
-                # retry those responses without any host-specific exception.
-                if [[ ! "$status_code" =~ ^(403|429|5[0-9][0-9])$ ]] ||
-                   (( attempt == 4 )); then
-                  return 0
-                fi
+          from curl_cffi import requests
 
-                echo "HTTP $status_code for $requested_url; retry $attempt/4." >&2
-              elif (( attempt == 4 )); then
-                return 1
-              fi
+          requested_url, body_file = sys.argv[1:]
+          response = None
 
-              sleep "$((attempt * 2))"
-            done
+          for attempt in range(1, 5):
+              try:
+                  response = requests.get(
+                      requested_url,
+                      impersonate="chrome",
+                      headers={
+                          "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+                          "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.7",
+                      },
+                      allow_redirects=True,
+                      timeout=60,
+                  )
+              except requests.RequestsError:
+                  if attempt == 4:
+                      raise
+                  time.sleep(attempt * 2)
+                  continue
+
+              if response.status_code != 429 and response.status_code < 500:
+                  break
+              if attempt < 4:
+                  time.sleep(attempt * 2)
+
+          if response is None:
+              raise RuntimeError("No HTTP response")
+
+          redirect_chain = [*response.history, response]
+          if len(response.history) > 10:
+              raise RuntimeError("Too many redirects")
+          if any(urlparse(item.url).scheme != "https" for item in redirect_chain):
+              raise RuntimeError("Refusing a non-HTTPS redirect")
+
+          with open(body_file, "wb") as output:
+              output.write(response.content)
+
+          print(response.url)
+          print(response.status_code)
+          PY
+            )"; then
+              return 1
+            fi
+
+            effective_url="$(sed -n '1p' <<< "$fetch_output")"
+            status_code="$(sed -n '2p' <<< "$fetch_output")"
           }
 
           page_announces_move() {
@@ -370,7 +386,7 @@ jobs:
                 return 0
               fi
 
-              # Une véritable redirection HTTP a déjà été suivie par curl.
+              # Une véritable redirection HTTP a déjà été suivie par le client.
               # Si la page obtenue n'annonce aucun autre déplacement, elle
               # devient immédiatement l'adresse finale.
               if ! page_announces_move "$body_file"; then
