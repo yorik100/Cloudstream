@@ -109,6 +109,7 @@ jobs:
               python3 - "$requested_url" "$body_file" <<'PY'
           import sys
           import time
+          import re
           from urllib.parse import urlparse
 
           from curl_cffi import requests
@@ -116,12 +117,19 @@ jobs:
 
           INTERSTITIAL_MARKERS = (
               "please wait",
+              "please, wait",
+              "wait a moment",
+              "hold on",
               "just a moment",
               "checking your browser",
               "checking if the site connection is secure",
+              "verifying your browser",
+              "security verification",
+              "veuillez patienter",
+              "patientez",
+              "un instant",
               "cf-chl-",
           )
-
 
           def page_text(content):
               if isinstance(content, bytes):
@@ -129,9 +137,59 @@ jobs:
               return str(content).lower()
 
 
-          def is_interstitial(content):
+          def has_wait_marker(content):
               source = page_text(content)
-              return any(marker in source for marker in INTERSTITIAL_MARKERS)
+              title_match = re.search(
+                  r"<title\b[^>]*>(.*?)</title>",
+                  source,
+                  re.I | re.S,
+              )
+              title = re.sub(
+                  r"[^a-z0-9]+",
+                  " ",
+                  title_match.group(1) if title_match else "",
+              ).strip()
+              without_scripts = re.sub(
+                  r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>",
+                  " ",
+                  source,
+                  flags=re.I | re.S,
+              )
+              visible_text = re.sub(r"<[^>]+>", " ", without_scripts)
+              visible_text = " ".join(visible_text.split())
+              leading_text = visible_text[:500]
+              if (
+                  "cf-chl-" in source
+                  or any(
+                      marker in title or marker in leading_text
+                      for marker in INTERSTITIAL_MARKERS
+                      if marker != "cf-chl-"
+                  )
+                  or any(
+                      word in title
+                      for word in (
+                          "wait",
+                          "checking",
+                          "verification",
+                          "verifying",
+                          "redirecting",
+                          "loading",
+                      )
+                  )
+              ):
+                  return True
+
+              scripted_shell = (
+                  "<script" in source
+                  and len(visible_text) < 180
+                  and len(re.findall(r"<a\b", source, re.I)) <= 1
+                  and not re.search(r"<(?:form|main|article)\b", source, re.I)
+              )
+              return scripted_shell
+
+
+          def is_interstitial(content):
+              return has_wait_marker(content)
 
 
           def fetch_with_chrome(url):
@@ -205,11 +263,11 @@ jobs:
                           )
                       )
                       javascript_redirect = waiting_text and bool(
-                          __import__("re").search(
+                          re.search(
                               r"(?:window\.)?location(?:\.href)?\s*=|"
                               r"location\.(?:replace|assign)\s*\(",
                               source,
-                              __import__("re").I,
+                              re.I,
                           )
                       )
 
@@ -290,7 +348,7 @@ jobs:
               if (
                   candidate.status_code not in (403, 429)
                   and candidate.status_code < 500
-                  and not is_interstitial(candidate.content)
+                  and not has_wait_marker(candidate.content)
               ):
                   break
 
@@ -366,7 +424,22 @@ jobs:
               r"redirection\s+securisee\s+vers",
           ]
 
-          found = any(re.search(pattern, normalized) for pattern in patterns)
+          redirect_patterns = (
+              r"<meta\b[^>]*http-equiv\s*=\s*['\"]?refresh['\"]?[^>]*"
+              r"content\s*=\s*['\"][^'\"]*url\s*=",
+              r"<meta\b[^>]*content\s*=\s*['\"][^'\"]*url\s*=[^>]*"
+              r"http-equiv\s*=\s*['\"]?refresh",
+              r"(?:window\.)?location(?:\.href)?\s*=\s*['\"]https://",
+              r"location\.(?:replace|assign)\s*\(\s*['\"]https://",
+          )
+
+          found = (
+              any(re.search(pattern, normalized) for pattern in patterns)
+              or any(
+                  re.search(pattern, source, re.I | re.S)
+                  for pattern in redirect_patterns
+              )
+          )
           raise SystemExit(0 if found else 1)
           PY
           }
@@ -376,6 +449,7 @@ jobs:
 
             python3 - "$body_file" <<'PY'
           import html
+          import re
           import sys
           import unicodedata
 
@@ -390,13 +464,69 @@ jobs:
 
           markers = (
               "please wait",
+              "please, wait",
+              "wait a moment",
+              "hold on",
               "just a moment",
               "checking your browser",
               "checking if the site connection is secure",
+              "verifying your browser",
+              "security verification",
+              "veuillez patienter",
+              "patientez",
+              "un instant",
               "cf-chl-",
           )
 
-          raise SystemExit(0 if any(marker in normalized for marker in markers) else 1)
+          title_match = re.search(
+              r"<title\b[^>]*>(.*?)</title>",
+              normalized,
+              re.I | re.S,
+          )
+          title = re.sub(
+              r"[^a-z0-9]+",
+              " ",
+              title_match.group(1) if title_match else "",
+          ).strip()
+          without_scripts = re.sub(
+              r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>",
+              " ",
+              normalized,
+              flags=re.I | re.S,
+          )
+          visible_text = re.sub(r"<[^>]+>", " ", without_scripts)
+          visible_text = " ".join(visible_text.split())
+          leading_text = visible_text[:500]
+          if (
+              "cf-chl-" in normalized
+              or any(
+                  marker in title or marker in leading_text
+                  for marker in markers
+                  if marker != "cf-chl-"
+              )
+              or any(
+                  word in title
+                  for word in (
+                      "wait",
+                      "checking",
+                      "verification",
+                      "verifying",
+                      "redirecting",
+                      "loading",
+                  )
+              )
+          ):
+              raise SystemExit(0)
+
+          if (
+              "<script" in normalized
+              and len(visible_text) < 180
+              and len(re.findall(r"<a\b", normalized, re.I)) <= 1
+              and not re.search(r"<(?:form|main|article)\b", normalized, re.I)
+          ):
+              raise SystemExit(0)
+
+          raise SystemExit(1)
           PY
           }
 
