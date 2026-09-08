@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Resolver revision: explicit-home-cta-v4"
+          echo "Resolver revision: explicit-route-following-v6"
 
           shopt -s nullglob
           files=(KeepLink*.txt)
@@ -605,9 +605,18 @@ jobs:
 
           candidates = []
           candidate_index = 0
+          allowed_sources = {
+              "explicit_cta",
+              "announced_address",
+              "meta_refresh",
+              "javascript_redirect",
+          }
 
-          def add_candidate(value, priority):
+          def add_candidate(value, priority, source_kind):
               global candidate_index
+
+              if source_kind not in allowed_sources:
+                  return
 
               value = html.unescape(value).strip()
               value = value.rstrip("\"'<>),.;")
@@ -627,6 +636,7 @@ jobs:
               "ouvrir le site",
               "acceder maintenant",
               "acceder a la page d'accueil",
+              "acceder a la page d’accueil",
               "acceder au site",
               "visiter le site",
               "continuer vers le site",
@@ -636,7 +646,7 @@ jobs:
               normalized_label = normalize(label)
 
               if any(text in normalized_label for text in preferred_labels):
-                  add_candidate(href, 1000)
+                  add_candidate(href, 1000, "explicit_cta")
 
           # Adresse écrite après les indications AfterDark.
           visible_text = " ".join(parser.text)
@@ -646,14 +656,14 @@ jobs:
               r"nouvelle\s+adresse.{0,250}?(https://[a-z0-9.-]+)",
           ):
               for match in re.finditer(pattern, visible_text, re.I | re.S):
-                  add_candidate(match.group(1), 900)
+                  add_candidate(match.group(1), 900, "announced_address")
 
           # Redirections HTML.
           for refresh in parser.refreshes:
               match = re.search(r"url\s*=\s*([^;]+)", refresh, re.I)
 
               if match:
-                  add_candidate(match.group(1), 850)
+                  add_candidate(match.group(1), 850, "meta_refresh")
 
           # Redirections JavaScript utilisées par certaines anciennes pages.
           javascript_patterns = (
@@ -664,9 +674,17 @@ jobs:
 
           for pattern in javascript_patterns:
               for match in re.finditer(pattern, source, re.I):
-                  add_candidate(match.group(1), 800)
+                  add_candidate(match.group(1), 800, "javascript_redirect")
 
-          base_host = (urlparse(base_url).hostname or "").lower()
+          # No fallback over ordinary links or arbitrary HTTPS URLs. Only the
+          # four explicit redirect sources above are eligible.
+          base_parsed = urlparse(base_url)
+          base_host = (base_parsed.hostname or "").lower()
+          base_port = f":{base_parsed.port}" if base_parsed.port else ""
+          base_path = base_parsed.path or "/"
+          normalized_base = f"https://{base_host}{base_port}{base_path}"
+          if base_parsed.query:
+              normalized_base += f"?{base_parsed.query}"
 
           for _, _, candidate in sorted(
               candidates,
@@ -678,9 +696,6 @@ jobs:
                   continue
 
               candidate_host = parsed.hostname.lower()
-
-              if candidate_host == base_host:
-                  continue
 
               # Évite les liens sociaux présents sur les pages d'annonce.
               if candidate_host in {
@@ -695,7 +710,18 @@ jobs:
                   continue
 
               port = f":{parsed.port}" if parsed.port else ""
-              print(f"https://{candidate_host}{port}/")
+              path = parsed.path or "/"
+              normalized_candidate = f"https://{candidate_host}{port}{path}"
+              if parsed.query:
+                  normalized_candidate += f"?{parsed.query}"
+
+              # An explicit same-origin route such as /go or /redirect is
+              # valid and must be fetched because it can perform the actual
+              # cross-origin redirect. Only an exact self-link is rejected.
+              if normalized_candidate == normalized_base:
+                  continue
+
+              print(normalized_candidate)
               sys.exit(0)
 
           sys.exit(1)
@@ -707,6 +733,7 @@ jobs:
             local current_url
             local current_origin
             local candidate_url
+            local candidate_origin
             local effective_origin
             local next_url
             local resolved_url=""
@@ -736,6 +763,11 @@ jobs:
 
               visited["$candidate_url"]=1
 
+              if ! candidate_origin="$(url_origin "$candidate_url")"; then
+                echo "::warning file=$file::Candidate URL could not be parsed"
+                return 0
+              fi
+
               if ! fetch_page "$candidate_url" "$body_file"; then
                 echo "$file: $candidate_url could not be reached; unchanged."
                 return 0
@@ -761,7 +793,7 @@ jobs:
               # interstitial, that navigation itself is the resolution. Do
               # not scan the destination page for another external link: it
               # may contain advertisements unrelated to the address change.
-              if [[ "$effective_origin" != "$candidate_url" ]]; then
+              if [[ "$effective_origin" != "$candidate_origin" ]]; then
                 resolved_url="$effective_origin"
                 echo "$file: browser reached final origin: $resolved_url"
                 break
