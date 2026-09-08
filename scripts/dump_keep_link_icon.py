@@ -50,6 +50,14 @@ def https_url(value):
     return parsed.scheme == "https" and bool(parsed.hostname)
 
 
+def normalized_origin(value):
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return None
+    port = "" if parsed.port in (None, 443) else f":{parsed.port}"
+    return f"https://{parsed.hostname.lower()}{port}"
+
+
 def candidate_urls(page_source, page_url, origin):
     parser = IconParser()
     parser.feed(page_source)
@@ -167,6 +175,8 @@ def main():
 
     if not https_url(args.page_url) or not https_url(args.origin):
         parser.error("page-url and origin must use HTTPS")
+    if normalized_origin(args.page_url) != normalized_origin(args.origin):
+        parser.error("page-url must belong to the resolved final origin")
 
     page_source = args.page_file.read_text(encoding="utf-8", errors="ignore")
     for candidate in candidate_urls(page_source, args.page_url, args.origin):

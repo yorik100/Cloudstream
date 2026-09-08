@@ -298,11 +298,15 @@ jobs:
 
           patterns = [
               r"a\s+change\s+d['’]adresse",
+              r"l['’]adresse.{0,120}?a\s+change",
               r"ancienne\s+adresse\s+n['’]est\s+plus\s+utilisee",
               r"redirection\s+dans\s+[0-9]+\s*s",
               r"nouvelle\s+adresse",
+              r"adresse\s+officielle\s+disponible",
+              r"nouveau\s+nom\s+de\s+domaine",
               r"url\s+en\s+vigueur",
               r"ouvrir\s+le\s+site",
+              r"acces\s+[a-z0-9.-]+\.[a-z]{2,}",
           ]
 
           found = any(re.search(pattern, normalized) for pattern in patterns)
@@ -347,6 +351,8 @@ jobs:
                   self.links = []
                   self.text = []
                   self.refreshes = []
+                  self.canonicals = []
+                  self.open_graph_urls = []
 
               def handle_starttag(self, tag, attrs):
                   attributes = dict(attrs)
@@ -363,6 +369,17 @@ jobs:
                       and attributes.get("http-equiv", "").lower() == "refresh"
                   ):
                       self.refreshes.append(attributes.get("content", ""))
+
+                  if tag == "link":
+                      rel = set(attributes.get("rel", "").lower().split())
+                      if "canonical" in rel:
+                          self.canonicals.append(attributes.get("href", ""))
+
+                  if tag == "meta" and attributes.get(
+                      "property",
+                      "",
+                  ).lower() == "og:url":
+                      self.open_graph_urls.append(attributes.get("content", ""))
 
               def handle_data(self, data):
                   self.text.append(data)
@@ -404,9 +421,21 @@ jobs:
           preferred_labels = (
               "ouvrir le site",
               "acceder au site",
+              "acces au site",
+              "acces ",
               "visiter le site",
               "continuer vers le site",
+              "nouvelle adresse",
+              "adresse officielle",
           )
+
+          # Les pages d'annonce utilisent souvent leur URL canonique ou og:url
+          # pour déclarer le successeur, même lorsque le texte est rendu en JS.
+          for canonical in parser.canonicals:
+              add_candidate(canonical, 1200)
+
+          for open_graph_url in parser.open_graph_urls:
+              add_candidate(open_graph_url, 1150)
 
           for href, label in parser.links:
               normalized_label = normalize(label)
@@ -420,6 +449,8 @@ jobs:
           for pattern in (
               r"url\s+en\s+vigueur.{0,250}?(https://[a-z0-9.-]+)",
               r"nouvelle\s+adresse.{0,250}?(https://[a-z0-9.-]+)",
+              r"adresse.{0,250}?a\s+change.{0,250}?(https://[a-z0-9.-]+)",
+              r"nouveau\s+nom\s+de\s+domaine.{0,250}?(https://[a-z0-9.-]+)",
           ):
               for match in re.finditer(pattern, visible_text, re.I | re.S):
                   add_candidate(match.group(1), 900)
@@ -501,6 +532,7 @@ jobs:
             local resolved_url=""
             local body_file="$temp_dir/${file//\//_}.html"
             local icon_file="icons/${file%.txt}.png"
+            local icon_page_file="$temp_dir/${file//\//_}.icon.html"
             local -A visited=()
 
             current_url="$(
@@ -568,22 +600,40 @@ jobs:
               return 0
             fi
 
+            if [[ "$resolved_url" == "$current_url" ]]; then
+              echo "$file is already current: $current_url"
+            else
+              printf '%s\n' "$resolved_url" > "$file"
+              echo "$file updated: $current_url -> $resolved_url"
+            fi
+
+            # L'icône est récupérée seulement après résolution complète. Une
+            # nouvelle requête est faite vers le domaine qui vient d'être
+            # confirmé, jamais depuis l'ancienne page d'annonce.
+            if ! fetch_page "$resolved_url" "$icon_page_file"; then
+              echo "::error file=$file::Final icon page could not be reached"
+              return 1
+            fi
+
+            if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
+              echo "::error file=$file::Final icon page returned HTTP $status_code"
+              return 1
+            fi
+
+            if ! icon_effective_origin="$(url_origin "$effective_url")" ||
+               [[ "$icon_effective_origin" != "$resolved_url" ]]; then
+              echo "::error file=$file::Icon request left final origin $resolved_url"
+              return 1
+            fi
+
             python3 scripts/dump_keep_link_icon.py \
-              --page-file "$body_file" \
+              --page-file "$icon_page_file" \
               --page-url "$effective_url" \
               --origin "$resolved_url" \
               --output "$icon_file" \
               --tor-port 9050
 
-            echo "$file icon updated: $icon_file"
-
-            if [[ "$resolved_url" == "$current_url" ]]; then
-              echo "$file is already current: $current_url"
-              return 0
-            fi
-
-            printf '%s\n' "$resolved_url" > "$file"
-            echo "$file updated: $current_url -> $resolved_url"
+            echo "$file icon updated from final origin: $icon_file"
           }
 
           failed=false
