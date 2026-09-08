@@ -691,5 +691,3 @@ jobs:
           git add -- KeepLink*.txt icons/
           git commit -m "chore: update KeepLink redirects and icons"
           git push
-
-```
