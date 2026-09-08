@@ -1,4 +1,4 @@
-name: Update KeepLink redirect
+name: Update KeepLink redirects
 
 on:
   schedule:
@@ -9,35 +9,36 @@ permissions:
   contents: write
 
 concurrency:
-  group: update-keep-link-${{ github.ref }}
+  group: update-keep-links-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  update-link:
+  update-links:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Resolve the current address
-        id: keep-link
+      - name: Resolve all KeepLink files
+        id: keep-links
         shell: bash
         run: |
           set -euo pipefail
 
-          file="KeepLink.txt"
-          if [[ ! -f "$file" ]]; then
-            echo "::error file=$file::KeepLink.txt does not exist"
+          shopt -s nullglob
+          files=(KeepLink*.txt)
+          shopt -u nullglob
+
+          if (( ${#files[@]} == 0 )); then
+            echo "::error::No KeepLink*.txt file was found"
             exit 1
           fi
 
-          current_url="$(awk 'NF { sub(/\r$/, ""); print; exit }' "$file")"
+          temp_dir="$(mktemp -d)"
+          trap 'rm -rf "$temp_dir"' EXIT
 
-          # Extracts "https://host/" from any https:// URL. No domain or
-          # brand restriction here: whether we go looking for a new link at
-          # all is decided purely by the announcement text on the page.
           url_origin() {
             local value="$1"
 
@@ -48,16 +49,9 @@ jobs:
             printf 'https://%s/\n' "${BASH_REMATCH[1],,}"
           }
 
-          if ! current_origin="$(url_origin "$current_url")"; then
-            echo "::error file=$file::KeepLink.txt must contain a valid https:// URL"
-            exit 1
-          fi
-
-          body_file="$(mktemp)"
-          trap 'rm -f "$body_file"' EXIT
-
           fetch_page() {
             local requested_url="$1"
+            local body_file="$2"
             local curl_output
 
             if ! curl_output="$(
@@ -75,6 +69,7 @@ jobs:
                 --proto-redir '=https' \
                 --user-agent 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
                 --header 'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8' \
+                --header 'Accept-Language: fr-FR,fr;q=0.9,en;q=0.7' \
                 --header 'Cache-Control: no-cache' \
                 --output "$body_file" \
                 --write-out $'%{url_effective}\n%{http_code}' \
@@ -87,91 +82,338 @@ jobs:
             status_code="$(sed -n '2p' <<< "$curl_output")"
           }
 
-          resolved_url=""
-          candidate_url="$current_origin"
+          page_announces_move() {
+            local body_file="$1"
 
-          # A page is only ever treated as "announcing a move" if it contains
-          # one of these exact phrases. If it doesn't, the page is treated as
-          # the final, live address and nothing further is followed.
-          for _ in {1..8}; do
-            if ! fetch_page "$candidate_url"; then
-              echo "The current URL could not be reached; KeepLink.txt is unchanged."
-              exit 0
-            fi
+            python3 - "$body_file" <<'PY'
+          import html
+          import re
+          import sys
+          import unicodedata
 
-            if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
-              echo "Final HTTP status is $status_code; KeepLink.txt is unchanged."
-              exit 0
-            fi
+          with open(sys.argv[1], "r", encoding="utf-8", errors="ignore") as file:
+              source = file.read()
 
-            if ! effective_origin="$(url_origin "$effective_url")"; then
-              echo "::warning::The effective URL could not be parsed."
-              exit 0
-            fi
+          source = html.unescape(source)
+          source = source.replace("\\/", "/")
+          source = re.sub(r"\\u002f", "/", source, flags=re.I)
 
-            if ! grep -Eiq \
-              "a changé d'adresse|ancienne adresse n'est plus utilisée|redirection dans [0-9]+s" \
-              "$body_file"; then
-              # No announcement on this page: it's the final, live address.
-              resolved_url="$effective_origin"
-              break
-            fi
+          normalized = unicodedata.normalize("NFKD", source)
+          normalized = "".join(
+              character for character in normalized
+              if not unicodedata.combining(character)
+          ).lower()
 
-            discovered_urls="$(
-              sed \
-                -e 's#\\/#/#g' \
-                -e 's#\\u002[fF]#/#g' \
-                "$body_file" |
-                grep -Eio "https?://[a-z0-9.-]+\.[a-z]{2,}(/[^\"'<>[:space:]]*)?" |
-                awk '!seen[tolower($0)]++' || true
+          patterns = [
+              r"a\s+change\s+d['’]adresse",
+              r"ancienne\s+adresse\s+n['’]est\s+plus\s+utilisee",
+              r"redirection\s+dans\s+[0-9]+\s*s",
+              r"nouvelle\s+adresse",
+              r"url\s+en\s+vigueur",
+              r"ouvrir\s+le\s+site",
+          ]
+
+          found = any(re.search(pattern, normalized) for pattern in patterns)
+          raise SystemExit(0 if found else 1)
+          PY
+          }
+
+          extract_announced_target() {
+            local body_file="$1"
+            local base_url="$2"
+
+            python3 - "$body_file" "$base_url" <<'PY'
+          import html
+          import re
+          import sys
+          import unicodedata
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlparse
+
+          filename = sys.argv[1]
+          base_url = sys.argv[2]
+
+          with open(filename, "r", encoding="utf-8", errors="ignore") as file:
+              source = file.read()
+
+          source = html.unescape(source)
+          source = source.replace("\\/", "/")
+          source = re.sub(r"\\u002f", "/", source, flags=re.I)
+
+          def normalize(value):
+              value = unicodedata.normalize("NFKD", value)
+              value = "".join(
+                  character for character in value
+                  if not unicodedata.combining(character)
+              )
+              return " ".join(value.lower().split())
+
+          class PageParser(HTMLParser):
+              def __init__(self):
+                  super().__init__(convert_charrefs=True)
+                  self.current_link = None
+                  self.links = []
+                  self.text = []
+                  self.refreshes = []
+
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  tag = tag.lower()
+
+                  if tag == "a":
+                      self.current_link = {
+                          "href": attributes.get("href", ""),
+                          "text": [],
+                      }
+
+                  if (
+                      tag == "meta"
+                      and attributes.get("http-equiv", "").lower() == "refresh"
+                  ):
+                      self.refreshes.append(attributes.get("content", ""))
+
+              def handle_data(self, data):
+                  self.text.append(data)
+
+                  if self.current_link is not None:
+                      self.current_link["text"].append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "a" and self.current_link is not None:
+                      self.links.append((
+                          self.current_link["href"],
+                          " ".join(self.current_link["text"]),
+                      ))
+                      self.current_link = None
+
+          parser = PageParser()
+          parser.feed(source)
+
+          candidates = []
+          candidate_index = 0
+
+          def add_candidate(value, priority):
+              global candidate_index
+
+              value = html.unescape(value).strip()
+              value = value.rstrip("\"'<>),.;")
+
+              if not value:
+                  return
+
+              candidates.append((
+                  priority,
+                  candidate_index,
+                  urljoin(base_url, value),
+              ))
+              candidate_index += 1
+
+          # Boutons explicitement destinés à ouvrir la nouvelle adresse.
+          preferred_labels = (
+              "ouvrir le site",
+              "acceder au site",
+              "visiter le site",
+              "continuer vers le site",
+          )
+
+          for href, label in parser.links:
+              normalized_label = normalize(label)
+
+              if any(text in normalized_label for text in preferred_labels):
+                  add_candidate(href, 1000)
+
+          # Adresse écrite après les indications AfterDark.
+          visible_text = " ".join(parser.text)
+
+          for pattern in (
+              r"url\s+en\s+vigueur.{0,250}?(https://[a-z0-9.-]+)",
+              r"nouvelle\s+adresse.{0,250}?(https://[a-z0-9.-]+)",
+          ):
+              for match in re.finditer(pattern, visible_text, re.I | re.S):
+                  add_candidate(match.group(1), 900)
+
+          # Redirections HTML.
+          for refresh in parser.refreshes:
+              match = re.search(r"url\s*=\s*([^;]+)", refresh, re.I)
+
+              if match:
+                  add_candidate(match.group(1), 850)
+
+          # Redirections JavaScript utilisées par certaines anciennes pages.
+          javascript_patterns = (
+              r"(?:window\.)?location(?:\.href)?\s*=\s*['\"](https://[^'\"]+)",
+              r"location\.replace\(\s*['\"](https://[^'\"]+)",
+              r"location\.assign\(\s*['\"](https://[^'\"]+)",
+          )
+
+          for pattern in javascript_patterns:
+              for match in re.finditer(pattern, source, re.I):
+                  add_candidate(match.group(1), 800)
+
+          # Liens HTML ordinaires.
+          for href, _ in parser.links:
+              if href:
+                  add_candidate(href, 500)
+
+          # Dernier recours : toutes les URL HTTPS présentes dans la page.
+          for match in re.finditer(
+              r"https://[a-z0-9.-]+\.[a-z]{2,}(?:/[^\s\"'<>]*)?",
+              source,
+              re.I,
+          ):
+              add_candidate(match.group(0), 100)
+
+          base_host = (urlparse(base_url).hostname or "").lower()
+
+          for _, _, candidate in sorted(
+              candidates,
+              key=lambda item: (-item[0], item[1]),
+          ):
+              parsed = urlparse(candidate)
+
+              if parsed.scheme != "https" or not parsed.hostname:
+                  continue
+
+              candidate_host = parsed.hostname.lower()
+
+              if candidate_host == base_host:
+                  continue
+
+              # Évite les liens sociaux présents sur les pages d'annonce.
+              if candidate_host in {
+                  "t.me",
+                  "telegram.me",
+                  "facebook.com",
+                  "www.facebook.com",
+                  "instagram.com",
+                  "www.instagram.com",
+                  "discord.gg",
+              }:
+                  continue
+
+              port = f":{parsed.port}" if parsed.port else ""
+              print(f"https://{candidate_host}{port}/")
+              sys.exit(0)
+
+          sys.exit(1)
+          PY
+          }
+
+          resolve_file() {
+            local file="$1"
+            local current_url
+            local current_origin
+            local candidate_url
+            local effective_origin
+            local next_url
+            local resolved_url=""
+            local body_file="$temp_dir/${file//\//_}.html"
+            local -A visited=()
+
+            current_url="$(
+              awk 'NF {
+                sub(/\r$/, "")
+                print
+                exit
+              }' "$file"
             )"
 
-            next_url=""
-            while IFS= read -r discovered_url; do
-              [[ -n "$discovered_url" ]] || continue
-
-              if discovered_origin="$(url_origin "${discovered_url,,}")" &&
-                 [[ "$discovered_origin" != "$effective_origin" ]]; then
-                next_url="$discovered_origin"
-                break
-              fi
-            done <<< "$discovered_urls"
-
-            if [[ -z "$next_url" ]]; then
-              echo "The page announces a move but exposes no usable link; KeepLink.txt is unchanged."
-              exit 0
+            if ! current_origin="$(url_origin "$current_url")"; then
+              echo "::error file=$file::$file must contain a valid HTTPS URL"
+              return 1
             fi
 
-            echo "Found a redirect announcement: $effective_origin -> $next_url"
-            candidate_url="$next_url"
+            candidate_url="$current_origin"
+
+            for _ in {1..8}; do
+              if [[ -n "${visited[$candidate_url]+present}" ]]; then
+                echo "::warning file=$file::Redirect loop detected at $candidate_url"
+                return 0
+              fi
+
+              visited["$candidate_url"]=1
+
+              if ! fetch_page "$candidate_url" "$body_file"; then
+                echo "$file: $candidate_url could not be reached; unchanged."
+                return 0
+              fi
+
+              if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
+                echo "$file: HTTP $status_code; unchanged."
+                return 0
+              fi
+
+              if ! effective_origin="$(url_origin "$effective_url")"; then
+                echo "::warning file=$file::Effective URL could not be parsed"
+                return 0
+              fi
+
+              # Une véritable redirection HTTP a déjà été suivie par curl.
+              # Si la page obtenue n'annonce aucun autre déplacement, elle
+              # devient immédiatement l'adresse finale.
+              if ! page_announces_move "$body_file"; then
+                resolved_url="$effective_origin"
+                break
+              fi
+
+              next_url="$(
+                extract_announced_target "$body_file" "$effective_url" ||
+                true
+              )"
+
+              if [[ -z "$next_url" ]]; then
+                echo "$file: move announced but no usable target found; unchanged."
+                return 0
+              fi
+
+              echo "$file: announcement found: $effective_origin -> $next_url"
+              candidate_url="$next_url"
+            done
+
+            if [[ -z "$resolved_url" ]]; then
+              echo "$file: too many consecutive announcements; unchanged."
+              return 0
+            fi
+
+            if [[ "$resolved_url" == "$current_url" ]]; then
+              echo "$file is already current: $current_url"
+              return 0
+            fi
+
+            printf '%s\n' "$resolved_url" > "$file"
+            echo "$file updated: $current_url -> $resolved_url"
+          }
+
+          failed=false
+
+          for file in "${files[@]}"; do
+            echo "Checking $file"
+
+            if ! resolve_file "$file"; then
+              failed=true
+            fi
           done
 
-          if [[ -z "$resolved_url" ]]; then
-            echo "Too many consecutive redirect announcements; KeepLink.txt is unchanged."
-            exit 0
+          if [[ "$failed" == true ]]; then
+            exit 1
           fi
 
-          if [[ "$resolved_url" == "$current_url" ]]; then
-            echo "KeepLink.txt is already current: $current_url"
-            exit 0
+          if git diff --quiet -- "${files[@]}"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-          printf '%s\n' "$resolved_url" > "$file"
-          echo "old_url=$current_url" >> "$GITHUB_OUTPUT"
-          echo "new_url=$resolved_url" >> "$GITHUB_OUTPUT"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-
-      - name: Commit updated URL
-        if: steps.keep-link.outputs.changed == 'true'
+      - name: Commit updated URLs
+        if: steps.keep-links.outputs.changed == 'true'
         shell: bash
-        env:
-          OLD_URL: ${{ steps.keep-link.outputs.old_url }}
-          NEW_URL: ${{ steps.keep-link.outputs.new_url }}
         run: |
           set -euo pipefail
+
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- KeepLink.txt
-          git commit -m "chore: update KeepLink redirect"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- KeepLink*.txt
+          git commit -m "chore: update KeepLink redirects"
           git push
-          echo "Updated $OLD_URL -> $NEW_URL"
