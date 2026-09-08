@@ -67,11 +67,7 @@ jobs:
             sleep 2
           done
 
-          python3 -m pip install \
-            --disable-pip-version-check \
-            curl-cffi \
-            pillow \
-            selenium
+          python3 -m pip install --disable-pip-version-check curl-cffi selenium
 
       - name: Resolve all KeepLink files
         id: keep-links
@@ -118,17 +114,24 @@ jobs:
           from curl_cffi import requests
 
 
-          def looks_like_challenge(content, title=""):
-              text = content.decode("utf-8", errors="ignore").lower()
-              title = title.lower()
-              markers = (
-                  "just a moment",
-                  "checking your browser",
-                  "verify you are human",
-                  "cf-chl-",
-                  "/cdn-cgi/challenge-platform/",
-              )
-              return any(marker in title or marker in text for marker in markers)
+          INTERSTITIAL_MARKERS = (
+              "please wait",
+              "just a moment",
+              "checking your browser",
+              "checking if the site connection is secure",
+              "cf-chl-",
+          )
+
+
+          def page_text(content):
+              if isinstance(content, bytes):
+                  return content.decode("utf-8", errors="ignore").lower()
+              return str(content).lower()
+
+
+          def is_interstitial(content):
+              source = page_text(content)
+              return any(marker in source for marker in INTERSTITIAL_MARKERS)
 
 
           def fetch_with_chrome(url):
@@ -176,20 +179,57 @@ jobs:
                   )
                   driver.get(url)
 
-                  # Allow a JavaScript challenge or client redirect to finish.
-                  deadline = time.monotonic() + 45
+                  # Wait for challenges, meta-refresh pages and JavaScript
+                  # redirect interstitials. A final page must then remain
+                  # stable for two seconds before it is returned.
+                  deadline = time.monotonic() + 40
+                  stable_since = None
+                  previous_url = None
+
                   while time.monotonic() < deadline:
-                      title = driver.title.lower()
-                      content = driver.page_source.encode("utf-8")
-                      if not looks_like_challenge(content, title):
+                      current_url = driver.current_url
+                      source = driver.page_source
+                      normalized_source = source.lower()
+                      challenge = is_interstitial(source)
+                      meta_refresh = driver.execute_script(
+                          "return Boolean(document.querySelector("
+                          "'meta[http-equiv=refresh i]'));"
+                      )
+
+                      waiting_text = any(
+                          marker in normalized_source
+                          for marker in (
+                              "please wait",
+                              "redirecting",
+                              "redirection",
+                          )
+                      )
+                      javascript_redirect = waiting_text and bool(
+                          __import__("re").search(
+                              r"(?:window\.)?location(?:\.href)?\s*=|"
+                              r"location\.(?:replace|assign)\s*\(",
+                              source,
+                              __import__("re").I,
+                          )
+                      )
+
+                      if challenge or meta_refresh or javascript_redirect:
+                          stable_since = None
+                      elif current_url != previous_url:
+                          stable_since = time.monotonic()
+                      elif stable_since is None:
+                          stable_since = time.monotonic()
+                      elif time.monotonic() - stable_since >= 2:
                           break
+
+                      previous_url = current_url
                       time.sleep(1)
 
                   content = driver.page_source.encode("utf-8")
-                  challenge_remaining = looks_like_challenge(
-                      content,
-                      driver.title,
-                  )
+                  if is_interstitial(content):
+                      raise RuntimeError(
+                          "Browser remained on an interstitial page"
+                      )
 
                   status = driver.execute_script(
                       "const nav = performance.getEntriesByType('navigation')[0];"
@@ -197,7 +237,7 @@ jobs:
                   )
                   return (
                       driver.current_url,
-                      403 if challenge_remaining else int(status or 0),
+                      int(status or 200),
                       content,
                   )
               finally:
@@ -240,18 +280,17 @@ jobs:
           requested_url, body_file = sys.argv[1:]
           response = None
 
-          # Try several independent European Tor exits. Stop at the first
-          # response which is not an access denial or temporary server error.
+          # Try several independent European Tor exits. An HTTP 200 challenge
+          # is not a usable response and must not be mistaken for a live site.
           for circuit in range(1, 7):
               candidate = fetch_with_circuit(requested_url, circuit)
               if candidate is None:
                   continue
               response = candidate
               if (
-                  not looks_like_challenge(candidate.content)
-                  and
                   candidate.status_code not in (403, 429)
                   and candidate.status_code < 500
+                  and not is_interstitial(candidate.content)
               ):
                   break
 
@@ -260,7 +299,8 @@ jobs:
 
           if (
               response.status_code in (403, 429)
-              or looks_like_challenge(response.content)
+              or response.status_code >= 500
+              or is_interstitial(response.content)
           ):
               final_url, status_code, content = fetch_with_chrome(requested_url)
               print(
@@ -317,22 +357,46 @@ jobs:
 
           patterns = [
               r"a\s+change\s+d['’]adresse",
-              r"l['’]adresse.{0,120}?a\s+change",
               r"ancienne\s+adresse\s+n['’]est\s+plus\s+utilisee",
               r"redirection\s+dans\s+[0-9]+\s*s",
-              r"redirection.{0,240}?\b(?:vers|sur)\b",
-              r"(?:allez|serez)\s+(?:etre\s+)?redirige",
-              r"acceder\s+(?:a|au|vers)\s+(?:la\s+)?(?:page\s+d['’]accueil|site)",
               r"nouvelle\s+adresse",
-              r"adresse\s+officielle\s+disponible",
-              r"nouveau\s+nom\s+de\s+domaine",
               r"url\s+en\s+vigueur",
               r"ouvrir\s+le\s+site",
-              r"acces\s+[a-z0-9.-]+\.[a-z]{2,}",
+              r"acceder\s+maintenant",
+              r"redirection\s+securisee\s+vers",
           ]
 
           found = any(re.search(pattern, normalized) for pattern in patterns)
           raise SystemExit(0 if found else 1)
+          PY
+          }
+
+          page_is_interstitial() {
+            local body_file="$1"
+
+            python3 - "$body_file" <<'PY'
+          import html
+          import sys
+          import unicodedata
+
+          with open(sys.argv[1], "r", encoding="utf-8", errors="ignore") as file:
+              source = html.unescape(file.read())
+
+          normalized = unicodedata.normalize("NFKD", source)
+          normalized = "".join(
+              character for character in normalized
+              if not unicodedata.combining(character)
+          ).lower()
+
+          markers = (
+              "please wait",
+              "just a moment",
+              "checking your browser",
+              "checking if the site connection is secure",
+              "cf-chl-",
+          )
+
+          raise SystemExit(0 if any(marker in normalized for marker in markers) else 1)
           PY
           }
 
@@ -373,8 +437,6 @@ jobs:
                   self.links = []
                   self.text = []
                   self.refreshes = []
-                  self.canonicals = []
-                  self.open_graph_urls = []
 
               def handle_starttag(self, tag, attrs):
                   attributes = dict(attrs)
@@ -391,17 +453,6 @@ jobs:
                       and attributes.get("http-equiv", "").lower() == "refresh"
                   ):
                       self.refreshes.append(attributes.get("content", ""))
-
-                  if tag == "link":
-                      rel = set(attributes.get("rel", "").lower().split())
-                      if "canonical" in rel:
-                          self.canonicals.append(attributes.get("href", ""))
-
-                  if tag == "meta" and attributes.get(
-                      "property",
-                      "",
-                  ).lower() == "og:url":
-                      self.open_graph_urls.append(attributes.get("content", ""))
 
               def handle_data(self, data):
                   self.text.append(data)
@@ -444,21 +495,9 @@ jobs:
               "ouvrir le site",
               "acceder maintenant",
               "acceder au site",
-              "acces au site",
-              "acces ",
               "visiter le site",
               "continuer vers le site",
-              "nouvelle adresse",
-              "adresse officielle",
           )
-
-          # Les pages d'annonce utilisent souvent leur URL canonique ou og:url
-          # pour déclarer le successeur, même lorsque le texte est rendu en JS.
-          for canonical in parser.canonicals:
-              add_candidate(canonical, 1200)
-
-          for open_graph_url in parser.open_graph_urls:
-              add_candidate(open_graph_url, 1150)
 
           for href, label in parser.links:
               normalized_label = normalize(label)
@@ -472,8 +511,6 @@ jobs:
           for pattern in (
               r"url\s+en\s+vigueur.{0,250}?(https://[a-z0-9.-]+)",
               r"nouvelle\s+adresse.{0,250}?(https://[a-z0-9.-]+)",
-              r"adresse.{0,250}?a\s+change.{0,250}?(https://[a-z0-9.-]+)",
-              r"nouveau\s+nom\s+de\s+domaine.{0,250}?(https://[a-z0-9.-]+)",
           ):
               for match in re.finditer(pattern, visible_text, re.I | re.S):
                   add_candidate(match.group(1), 900)
@@ -490,7 +527,6 @@ jobs:
               r"(?:window\.)?location(?:\.href)?\s*=\s*['\"](https://[^'\"]+)",
               r"location\.replace\(\s*['\"](https://[^'\"]+)",
               r"location\.assign\(\s*['\"](https://[^'\"]+)",
-              r"window\.open\(\s*['\"](https://[^'\"]+)['\"]",
           )
 
           for pattern in javascript_patterns:
@@ -555,8 +591,6 @@ jobs:
             local next_url
             local resolved_url=""
             local body_file="$temp_dir/${file//\//_}.html"
-            local icon_file="icons/${file%.txt}.png"
-            local icon_page_file="$temp_dir/${file//\//_}.icon.html"
             local -A visited=()
 
             current_url="$(
@@ -589,6 +623,11 @@ jobs:
 
               if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
                 echo "$file: HTTP $status_code; unchanged."
+                return 0
+              fi
+
+              if page_is_interstitial "$body_file"; then
+                echo "$file: unresolved verification page; unchanged."
                 return 0
               fi
 
@@ -626,38 +665,11 @@ jobs:
 
             if [[ "$resolved_url" == "$current_url" ]]; then
               echo "$file is already current: $current_url"
-            else
-              printf '%s\n' "$resolved_url" > "$file"
-              echo "$file updated: $current_url -> $resolved_url"
+              return 0
             fi
 
-            # L'icône est récupérée seulement après résolution complète. Une
-            # nouvelle requête est faite vers le domaine qui vient d'être
-            # confirmé, jamais depuis l'ancienne page d'annonce.
-            if ! fetch_page "$resolved_url" "$icon_page_file"; then
-              echo "::error file=$file::Final icon page could not be reached"
-              return 1
-            fi
-
-            if [[ ! "$status_code" =~ ^2[0-9][0-9]$ ]]; then
-              echo "::error file=$file::Final icon page returned HTTP $status_code"
-              return 1
-            fi
-
-            if ! icon_effective_origin="$(url_origin "$effective_url")" ||
-               [[ "$icon_effective_origin" != "$resolved_url" ]]; then
-              echo "::error file=$file::Icon request left final origin $resolved_url"
-              return 1
-            fi
-
-            python3 scripts/dump_keep_link_icon.py \
-              --page-file "$icon_page_file" \
-              --page-url "$effective_url" \
-              --origin "$resolved_url" \
-              --output "$icon_file" \
-              --tor-port 9050
-
-            echo "$file icon updated from final origin: $icon_file"
+            printf '%s\n' "$resolved_url" > "$file"
+            echo "$file updated: $current_url -> $resolved_url"
           }
 
           failed=false
@@ -674,13 +686,13 @@ jobs:
             exit 1
           fi
 
-          if [[ -z "$(git status --porcelain -- "${files[@]}" icons/)" ]]; then
+          if git diff --quiet -- "${files[@]}"; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit updated URLs and icons
+      - name: Commit updated URLs
         if: steps.keep-links.outputs.changed == 'true'
         shell: bash
         run: |
@@ -690,6 +702,6 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -- KeepLink*.txt icons/
-          git commit -m "chore: update KeepLink redirects and icons"
+          git add -- KeepLink*.txt
+          git commit -m "chore: update KeepLink redirects"
           git push
