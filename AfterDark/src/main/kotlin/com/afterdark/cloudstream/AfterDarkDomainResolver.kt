@@ -27,10 +27,21 @@ internal class AfterDarkDomainResolver {
 
             resolveWithClassicHttp()?.let { origin ->
                 cachedOrigin = origin
-                Log.i(TAG, "Domaine AfterDark obtenu par HTTP classique : $origin")
+                Log.i(TAG, "Domaine AfterDark obtenu depuis cherishmylove.space : $origin")
                 return@withLock origin
             }
 
+            Log.w(
+                TAG,
+                "cherishmylove.space invalide ou indisponible, essai de KeepLink2.txt",
+            )
+            resolveFromKeepLink()?.let { origin ->
+                cachedOrigin = origin
+                Log.i(TAG, "Domaine AfterDark obtenu depuis KeepLink2.txt : $origin")
+                return@withLock origin
+            }
+
+            Log.w(TAG, "KeepLink2.txt invalide ou indisponible")
             null
         }
     }
@@ -53,6 +64,39 @@ internal class AfterDarkDomainResolver {
         }
 
         val candidate = extractCurrentOrigin(source.text) ?: return null
+        return validateWithClassicHttp(candidate)
+    }
+
+    /**
+     * Fallback equivalent to Frembed's KeepLink path: read the first valid
+     * HTTPS origin published in KeepLink2.txt, then validate the actual site
+     * before accepting or caching it. Nothing is persisted on the device.
+     */
+    private suspend fun resolveFromKeepLink(): String? {
+        val response = runCatching {
+            app.get(
+                url = KEEP_LINK_URL,
+                headers = mapOf(
+                    "Accept" to "text/plain",
+                    "User-Agent" to SOURCE_HEADERS["User-Agent"].orEmpty(),
+                ),
+                cacheTime = 0,
+                timeout = KEEP_LINK_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(TAG, "Lecture de KeepLink2.txt impossible", error)
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        val candidate = response.text
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .mapNotNull(::normalizeOrigin)
+            .firstOrNull()
+            ?: return null
+
         return validateWithClassicHttp(candidate)
     }
 
@@ -91,7 +135,11 @@ internal class AfterDarkDomainResolver {
         const val SOURCE_ORIGIN = "https://cherishmylove.space"
         const val SOURCE_URL = "$SOURCE_ORIGIN/"
         const val SOURCE_HOST = "cherishmylove.space"
+        const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
+        const val KEEP_LINK_URL =
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink2.txt"
         const val CLASSIC_TIMEOUT_SECONDS = 15L
+        const val KEEP_LINK_TIMEOUT_SECONDS = 8L
         const val TAG = "AfterDarkResolver"
 
         val SOURCE_HEADERS = mapOf(
