@@ -26,15 +26,22 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends tor
+          sudo apt-get install \
+            --yes \
+            --no-install-recommends \
+            tor \
+            tor-geoipdb
 
-          sudo tee /etc/tor/torrc.d/keep-link.conf > /dev/null <<'TORRC'
+          sudo tee --append /etc/tor/torrc > /dev/null <<'TORRC'
+
+          # KeepLink resolver proxy
           SocksPort 9050 IsolateSOCKSAuth
           ExitNodes {fr},{be},{ch},{lu},{de},{nl},{es},{it}
           StrictNodes 1
           AvoidDiskWrites 1
           TORRC
 
+          sudo tor --verify-config --hush -f /etc/tor/torrc
           sudo systemctl restart tor@default
 
           for attempt in {1..30}; do
