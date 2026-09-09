@@ -27,6 +27,7 @@ import com.lagradost.nicehttp.Session
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.json.JSONArray
 import org.json.JSONObject
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -471,16 +472,11 @@ class XalaflixProvider : MainAPI() {
         }
         if (currentSeasonId != null && currentSeasonNumber != null) options[currentSeasonId] = currentSeasonNumber
 
-        // Livewire et son cookie de session ne sont pas fiables quand plusieurs
-        // mutations du même composant sont envoyées en parallèle.
-        val pages = ArrayList<Pair<Int, Document>>()
-        for ((seasonId, seasonNumber) in options) {
-            if (seasonId == currentSeasonId) continue
-            loadSeasonPage(origin, referer, csrf, snapshot, seasonId)?.let {
-                Log.i(LOG_TAG, "Saison Livewire id=$seasonId saison=$seasonNumber épisodes=${parseSiteEpisodes(it, origin).size}")
-                pages += seasonNumber to it
-            }
-        }
+        // Le serveur invalide parfois les mutations successives du même composant
+        // et répond alors {"components":[]}. Livewire accepte nativement plusieurs
+        // composants dans une même requête : un seul POST récupère toutes les saisons.
+        val requestedSeasons = options.filterKeys { it != currentSeasonId }
+        val pages = loadSeasonPages(origin, referer, csrf, snapshot, requestedSeasons)
         Log.i(LOG_TAG, "Livewire saisons demandées=${options.size} chargées=${pages.size + 1}")
         val merged = LinkedHashMap<String, SiteEpisode>()
         parseSiteEpisodes(document, origin).forEach { merged[it.path] = it }
@@ -490,16 +486,19 @@ class XalaflixProvider : MainAPI() {
         return merged.values.sortedWith(compareBy<SiteEpisode> { it.season }.thenBy { it.episode })
     }
 
-    private suspend fun loadSeasonPage(
+    private suspend fun loadSeasonPages(
         origin: String,
         referer: String,
         csrf: String,
         snapshot: String,
-        seasonId: String,
-    ): Document? {
-        val call = mapOf("path" to "", "method" to "updateSeason", "params" to listOf(seasonId))
-        val component = mapOf("snapshot" to snapshot, "updates" to emptyMap<String, String>(), "calls" to listOf(call))
-        val payload = mapOf("_token" to csrf, "components" to listOf(component))
+        seasons: Map<String, Int>,
+    ): List<Pair<Int, Document>> {
+        if (seasons.isEmpty()) return emptyList()
+        val components = seasons.keys.map { seasonId ->
+            val call = mapOf("path" to "", "method" to "updateSeason", "params" to listOf(seasonId))
+            mapOf("snapshot" to snapshot, "updates" to emptyMap<String, String>(), "calls" to listOf(call))
+        }
+        val payload = mapOf("_token" to csrf, "components" to components)
         val response = runCatching {
             siteSession.post(
                 "$origin/livewire/update",
@@ -513,20 +512,40 @@ class XalaflixProvider : MainAPI() {
                 ),
                 referer = referer,
                 cacheTime = 0,
-                timeout = 25L,
+                timeout = 45L,
             )
-        }.onFailure { Log.w(LOG_TAG, "Saison Livewire impossible id=$seasonId", it) }.getOrNull() ?: return null
+        }.onFailure { Log.w(LOG_TAG, "Saisons Livewire impossibles ids=${seasons.keys.joinToString()}", it) }
+            .getOrNull() ?: return emptyList()
         if (response.okhttpResponse.code !in 200..299) {
-            Log.w(LOG_TAG, "Saison Livewire id=$seasonId HTTP=${response.okhttpResponse.code}")
-            return null
+            Log.w(LOG_TAG, "Saisons Livewire HTTP=${response.okhttpResponse.code}")
+            return emptyList()
         }
-        val html = runCatching {
-            JSONObject(response.text).getJSONArray("components").getJSONObject(0)
-                .getJSONObject("effects").getString("html")
-        }.onFailure {
-            Log.w(LOG_TAG, "Réponse Livewire illisible id=$seasonId aperçu='${preview(response.text)}'", it)
-        }.getOrNull()?.takeIf(String::isNotBlank) ?: return null
-        return Jsoup.parseBodyFragment(html, "$origin/")
+        val responseComponents = runCatching { JSONObject(response.text).optJSONArray("components") }
+            .onFailure { Log.w(LOG_TAG, "Réponse Livewire illisible aperçu='${preview(response.text)}'", it) }
+            .getOrNull()
+        if (responseComponents == null || responseComponents.length() == 0) {
+            Log.w(LOG_TAG, "Réponse Livewire vide aperçu='${preview(response.text)}'")
+            return emptyList()
+        }
+        val pages = ArrayList<Pair<Int, Document>>()
+        for (index in 0 until responseComponents.length()) {
+            val component = responseComponents.optJSONObject(index) ?: continue
+            val returnedSnapshot = component.optString("snapshot")
+            val data = runCatching { JSONObject(returnedSnapshot).optJSONObject("data") }.getOrNull()
+            val seasonId = livewireScalar(data?.opt("seasonId"))
+            val seasonNumber = livewireScalar(data?.opt("season_number"))?.toIntOrNull()
+                ?: seasonId?.let(seasons::get)
+                ?: continue
+            val html = component.optJSONObject("effects")?.optString("html")
+                ?.takeIf(String::isNotBlank) ?: continue
+            val seasonDocument = Jsoup.parseBodyFragment(html, "$origin/")
+            Log.i(
+                LOG_TAG,
+                "Saison Livewire id=${seasonId ?: "?"} saison=$seasonNumber épisodes=${parseSiteEpisodes(seasonDocument, origin).size}",
+            )
+            pages += seasonNumber to seasonDocument
+        }
+        return pages
     }
 
     private fun livewireScalar(value: Any?): String? = when (value) {
@@ -575,7 +594,8 @@ class XalaflixProvider : MainAPI() {
 
     private fun extractPlayers(doc: Document, origin: String): List<Pair<String, String>> {
         val result = LinkedHashMap<String, Pair<String, String>>()
-        doc.select("iframe[src], video[src], source[src], [data-src], [data-url], [data-link], [data-embed], a[href]").forEach { element ->
+        extractSnapshotPlayers(doc, origin).forEach { result[it.second] = it }
+        doc.select("iframe[src], video[src], source[src], [data-src]:not(img), [data-url], [data-link], [data-embed]").forEach { element ->
             val raw = listOf("src", "data-src", "data-url", "data-link", "data-embed", "href")
                 .map { element.attr(it) }.firstOrNull(String::isNotBlank) ?: return@forEach
             val url = absolute(raw, origin) ?: return@forEach
@@ -583,16 +603,17 @@ class XalaflixProvider : MainAPI() {
             val label = element.attr("title").ifBlank { element.text() }.ifBlank { URI(url).host ?: "Lecteur" }
             result[url] = label to url
         }
-        URL_IN_SCRIPT.findAll(doc.html()).forEach { match ->
+        val normalizedHtml = doc.html().replace("\\/", "/")
+        URL_IN_SCRIPT.findAll(normalizedHtml).forEach { match ->
             val url = cleanUrl(match.value)
-            if (!url.contains("xalaflix.", true) || DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url)) {
-                result[url] = "Lecteur" to url
+            if (DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url) || isInternalEmbed(url, origin)) {
+                result.putIfAbsent(url, "Lecteur" to url)
             }
         }
-        SCRIPT_LINK.findAll(doc.html()).forEach { match ->
-            absolute(cleanUrl(match.groupValues[1]), origin)?.let { result[it] = "Lecteur" to it }
+        SCRIPT_LINK.findAll(normalizedHtml).forEach { match ->
+            absolute(cleanUrl(match.groupValues[1]), origin)?.let { result.putIfAbsent(it, "Lecteur" to it) }
         }
-        RELATIVE_EMBED.findAll(doc.html()).forEach { match ->
+        RELATIVE_EMBED.findAll(normalizedHtml).forEach { match ->
             absolute(cleanUrl(match.value), origin)?.let { result[it] = "Lecteur interne" to it }
         }
         Log.i(LOG_TAG, "Lecteurs intégrés trouvés=${result.size}")
@@ -602,6 +623,43 @@ class XalaflixProvider : MainAPI() {
             .distinct().take(50).toList()
         Log.i(LOG_TAG, "Routes dynamiques=${dynamicRoutes.joinToString(" | ")}")
         return result.values.toList()
+    }
+
+    private fun extractSnapshotPlayers(doc: Document, origin: String): List<Pair<String, String>> {
+        val result = LinkedHashMap<String, Pair<String, String>>()
+        doc.getAllElements().asSequence()
+            .map { it.attr("wire:snapshot") }
+            .filter { it.contains("watch-component") }
+            .forEach { snapshot ->
+                val data = runCatching { JSONObject(snapshot).optJSONObject("data") }.getOrNull() ?: return@forEach
+                collectSnapshotPlayers(data, origin, result)
+            }
+        return result.values.toList()
+    }
+
+    private fun collectSnapshotPlayers(
+        value: Any?,
+        origin: String,
+        result: LinkedHashMap<String, Pair<String, String>>,
+    ) {
+        when (value) {
+            is JSONObject -> {
+                val rawLink = value.optString("link").takeIf(String::isNotBlank)
+                val url = rawLink?.let { absolute(cleanUrl(it), origin) }
+                if (url != null && url.startsWith("http") && detailPath(url) == null) {
+                    val label = listOf(
+                        value.optString("server_name"),
+                        value.optString("label"),
+                        value.optString("version"),
+                    ).filter(String::isNotBlank).distinct().joinToString(" · ").ifBlank { "Lecteur" }
+                    result[url] = label to url
+                }
+                value.keys().forEach { key -> collectSnapshotPlayers(value.opt(key), origin, result) }
+            }
+            is JSONArray -> for (index in 0 until value.length()) {
+                collectSnapshotPlayers(value.opt(index), origin, result)
+            }
+        }
     }
 
     private fun safeRoute(raw: String): String? = runCatching {
