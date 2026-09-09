@@ -144,7 +144,7 @@ class XalaflixProvider : MainAPI() {
         }
         Log.i(LOG_TAG, "Série saisons=${siteEpisodes.map { it.season }.distinct().size} épisodes=${siteEpisodes.size}")
         val episodes = enrichedEpisodes.map { item ->
-            newEpisode(Playback(item.path, null).encode()) {
+            newEpisode(item.path) {
                 name = item.title
                 season = item.season
                 episode = item.episode
@@ -168,7 +168,12 @@ class XalaflixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        val playback = Playback.decode(data) ?: return false
+        val playback = Playback.decode(data)
+        if (playback == null) {
+            Log.w(LOG_TAG, "Lecture refusée : données d'épisode invalides taille=${data.length}")
+            return false
+        }
+        Log.i(LOG_TAG, "Lecture demandée path=${playback.path}")
         // Même garde que load(): résolution obligatoire avant toute lecture.
         val loaded = fetchWithRefresh(playback.path) ?: return false
         val referer = "${loaded.origin}${playback.path}"
@@ -472,11 +477,19 @@ class XalaflixProvider : MainAPI() {
         }
         if (currentSeasonId != null && currentSeasonNumber != null) options[currentSeasonId] = currentSeasonNumber
 
-        // Le serveur invalide parfois les mutations successives du même composant
-        // et répond alors {"components":[]}. Livewire accepte nativement plusieurs
-        // composants dans une même requête : un seul POST récupère toutes les saisons.
-        val requestedSeasons = options.filterKeys { it != currentSeasonId }
-        val pages = loadSeasonPages(origin, referer, csrf, snapshot, requestedSeasons)
+        // Chaque mutation Livewire renvoie un nouveau snapshot du composant. Le
+        // snapshot précédent ne doit pas être réutilisé pour la mutation suivante,
+        // sinon le serveur finit par répondre {"components":[]}.
+        val pages = ArrayList<Pair<Int, Document>>()
+        var activeSnapshot = snapshot
+        for ((seasonId, seasonNumber) in options) {
+            if (seasonId == currentSeasonId) continue
+            val page = loadSeasonPage(origin, referer, csrf, activeSnapshot, seasonId) ?: continue
+            activeSnapshot = page.snapshot
+            val episodeCount = parseSiteEpisodes(page.document, origin).size
+            Log.i(LOG_TAG, "Saison Livewire id=$seasonId saison=$seasonNumber épisodes=$episodeCount")
+            pages += seasonNumber to page.document
+        }
         Log.i(LOG_TAG, "Livewire saisons demandées=${options.size} chargées=${pages.size + 1}")
         val merged = LinkedHashMap<String, SiteEpisode>()
         parseSiteEpisodes(document, origin).forEach { merged[it.path] = it }
@@ -486,19 +499,18 @@ class XalaflixProvider : MainAPI() {
         return merged.values.sortedWith(compareBy<SiteEpisode> { it.season }.thenBy { it.episode })
     }
 
-    private suspend fun loadSeasonPages(
+    private data class LivewireSeasonPage(val document: Document, val snapshot: String)
+
+    private suspend fun loadSeasonPage(
         origin: String,
         referer: String,
         csrf: String,
         snapshot: String,
-        seasons: Map<String, Int>,
-    ): List<Pair<Int, Document>> {
-        if (seasons.isEmpty()) return emptyList()
-        val components = seasons.keys.map { seasonId ->
-            val call = mapOf("path" to "", "method" to "updateSeason", "params" to listOf(seasonId))
-            mapOf("snapshot" to snapshot, "updates" to emptyMap<String, String>(), "calls" to listOf(call))
-        }
-        val payload = mapOf("_token" to csrf, "components" to components)
+        seasonId: String,
+    ): LivewireSeasonPage? {
+        val call = mapOf("path" to "", "method" to "updateSeason", "params" to listOf(seasonId))
+        val component = mapOf("snapshot" to snapshot, "updates" to emptyMap<String, String>(), "calls" to listOf(call))
+        val payload = mapOf("_token" to csrf, "components" to listOf(component))
         val response = runCatching {
             siteSession.post(
                 "$origin/livewire/update",
@@ -514,38 +526,24 @@ class XalaflixProvider : MainAPI() {
                 cacheTime = 0,
                 timeout = 45L,
             )
-        }.onFailure { Log.w(LOG_TAG, "Saisons Livewire impossibles ids=${seasons.keys.joinToString()}", it) }
-            .getOrNull() ?: return emptyList()
+        }.onFailure { Log.w(LOG_TAG, "Saison Livewire impossible id=$seasonId", it) }
+            .getOrNull() ?: return null
         if (response.okhttpResponse.code !in 200..299) {
-            Log.w(LOG_TAG, "Saisons Livewire HTTP=${response.okhttpResponse.code}")
-            return emptyList()
+            Log.w(LOG_TAG, "Saison Livewire id=$seasonId HTTP=${response.okhttpResponse.code}")
+            return null
         }
         val responseComponents = runCatching { JSONObject(response.text).optJSONArray("components") }
-            .onFailure { Log.w(LOG_TAG, "Réponse Livewire illisible aperçu='${preview(response.text)}'", it) }
+            .onFailure { Log.w(LOG_TAG, "Réponse Livewire illisible id=$seasonId aperçu='${preview(response.text)}'", it) }
             .getOrNull()
         if (responseComponents == null || responseComponents.length() == 0) {
-            Log.w(LOG_TAG, "Réponse Livewire vide aperçu='${preview(response.text)}'")
-            return emptyList()
+            Log.w(LOG_TAG, "Réponse Livewire vide id=$seasonId aperçu='${preview(response.text)}'")
+            return null
         }
-        val pages = ArrayList<Pair<Int, Document>>()
-        for (index in 0 until responseComponents.length()) {
-            val component = responseComponents.optJSONObject(index) ?: continue
-            val returnedSnapshot = component.optString("snapshot")
-            val data = runCatching { JSONObject(returnedSnapshot).optJSONObject("data") }.getOrNull()
-            val seasonId = livewireScalar(data?.opt("seasonId"))
-            val seasonNumber = livewireScalar(data?.opt("season_number"))?.toIntOrNull()
-                ?: seasonId?.let(seasons::get)
-                ?: continue
-            val html = component.optJSONObject("effects")?.optString("html")
-                ?.takeIf(String::isNotBlank) ?: continue
-            val seasonDocument = Jsoup.parseBodyFragment(html, "$origin/")
-            Log.i(
-                LOG_TAG,
-                "Saison Livewire id=${seasonId ?: "?"} saison=$seasonNumber épisodes=${parseSiteEpisodes(seasonDocument, origin).size}",
-            )
-            pages += seasonNumber to seasonDocument
-        }
-        return pages
+        val returnedComponent = responseComponents.optJSONObject(0) ?: return null
+        val returnedSnapshot = returnedComponent.optString("snapshot").takeIf(String::isNotBlank) ?: return null
+        val html = returnedComponent.optJSONObject("effects")?.optString("html")
+            ?.takeIf(String::isNotBlank) ?: return null
+        return LivewireSeasonPage(Jsoup.parseBodyFragment(html, "$origin/"), returnedSnapshot)
     }
 
     private fun livewireScalar(value: Any?): String? = when (value) {
@@ -634,6 +632,7 @@ class XalaflixProvider : MainAPI() {
                 val data = runCatching { JSONObject(snapshot).optJSONObject("data") }.getOrNull() ?: return@forEach
                 collectSnapshotPlayers(data, origin, result)
             }
+        Log.i(LOG_TAG, "Lecteurs snapshot trouvés=${result.size}")
         return result.values.toList()
     }
 
