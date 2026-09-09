@@ -151,7 +151,11 @@ class XalaflixProvider : MainAPI() {
         // Même garde que load(): résolution obligatoire avant toute lecture.
         val loaded = fetchWithRefresh(playback.path) ?: return false
         val referer = "${loaded.origin}${playback.path}"
-        val mediaId = playback.mediaId ?: findMediaId(loaded.document, referer) ?: return false
+        val mediaId = playback.mediaId ?: findMediaId(loaded.document, referer)
+        if (mediaId == null) {
+            Log.i(LOG_TAG, "Lecture sans mediaId : extraction directe de la fiche ${playback.path}")
+            return extractAndEmit(loaded.document, loaded.origin, referer, subtitleCallback, callback)
+        }
         val playableId = playback.episodeId
             ?: loadMovieEpisodeId(loaded.origin, mediaId, referer)
             ?: return extractAndEmit(loaded.document, loaded.origin, referer, subtitleCallback, callback)
@@ -366,17 +370,21 @@ class XalaflixProvider : MainAPI() {
 
     private fun extractPlayers(doc: Document, origin: String): List<Pair<String, String>> {
         val result = LinkedHashMap<String, Pair<String, String>>()
-        doc.select("iframe[src], video[src], source[src], [data-src], [data-url], a[href]").forEach { element ->
-            val raw = listOf("src", "data-src", "data-url", "href").map { element.attr(it) }.firstOrNull(String::isNotBlank) ?: return@forEach
+        doc.select("iframe[src], video[src], source[src], [data-src], [data-url], [data-link], [data-embed], a[href]").forEach { element ->
+            val raw = listOf("src", "data-src", "data-url", "data-link", "data-embed", "href")
+                .map { element.attr(it) }.firstOrNull(String::isNotBlank) ?: return@forEach
             val url = absolute(raw, origin) ?: return@forEach
             if (!url.startsWith("http") || detailPath(url) != null) return@forEach
             val label = element.attr("title").ifBlank { element.text() }.ifBlank { URI(url).host ?: "Lecteur" }
             result[url] = label to url
         }
         URL_IN_SCRIPT.findAll(doc.html()).forEach { match ->
-            val url = match.value.replace("\\/", "/")
-            if (DIRECT_MEDIA.containsMatchIn(url)) result[url] = "Direct" to url
+            val url = match.value.replace("\\/", "/").replace("&amp;", "&")
+            if (!url.contains("xalaflix.", true) || DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url)) {
+                result[url] = "Lecteur" to url
+            }
         }
+        Log.i(LOG_TAG, "Lecteurs intégrés trouvés=${result.size}")
         return result.values.toList()
     }
 
@@ -433,6 +441,7 @@ class XalaflixProvider : MainAPI() {
         private val SEASON = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+)")
         private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
+        private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
     }
 }
