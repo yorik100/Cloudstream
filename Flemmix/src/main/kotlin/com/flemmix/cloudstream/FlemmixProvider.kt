@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.nicehttp.Session
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
@@ -173,17 +174,48 @@ class FlemmixProvider : MainAPI() {
         origin: String,
         query: String,
     ): List<SearchResponse>? {
+        // DLE lie le jeton de recherche aux cookies créés en chargeant la
+        // page d'accueil. Une Session est donc indispensable : deux appels
+        // via l'objet global `app` peuvent utiliser des contextes différents.
+        val session = Session(app.baseClient)
+        val home = runCatching {
+            session.get(
+                url = "$origin/",
+                headers = browserHeaders,
+                cacheTime = 0,
+                timeout = PAGE_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(SEARCH_TAG, "Initialisation de la session impossible sur $origin", error)
+        }.getOrNull() ?: return null
+
+        if (home.okhttpResponse.code !in 200..299) {
+            Log.w(SEARCH_TAG, "Accueil de recherche sur $origin : HTTP ${home.okhttpResponse.code}")
+            return null
+        }
+
+        val userHash = DLE_LOGIN_HASH_REGEX.find(home.text)?.groupValues?.getOrNull(1)
+        val skin = DLE_SKIN_REGEX.find(home.text)?.groupValues?.getOrNull(1)
+        if (userHash.isNullOrBlank() || skin.isNullOrBlank()) {
+            Log.w(
+                SEARCH_TAG,
+                "Paramètres DLE absents sur $origin ; taille accueil=${home.text.length}",
+            )
+            return null
+        }
+
         val response = runCatching {
-            app.post(
-                url = "$origin/index.php?do=search&subaction=search",
+            session.post(
+                url = "$origin/index.php?controller=ajax&mod=search",
                 data = mapOf(
-                    "do" to "search",
-                    "subaction" to "search",
-                    "story" to query,
+                    "query" to query,
+                    "skin" to skin,
+                    "user_hash" to userHash,
                 ),
                 headers = browserHeaders + mapOf(
-                    "Content-Type" to "application/x-www-form-urlencoded",
+                    "Accept" to "text/html, */*; q=0.01",
                     "Origin" to origin,
+                    "X-Requested-With" to "XMLHttpRequest",
                 ),
                 referer = "$origin/",
                 cacheTime = 0,
@@ -202,7 +234,7 @@ class FlemmixProvider : MainAPI() {
             .filter(String::isNotBlank)
         if (queryTerms.isEmpty()) return emptyList()
 
-        val results = parseItems(response.text, origin, null)
+        val results = parseSearchSuggestions(response.text, origin)
             .filter { item ->
                 sequenceOf(item.response.name, item.originalTitle)
                     .filterNotNull()
@@ -216,19 +248,55 @@ class FlemmixProvider : MainAPI() {
             .take(MAX_SEARCH_RESULTS)
 
         if (results.isEmpty()) {
-            val finalUrl = response.okhttpResponse.request.url
-            val pageTitle = HTML_TITLE_REGEX.find(response.text)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.let(::plainText)
-                .orEmpty()
             Log.w(
                 SEARCH_TAG,
-                "Aucune carte pour '$query' ; URL=$finalUrl, titre='$pageTitle', " +
-                    "taille=${response.text.length}",
+                "Aucune suggestion pour '$query' ; URL=${response.okhttpResponse.request.url}, " +
+                    "taille=${response.text.length}, aperçu='${plainText(response.text).take(100)}'",
             )
         }
         return results
+    }
+
+    private fun parseSearchSuggestions(html: String, origin: String): List<ParsedItem> {
+        val results = LinkedHashMap<String, ParsedItem>()
+
+        for (anchor in ANCHOR_REGEX.findAll(html)) {
+            val openingTag = anchor.value.substringBefore('>')
+            if (!FAST_SEARCH_CLASS_REGEX.containsMatchIn(openingTag)) continue
+
+            val rawHref = decodeHtml(anchor.groupValues[1]).trim()
+            val absolute = resolveUrl("$origin/", rawHref) ?: continue
+            val uri = runCatching { URI(absolute) }.getOrNull() ?: continue
+            val path = uri.path ?: continue
+            val pathMatch = DETAIL_PATH_REGEX.matchEntire(path) ?: continue
+            val type = typeFromPath(pathMatch.groupValues[1])
+            val body = anchor.groupValues[2]
+            val title = FAST_SEARCH_TITLE_REGEX.find(body)?.groupValues?.getOrNull(1)
+                ?.let(::plainText)
+                ?.takeIf(String::isNotBlank)
+                ?: continue
+            val imageTag = IMAGE_REGEX.find(body)?.value
+            val posterUrl = imageTag
+                ?.let { image ->
+                    sequenceOf("src", "data-src", "data-lazy-src")
+                        .mapNotNull { attribute(image, it) }
+                        .firstOrNull(String::isNotBlank)
+                }
+                ?.let { resolveUrl("$origin/", decodeHtml(it)) }
+            val itemUrl = "$origin$path"
+            val result = if (type == "movie") {
+                newMovieSearchResponse(title, itemUrl, TvType.Movie) {
+                    this.posterUrl = posterUrl
+                }
+            } else {
+                newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) {
+                    this.posterUrl = posterUrl
+                }
+            }
+            results.putIfAbsent("$type:$path", ParsedItem(result, null))
+        }
+
+        return results.values.toList()
     }
 
     private fun parseItems(
@@ -794,9 +862,21 @@ class FlemmixProvider : MainAPI() {
             """href=[\"']([^\"']*/page/([0-9]+)/?)[\"']""",
             RegexOption.IGNORE_CASE,
         )
-        val HTML_TITLE_REGEX = Regex(
-            """<title\b[^>]*>(.*?)</title>""",
+        val FAST_SEARCH_CLASS_REGEX = Regex(
+            """\bclass\s*=\s*[\"'][^\"']*\bfsr-wrap\b[^\"']*[\"']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val FAST_SEARCH_TITLE_REGEX = Regex(
+            """<span\b[^>]*class=[\"'][^\"']*\bfsr-title\b[^\"']*[\"'][^>]*>(.*?)</span>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val DLE_LOGIN_HASH_REGEX = Regex(
+            """\bdle_login_hash\s*=\s*[\"']([^\"']+)[\"']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val DLE_SKIN_REGEX = Regex(
+            """\bdle_skin\s*=\s*[\"']([^\"']+)[\"']""",
+            RegexOption.IGNORE_CASE,
         )
         val DETAIL_TITLE_REGEX = Regex(
             """<h1\b[^>]*itemprop=[\"']name[\"'][^>]*>(.*?)</h1>""",
