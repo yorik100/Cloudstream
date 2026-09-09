@@ -174,14 +174,17 @@ class FlemmixProvider : MainAPI() {
         query: String,
     ): List<SearchResponse>? {
         val response = runCatching {
-            app.get(
-                url = "$origin/index.php",
-                params = mapOf(
+            app.post(
+                url = "$origin/index.php?do=search&subaction=search",
+                data = mapOf(
                     "do" to "search",
                     "subaction" to "search",
                     "story" to query,
                 ),
-                headers = browserHeaders,
+                headers = browserHeaders + mapOf(
+                    "Content-Type" to "application/x-www-form-urlencoded",
+                    "Origin" to origin,
+                ),
                 referer = "$origin/",
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
@@ -194,16 +197,12 @@ class FlemmixProvider : MainAPI() {
             Log.w(SEARCH_TAG, "Recherche sur $origin : HTTP ${response.okhttpResponse.code}")
             return null
         }
-        if (!SEARCH_PAGE_REGEX.containsMatchIn(response.text)) {
-            Log.w(SEARCH_TAG, "La réponse de recherche sur $origin n'est pas une page de résultats")
-            return null
-        }
         val queryTerms = normalizeForMatch(query)
             .split(' ')
             .filter(String::isNotBlank)
         if (queryTerms.isEmpty()) return emptyList()
 
-        return parseItems(response.text, origin, null)
+        val results = parseItems(response.text, origin, null)
             .filter { item ->
                 sequenceOf(item.response.name, item.originalTitle)
                     .filterNotNull()
@@ -215,6 +214,21 @@ class FlemmixProvider : MainAPI() {
             .map { it.response }
             .distinctBy { it.url }
             .take(MAX_SEARCH_RESULTS)
+
+        if (results.isEmpty()) {
+            val finalUrl = response.okhttpResponse.request.url
+            val pageTitle = HTML_TITLE_REGEX.find(response.text)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.let(::plainText)
+                .orEmpty()
+            Log.w(
+                SEARCH_TAG,
+                "Aucune carte pour '$query' ; URL=$finalUrl, titre='$pageTitle', " +
+                    "taille=${response.text.length}",
+            )
+        }
+        return results
     }
 
     private fun parseItems(
@@ -780,9 +794,9 @@ class FlemmixProvider : MainAPI() {
             """href=[\"']([^\"']*/page/([0-9]+)/?)[\"']""",
             RegexOption.IGNORE_CASE,
         )
-        val SEARCH_PAGE_REGEX = Regex(
-            """<form\b[^>]*(?:id|name)\s*=\s*[\"']fullsearch[\"']""",
-            RegexOption.IGNORE_CASE,
+        val HTML_TITLE_REGEX = Regex(
+            """<title\b[^>]*>(.*?)</title>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
         val DETAIL_TITLE_REGEX = Regex(
             """<h1\b[^>]*itemprop=[\"']name[\"'][^>]*>(.*?)</h1>""",
