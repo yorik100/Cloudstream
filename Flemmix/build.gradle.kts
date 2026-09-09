@@ -1,6 +1,6 @@
 import com.lagradost.cloudstream3.gradle.tasks.GenerateManifestTask
 
-version = 19
+version = 20
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -13,7 +13,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "Flemmix/Wiflix - catalogue réel et résolution neufneuf.space puis KeepLink3"
+    description = "Flemmix/Wiflix - lecteur natif"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
