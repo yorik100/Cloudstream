@@ -300,7 +300,7 @@ class FlemmixProvider : MainAPI() {
         val ajaxBlocked = response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)
         if (results.isEmpty() && (navigationBlocked || ajaxBlocked)) {
             Log.i(SEARCH_TAG, "Bot Shield détecté, recherche WebView en arrière-plan")
-            val browserHtml = FlemmixSearchWebView.load(origin, query)
+            val browserHtml = FlemmixSearchWebViewV16.load(origin, query)
             val browserResults = browserHtml?.let {
                 filterSearchItems(parseItems(it, origin, null), queryTerms)
             }.orEmpty()
@@ -1000,7 +1000,7 @@ class FlemmixProvider : MainAPI() {
     }
 }
 
-object FlemmixSearchWebView {
+object FlemmixSearchWebViewV16 {
     private const val TIMEOUT_MS = 25_000L
     private const val POLL_INTERVAL_MS = 500L
 
@@ -1038,7 +1038,7 @@ object FlemmixSearchWebView {
 
             timeout = Runnable { finish(null) }
             handler.post {
-                val activity = FlemmixRuntime.currentActivity()
+                val activity = FlemmixRuntimeV16.currentActivity()
                 if (activity == null || activity.isFinishing) {
                     finish(null)
                     return@post

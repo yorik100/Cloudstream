@@ -16,7 +16,7 @@ class FlemmixPlugin : Plugin() {
     private val discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun load(context: Context) {
-        FlemmixRuntime.init(context)
+        FlemmixRuntimeV16.init(context)
         val provider = FlemmixProvider()
         registerMainAPI(provider)
 
@@ -26,7 +26,7 @@ class FlemmixPlugin : Plugin() {
     }
 }
 
-object FlemmixRuntime {
+object FlemmixRuntimeV16 {
     private var contextRef: WeakReference<Context>? = null
 
     fun init(context: Context) {
