@@ -204,6 +204,54 @@ class FlemmixProvider : MainAPI() {
             return null
         }
 
+        val queryTerms = normalizeForMatch(query)
+            .split(' ')
+            .filter(String::isNotBlank)
+        if (queryTerms.isEmpty()) return emptyList()
+
+        // La recherche complète est une navigation normale acceptée par le
+        // site. Contrairement au contrôleur AJAX, elle ne renvoie pas
+        // systématiquement "Bot shield active." aux clients non-WebView.
+        val navigationResponse = runCatching {
+            session.get(
+                url = "$origin/index.php?do=search&subaction=search&story=${encode(query)}",
+                headers = browserHeaders + mapOf(
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "same-origin",
+                    "Sec-Fetch-User" to "?1",
+                    "Upgrade-Insecure-Requests" to "1",
+                ),
+                referer = "$origin/",
+                cacheTime = 0,
+                timeout = PAGE_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(SEARCH_TAG, "Navigation de recherche impossible sur $origin", error)
+        }.getOrNull()
+
+        if (navigationResponse != null && navigationResponse.okhttpResponse.code in 200..299) {
+            val navigationResults = filterSearchItems(
+                parseItems(navigationResponse.text, origin, null),
+                queryTerms,
+            )
+            if (navigationResults.isNotEmpty()) return navigationResults
+
+            Log.w(
+                SEARCH_TAG,
+                "Navigation sans résultat pour '$query' ; " +
+                    "taille=${navigationResponse.text.length}, " +
+                    "aperçu='${plainText(navigationResponse.text).take(100)}'",
+            )
+        } else if (navigationResponse != null) {
+            Log.w(
+                SEARCH_TAG,
+                "Navigation de recherche sur $origin : HTTP ${navigationResponse.okhttpResponse.code}",
+            )
+        }
+
+        // Second essai : autocomplétion DLE. Certains déploiements l'acceptent
+        // encore, d'autres la protègent explicitement avec Bot Shield.
         val response = runCatching {
             session.post(
                 url = "$origin/index.php?controller=ajax&mod=search",
@@ -229,12 +277,26 @@ class FlemmixProvider : MainAPI() {
             Log.w(SEARCH_TAG, "Recherche sur $origin : HTTP ${response.okhttpResponse.code}")
             return null
         }
-        val queryTerms = normalizeForMatch(query)
-            .split(' ')
-            .filter(String::isNotBlank)
-        if (queryTerms.isEmpty()) return emptyList()
+        val results = filterSearchItems(
+            parseSearchSuggestions(response.text, origin),
+            queryTerms,
+        )
 
-        val results = parseSearchSuggestions(response.text, origin)
+        if (results.isEmpty()) {
+            Log.w(
+                SEARCH_TAG,
+                "Aucune suggestion pour '$query' ; URL=${response.okhttpResponse.request.url}, " +
+                    "taille=${response.text.length}, aperçu='${plainText(response.text).take(100)}'",
+            )
+        }
+        return results
+    }
+
+    private fun filterSearchItems(
+        items: List<ParsedItem>,
+        queryTerms: List<String>,
+    ): List<SearchResponse> =
+        items
             .filter { item ->
                 sequenceOf(item.response.name, item.originalTitle)
                     .filterNotNull()
@@ -246,16 +308,6 @@ class FlemmixProvider : MainAPI() {
             .map { it.response }
             .distinctBy { it.url }
             .take(MAX_SEARCH_RESULTS)
-
-        if (results.isEmpty()) {
-            Log.w(
-                SEARCH_TAG,
-                "Aucune suggestion pour '$query' ; URL=${response.okhttpResponse.request.url}, " +
-                    "taille=${response.text.length}, aperçu='${plainText(response.text).take(100)}'",
-            )
-        }
-        return results
-    }
 
     private fun parseSearchSuggestions(html: String, origin: String): List<ParsedItem> {
         val results = LinkedHashMap<String, ParsedItem>()
