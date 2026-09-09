@@ -1012,6 +1012,8 @@ object FlemmixSearchWebViewV16 {
             var webView: WebView? = null
             var searchStarted = false
             var pollingStarted = false
+            var lastHtml: String? = null
+            var lastUrl: String? = null
 
             val searchUrl = Uri.parse("$origin/index.php").buildUpon()
                 .appendQueryParameter("do", "search")
@@ -1036,7 +1038,14 @@ object FlemmixSearchWebViewV16 {
                 continuation.resume(html)
             }
 
-            timeout = Runnable { finish(null) }
+            timeout = Runnable {
+                Log.w(
+                    "FlemmixSearchWebView",
+                    "Expiration WebView ; URL=${lastUrl.orEmpty()}, taille=${lastHtml?.length ?: 0}, " +
+                        "aperçu='${lastHtml?.let { Regex("<[^>]+>").replace(it, " ") }?.take(100).orEmpty()}'",
+                )
+                finish(lastHtml)
+            }
             handler.post {
                 val activity = FlemmixRuntimeV16.currentActivity()
                 if (activity == null || activity.isFinishing) {
@@ -1052,12 +1061,11 @@ object FlemmixSearchWebViewV16 {
                         alpha = 0.01f
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
-                        settings.userAgentString =
-                            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
-                                "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
                         webViewClient = object : WebViewClient() {
                             override fun onPageFinished(view: WebView, url: String) {
                                 if (finished.get() || url == "about:blank") return
+                                lastUrl = url
+                                Log.i("FlemmixSearchWebView", "Page terminée : $url")
 
                                 if (!searchStarted) {
                                     searchStarted = true
@@ -1081,6 +1089,7 @@ object FlemmixSearchWebViewV16 {
                                         val html = runCatching {
                                             JSONTokener(encoded).nextValue() as? String
                                         }.getOrNull()
+                                        if (!html.isNullOrBlank()) lastHtml = html
                                         val hasCards = html?.contains("mov-t", ignoreCase = true) == true
                                         if (hasCards && html.length > 500) {
                                             finish(html)
