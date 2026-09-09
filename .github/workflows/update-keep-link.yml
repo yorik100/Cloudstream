@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Resolver revision: explicit-route-following-v6"
+          echo "Resolver revision: explicit-onclick-v7"
 
           shopt -s nullglob
           files=(KeepLink*.txt)
@@ -566,7 +566,9 @@ jobs:
               def __init__(self):
                   super().__init__(convert_charrefs=True)
                   self.current_link = None
+                  self.current_clickable = None
                   self.links = []
+                  self.clickables = []
                   self.text = []
                   self.refreshes = []
 
@@ -577,6 +579,14 @@ jobs:
                   if tag == "a":
                       self.current_link = {
                           "href": attributes.get("href", ""),
+                          "text": [],
+                      }
+
+                  onclick = attributes.get("onclick", "")
+                  if onclick and self.current_clickable is None:
+                      self.current_clickable = {
+                          "tag": tag,
+                          "onclick": onclick,
                           "text": [],
                       }
 
@@ -592,6 +602,9 @@ jobs:
                   if self.current_link is not None:
                       self.current_link["text"].append(data)
 
+                  if self.current_clickable is not None:
+                      self.current_clickable["text"].append(data)
+
               def handle_endtag(self, tag):
                   if tag.lower() == "a" and self.current_link is not None:
                       self.links.append((
@@ -600,6 +613,16 @@ jobs:
                       ))
                       self.current_link = None
 
+                  if (
+                      self.current_clickable is not None
+                      and tag.lower() == self.current_clickable["tag"]
+                  ):
+                      self.clickables.append((
+                          self.current_clickable["onclick"],
+                          " ".join(self.current_clickable["text"]),
+                      ))
+                      self.current_clickable = None
+
           parser = PageParser()
           parser.feed(source)
 
@@ -607,6 +630,7 @@ jobs:
           candidate_index = 0
           allowed_sources = {
               "explicit_cta",
+              "explicit_onclick",
               "announced_address",
               "meta_refresh",
               "javascript_redirect",
@@ -636,7 +660,6 @@ jobs:
               "ouvrir le site",
               "acceder maintenant",
               "acceder a la page d'accueil",
-              "acceder a la page d’accueil",
               "acceder au site",
               "visiter le site",
               "continuer vers le site",
@@ -647,6 +670,28 @@ jobs:
 
               if any(text in normalized_label for text in preferred_labels):
                   add_candidate(href, 1000, "explicit_cta")
+
+          # Certains boutons sont des <div onclick="window.open(...)" plutôt
+          # que des liens. Ils ne sont acceptés que si leur texte correspond
+          # à un libellé explicite de redirection reconnu ci-dessus.
+          for onclick, label in parser.clickables:
+              normalized_label = normalize(label)
+              if not any(
+                  text in normalized_label for text in preferred_labels
+              ):
+                  continue
+
+              match = re.search(
+                  r"(?:window\.)?open\(\s*(['\"])(.*?)\1",
+                  onclick,
+                  re.I | re.S,
+              )
+              if match:
+                  add_candidate(
+                      match.group(2),
+                      1000,
+                      "explicit_onclick",
+                  )
 
           # Adresse écrite après les indications AfterDark.
           visible_text = " ".join(parser.text)
@@ -677,7 +722,7 @@ jobs:
                   add_candidate(match.group(1), 800, "javascript_redirect")
 
           # No fallback over ordinary links or arbitrary HTTPS URLs. Only the
-          # four explicit redirect sources above are eligible.
+          # explicit redirect sources above are eligible.
           base_parsed = urlparse(base_url)
           base_host = (base_parsed.hostname or "").lower()
           base_port = f":{base_parsed.port}" if base_parsed.port else ""
