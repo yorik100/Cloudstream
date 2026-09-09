@@ -385,8 +385,19 @@ class XalaflixProvider : MainAPI() {
             }
         }
         Log.i(LOG_TAG, "Lecteurs intégrés trouvés=${result.size}")
+        Log.i(LOG_TAG, "Candidats=${result.keys.mapNotNull(::safeRoute).distinct().take(50).joinToString(" | ")}")
+        val dynamicRoutes = DYNAMIC_ROUTE.findAll(doc.html())
+            .map { it.value.replace("\\/", "/").replace("&amp;", "&").substringBefore('?') }
+            .distinct().take(50).toList()
+        Log.i(LOG_TAG, "Routes dynamiques=${dynamicRoutes.joinToString(" | ")}")
         return result.values.toList()
     }
+
+    private fun safeRoute(raw: String): String? = runCatching {
+        val uri = URI(raw)
+        val host = uri.host ?: return@runCatching null
+        "$host${uri.path.orEmpty()}"
+    }.getOrNull()
 
     private fun imageUrl(image: Element, origin: String): String? = absolute(
         sequenceOf("data-src", "data-original", "data-lazy-src", "src").map { image.attr(it) }.firstOrNull(String::isNotBlank),
@@ -443,5 +454,8 @@ class XalaflixProvider : MainAPI() {
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
+        private val DYNAMIC_ROUTE = Regex(
+            "(?i)(?:https?://[^\\s\\\"'<>]+|/[a-z0-9_./-]*(?:ajax|api|embed|episode|server|source|watch|player)[a-z0-9_./?=&-]*)",
+        )
     }
 }
