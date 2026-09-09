@@ -1,4 +1,4 @@
-version = 23
+version = 24
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -11,7 +11,7 @@ dependencies {
 }
 
 cloudstream {
-    description = "Frembed - résolution config main/backup, KeepLink puis crt.sh"
+    description = "Frembed - lecteur natif"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
