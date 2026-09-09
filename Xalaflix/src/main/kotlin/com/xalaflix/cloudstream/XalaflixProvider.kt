@@ -198,7 +198,38 @@ class XalaflixProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         var emitted = false
-        for ((_, url) in extractPlayers(document, origin)) {
+        val firstLevel = extractPlayers(document, origin)
+        val players = LinkedHashMap<String, Pair<String, String>>()
+        firstLevel.forEach { players[it.second] = it }
+        for ((_, url) in firstLevel) {
+            if (isInternalEmbed(url, origin)) {
+                val response = runCatching {
+                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
+                }.onFailure { Log.w(LOG_TAG, "Lecteur interne inaccessible ${safeRoute(url)}", it) }.getOrNull()
+                if (response != null && response.okhttpResponse.code in 200..299) {
+                    val embedDocument = Jsoup.parse(response.text, url)
+                    val nested = extractPlayers(embedDocument, origin)
+                    Log.i(LOG_TAG, "Lecteur interne ${safeRoute(url)} HTTP=${response.okhttpResponse.code} sources=${nested.size}")
+                    nested.forEach { players[it.second] = it }
+                }
+            }
+        }
+        for ((label, url) in players.values) {
+            if (DIRECT_MEDIA.containsMatchIn(url)) {
+                callback(newExtractorLink(
+                    source = name,
+                    name = "Xalaflix · $label",
+                    url = url,
+                    type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                ) {
+                    this.referer = referer
+                    quality = getQualityFromName(label)
+                    headers = this@XalaflixProvider.headers
+                })
+                emitted = true
+                continue
+            }
+            if (isInternalEmbed(url, origin)) continue
             runCatching {
                 loadExtractor(url, referer, subtitleCallback) { emitted = true; callback(it) }
             }
@@ -379,10 +410,13 @@ class XalaflixProvider : MainAPI() {
             result[url] = label to url
         }
         URL_IN_SCRIPT.findAll(doc.html()).forEach { match ->
-            val url = match.value.replace("\\/", "/").replace("&amp;", "&")
+            val url = cleanUrl(match.value)
             if (!url.contains("xalaflix.", true) || DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url)) {
                 result[url] = "Lecteur" to url
             }
+        }
+        RELATIVE_EMBED.findAll(doc.html()).forEach { match ->
+            absolute(cleanUrl(match.value), origin)?.let { result[it] = "Lecteur interne" to it }
         }
         Log.i(LOG_TAG, "Lecteurs intégrés trouvés=${result.size}")
         Log.i(LOG_TAG, "Candidats=${result.keys.mapNotNull(::safeRoute).distinct().take(50).joinToString(" | ")}")
@@ -398,6 +432,18 @@ class XalaflixProvider : MainAPI() {
         val host = uri.host ?: return@runCatching null
         "$host${uri.path.orEmpty()}"
     }.getOrNull()
+
+    private fun isInternalEmbed(raw: String, origin: String): Boolean = runCatching {
+        val uri = URI(raw)
+        uri.host.equals(URI(origin).host, true) && uri.path.orEmpty().contains("/embed-", true)
+    }.getOrDefault(false)
+
+    private fun cleanUrl(raw: String): String = raw
+        .replace("\\/", "/")
+        .replace("&amp;", "&")
+        .substringBefore("&quot;")
+        .substringBefore("&#")
+        .trim('"', '\'', ' ')
 
     private fun imageUrl(image: Element, origin: String): String? = absolute(
         sequenceOf("data-src", "data-original", "data-lazy-src", "src").map { image.attr(it) }.firstOrNull(String::isNotBlank),
@@ -454,6 +500,7 @@ class XalaflixProvider : MainAPI() {
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
+        private val RELATIVE_EMBED = Regex("(?i)/embed-[a-z0-9_-]+\\.html")
         private val DYNAMIC_ROUTE = Regex(
             "(?i)(?:https?://[^\\s\\\"'<>]+|/[a-z0-9_./-]*(?:ajax|api|embed|episode|server|source|watch|player)[a-z0-9_./?=&-]*)",
         )
