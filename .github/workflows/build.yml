@@ -39,9 +39,9 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Build AfterDark, Frembed and Flemmix
+      - name: Build AfterDark, Frembed, Flemmix and Xalaflix
         run: |
-          gradle :AfterDark:make :Frembed:make :Flemmix:make makePluginsJson --stacktrace
+          gradle :AfterDark:make :Frembed:make :Flemmix:make :Xalaflix:make makePluginsJson --stacktrace
 
           python3 - <<'PY'
           import json
@@ -68,18 +68,18 @@ jobs:
           rm -rf /tmp/cloudstream-publish
           mkdir -p /tmp/cloudstream-publish
 
-          find AfterDark/build Frembed/build Flemmix/build -maxdepth 1 -type f -name '*.cs3' \
+          find AfterDark/build Frembed/build Flemmix/build Xalaflix/build -maxdepth 1 -type f -name '*.cs3' \
             -exec cp -v {} /tmp/cloudstream-publish/ \;
 
-          find AfterDark/build Frembed/build Flemmix/build -maxdepth 1 -type f -name '*.jar' \
+          find AfterDark/build Frembed/build Flemmix/build Xalaflix/build -maxdepth 1 -type f -name '*.jar' \
             -exec cp -v {} /tmp/cloudstream-publish/ \;
 
           cp -v build/plugins.json /tmp/cloudstream-publish/plugins.json
           cp -v repo.json /tmp/cloudstream-publish/repo.json
 
           CS3_COUNT="$(find /tmp/cloudstream-publish -maxdepth 1 -type f -name '*.cs3' | wc -l)"
-          if [ "$CS3_COUNT" -lt 3 ]; then
-            echo "ERROR: expected at least 3 .cs3 files, found $CS3_COUNT"
+          if [ "$CS3_COUNT" -lt 4 ]; then
+            echo "ERROR: expected at least 4 .cs3 files, found $CS3_COUNT"
             find /tmp/cloudstream-publish -maxdepth 1 -type f -print
             exit 1
           fi
