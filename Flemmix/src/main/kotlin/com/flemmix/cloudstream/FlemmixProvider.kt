@@ -420,13 +420,40 @@ class FlemmixProvider : MainAPI() {
                 }
                 ?.let { resolveUrl("$origin/", decodeHtml(it)) }
 
+            // Pour les séries, le lien "mov-t" ne contient que le nom de la
+            // série (ex. "Futurama") : le numéro de saison est affiché à
+            // part, dans un <span class="block-sai"> situé juste après la
+            // fermeture du <a>, pas dans son texte. On va le chercher dans
+            // le HTML qui suit immédiatement le lien.
+            val seasonSuffix = if (type == "tv") {
+                val lookahead = html.substring(
+                    anchor.range.last + 1,
+                    minOf(html.length, anchor.range.last + 1 + SEASON_LOOKAHEAD_SIZE),
+                )
+                BLOCK_SAI_REGEX.find(lookahead)
+                    ?.groupValues?.getOrNull(1)
+                    ?.let(::plainText)
+                    ?.let { SEASON_IN_TITLE_REGEX.find(it) }
+                    ?.groupValues?.getOrNull(1)
+                    ?.let { "Saison $it" }
+            } else {
+                null
+            }
+            val displayTitle = if (seasonSuffix != null &&
+                !title.contains(seasonSuffix, ignoreCase = true)
+            ) {
+                "$title - $seasonSuffix"
+            } else {
+                title
+            }
+
             val itemUrl = "$origin$path"
             val response = if (type == "movie") {
-                newMovieSearchResponse(title, itemUrl, TvType.Movie) {
+                newMovieSearchResponse(displayTitle, itemUrl, TvType.Movie) {
                     this.posterUrl = posterUrl
                 }
             } else {
-                newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) {
+                newTvSeriesSearchResponse(displayTitle, itemUrl, TvType.TvSeries) {
                     this.posterUrl = posterUrl
                 }
             }
@@ -921,6 +948,7 @@ class FlemmixProvider : MainAPI() {
         const val DETAIL_CACHE_SECONDS = 120
         const val TMDB_CACHE_SECONDS = 3600
         const val ITEM_CONTEXT_SIZE = 2500
+        const val SEASON_LOOKAHEAD_SIZE = 400
         const val MAX_SEARCH_RESULTS = 40
         const val MINIMUM_TMDB_SCORE = 70
         const val BOT_SHIELD_TEXT = "Bot shield active."
@@ -940,6 +968,10 @@ class FlemmixProvider : MainAPI() {
         )
         val TITLE0_REGEX = Regex(
             """<span\b[^>]*class=[\"'][^\"']*title0[^\"']*[\"'][^>]*>(.*?)</span>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val BLOCK_SAI_REGEX = Regex(
+            """<span\b[^>]*class=[\"'][^\"']*\bblock-sai\b[^\"']*[\"'][^>]*>(.*?)</span>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
         val PAGE_LINK_REGEX = Regex(
