@@ -1,7 +1,7 @@
 package com.xalaflix.cloudstream
 
-import android.util.Log
 import android.util.Base64
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -23,15 +23,15 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import org.jsoup.nodes.Element
-import org.json.JSONObject
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import org.json.JSONArray
+import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 import java.net.URI
-import java.net.URLEncoder
 
 class XalaflixProvider : MainAPI() {
     override var mainUrl = XalaflixDomainResolver.REGISTRY_ORIGIN
@@ -63,16 +63,12 @@ class XalaflixProvider : MainAPI() {
         return origin
     }
 
-    private data class Page(val document: Document, val origin: String)
-    private data class Playback(val path: String, val mediaId: String?, val episodeId: String? = null) {
-        fun encode(): String = listOf(path, mediaId.orEmpty(), episodeId.orEmpty()).joinToString("\n")
+    /** data pour loadLinks = chemin /movie/... | /tv-show/... | /episode/... */
+    private data class Playback(val path: String) {
+        fun encode(): String = path
         companion object {
-            fun decode(raw: String): Playback? {
-                val parts = raw.split('\n', limit = 3)
-                val path = parts.firstOrNull()?.takeIf { it.startsWith('/') } ?: return null
-                val mediaId = parts.getOrNull(1)?.takeIf(String::isNotBlank)
-                return Playback(path, mediaId, parts.getOrNull(2)?.takeIf(String::isNotBlank))
-            }
+            fun decode(raw: String): Playback? =
+                raw.trim().takeIf { it.startsWith('/') }?.let { Playback(it) }
         }
     }
 
@@ -87,7 +83,6 @@ class XalaflixProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        // Aucun appel de recherche n'est effectué avant la résolution.
         val origin = resolver.resolvedOriginOrNull() ?: runCatching { ensureDomain() }.getOrNull() ?: return emptyList()
         mainUrl = origin
         val route = "/search/${query.trim().replace(Regex("\\s+"), "-")}"
@@ -101,26 +96,30 @@ class XalaflixProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val path = detailPath(url) ?: throw ErrorLoadingException("URL Xalaflix invalide")
-        // Une fiche ouverte depuis l'historique déclenche elle aussi la résolution.
+        val path = contentPath(url) ?: throw ErrorLoadingException("URL Xalaflix invalide")
         val loaded = fetchWithRefresh(path) ?: throw ErrorLoadingException("Fiche Xalaflix inaccessible")
         val doc = loaded.document
-        val type = if (path.startsWith("/tv-show/")) TvType.TvSeries else TvType.Movie
+        val origin = loaded.origin
+        val type = when {
+            path.startsWith("/tv-show/") || path.startsWith("/episode/") -> TvType.TvSeries
+            else -> TvType.Movie
+        }
         val title = doc.selectFirst("h1, .detail_page-infor h2, .heading-name")?.text()?.trim()
             ?: doc.title().substringBefore(" Streaming").trim().takeIf(String::isNotBlank)
             ?: throw ErrorLoadingException("Titre Xalaflix introuvable")
-        val poster = absolute(doc.selectFirst(".detail_page-infor img, .film-poster-img, .movie-poster img, img[src*=image.tmdb]")?.absUrl("src"), loaded.origin)
+        val poster = absolute(
+            doc.selectFirst(".detail_page-infor img, .film-poster-img, .movie-poster img, img[src*=image.tmdb]")?.absUrl("src"),
+            origin,
+        )
         val plot = doc.selectFirst(
             "h1 ~ p.text-gray-400.mt-3, .flex-1 > p.text-gray-400.mt-3, " +
                 ".description, .detail_page-infor .description, .film-description, [class*=overview]",
         )?.text()?.trim()?.takeIf(String::isNotBlank)
         val year = YEAR.find(doc.text())?.value?.toIntOrNull()
         val tags = doc.select("a[href*=/genre/]").map { it.text().trim() }.filter(String::isNotBlank).distinct()
-        val mediaId = findMediaId(doc, url)
-        Log.i(LOG_TAG, "Fiche type=$type path=$path mediaId=${mediaId ?: "absent"}")
 
         if (type == TvType.Movie) {
-            return newMovieLoadResponse(title, url, type, Playback(path, mediaId).encode()) {
+            return newMovieLoadResponse(title, url, type, Playback(path).encode()) {
                 posterUrl = poster
                 this.plot = plot
                 this.year = year
@@ -128,22 +127,9 @@ class XalaflixProvider : MainAPI() {
             }
         }
 
-        val siteEpisodes = parseSiteEpisodes(doc, loaded.origin)
-        val enrichedEpisodes = coroutineScope {
-            siteEpisodes.map { item ->
-                async { enrichEpisode(item, loaded.origin) }
-            }.awaitAll()
-        }
-        val episodes = enrichedEpisodes.map { item ->
-            newEpisode(Playback(item.path, null).encode()) {
-                name = item.title
-                season = item.season
-                episode = item.episode
-                posterUrl = item.poster
-                description = item.description
-            }
-        }
+        val episodes = loadAllSeriesEpisodes(doc, origin, path)
         if (episodes.isEmpty()) throw ErrorLoadingException("Aucun épisode Xalaflix disponible")
+        Log.i(LOG_TAG, "Épisodes chargés=${episodes.size} saisons=${episodes.mapNotNull { it.season }.distinct().sorted()}")
 
         return newTvSeriesLoadResponse(title, url, type, episodes) {
             posterUrl = poster
@@ -160,108 +146,366 @@ class XalaflixProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         val playback = Playback.decode(data) ?: return false
-        // Même garde que load(): résolution obligatoire avant toute lecture.
         val loaded = fetchWithRefresh(playback.path) ?: return false
         val referer = "${loaded.origin}${playback.path}"
-        val mediaId = playback.mediaId ?: findMediaId(loaded.document, referer)
-        if (mediaId == null) {
-            Log.i(LOG_TAG, "Lecture sans mediaId : extraction directe de la fiche ${playback.path}")
-            return extractAndEmit(loaded.document, loaded.origin, referer, subtitleCallback, callback)
-        }
-        val playableId = playback.episodeId
-            ?: loadMovieEpisodeId(loaded.origin, mediaId, referer)
-            ?: return extractAndEmit(loaded.document, loaded.origin, referer, subtitleCallback, callback)
-        Log.i(LOG_TAG, "Lecture path=${playback.path} mediaId=$mediaId playableId=$playableId")
-        val urls = loadServerSources(loaded.origin, playableId, referer).ifEmpty {
-            extractPlayers(loaded.document, loaded.origin)
-        }
-        Log.i(LOG_TAG, "Sources trouvées=${urls.size}")
-        var emitted = false
-        for ((label, playerUrl) in urls.distinctBy { it.second }) {
-            if (DIRECT_MEDIA.containsMatchIn(playerUrl)) {
-                callback(newExtractorLink(
-                    source = name,
-                    name = "Xalaflix · $label",
-                    url = playerUrl,
-                    type = if (playerUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = referer
-                    quality = getQualityFromName(label)
-                    headers = this@XalaflixProvider.headers
-                })
-                emitted = true
-            } else runCatching {
-                loadExtractor(
-                    url = playerUrl,
-                    referer = referer,
-                    subtitleCallback = subtitleCallback,
-                    callback = { emitted = true; callback(it) },
-                )
+        val html = loaded.document.html()
+        Log.i(LOG_TAG, "Lecture path=${playback.path} html=${html.length}")
+
+        val urls = LinkedHashMap<String, Pair<String, String>>()
+        extractVideosFromWatchSnapshot(html).forEach { (label, link) -> urls[link] = label to link }
+        // Repli regex global "link":"https://..."
+        LINK_JSON.findAll(html).forEach { m ->
+            val link = cleanUrl(m.groupValues[1])
+            if (link.startsWith("http") && contentPath(link) == null) {
+                urls.putIfAbsent(link, "Lecteur" to link)
             }
         }
+        extractPlayers(loaded.document, loaded.origin).forEach { (label, link) ->
+            if (link.startsWith("http") && !link.contains("iframeSrc", true)) {
+                urls.putIfAbsent(link, label to link)
+            }
+        }
+        Log.i(LOG_TAG, "Sources brutes=${urls.size} : ${urls.keys.take(8).joinToString()}")
+
+        var emitted = false
+        for ((label, playerUrl) in urls.values) {
+            try {
+                when {
+                    DIRECT_MEDIA.containsMatchIn(playerUrl) -> {
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "Xalaflix · $label",
+                                url = playerUrl,
+                                type = if (playerUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                            ) {
+                                this.referer = referer
+                                quality = getQualityFromName(label)
+                                headers = this@XalaflixProvider.headers
+                            },
+                        )
+                        emitted = true
+                    }
+                    isVidzyEmbed(playerUrl) -> {
+                        val mediaUrl = resolveVidzy(playerUrl, referer)
+                        if (mediaUrl != null) {
+                            callback(
+                                newExtractorLink(
+                                    source = name,
+                                    name = "Xalaflix · $label",
+                                    url = mediaUrl,
+                                    type = if (mediaUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                                ) {
+                                    this.referer = playerUrl
+                                    quality = getQualityFromName(label)
+                                    headers = this@XalaflixProvider.headers
+                                },
+                            )
+                            emitted = true
+                        } else {
+                            loadExtractor(playerUrl, referer, subtitleCallback) { emitted = true; callback(it) }
+                        }
+                    }
+                    else -> {
+                        loadExtractor(playerUrl, referer, subtitleCallback) { emitted = true; callback(it) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(LOG_TAG, "Source échouée $label $playerUrl", e)
+            }
+        }
+        Log.i(LOG_TAG, "Sources émises=$emitted")
         return emitted
     }
 
-    private suspend fun extractAndEmit(
-        document: Document,
+    // -------------------------------------------------------------------------
+    // Saisons / épisodes (Livewire updateSeason)
+    // -------------------------------------------------------------------------
+
+    private data class SeasonEntry(val id: String, val number: Int)
+    private data class SiteEpisode(
+        val path: String,
+        val season: Int,
+        val episode: Int,
+        val title: String,
+        val poster: String? = null,
+    )
+
+    private suspend fun loadAllSeriesEpisodes(
+        doc: Document,
         origin: String,
-        referer: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit,
-    ): Boolean {
-        var emitted = false
-        val firstLevel = extractPlayers(document, origin)
-        val players = LinkedHashMap<String, Pair<String, String>>()
-        val mediaReferers = HashMap<String, String>()
-        firstLevel.forEach { players[it.second] = it }
-        for ((_, url) in firstLevel) {
-            if (isInternalEmbed(url, origin)) {
-                val response = runCatching {
-                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
-                }.onFailure { Log.w(LOG_TAG, "Lecteur interne inaccessible ${safeRoute(url)}", it) }.getOrNull()
-                if (response != null && response.okhttpResponse.code in 200..299) {
-                    val embedDocument = Jsoup.parse(response.text, url)
-                    val nested = extractPlayers(embedDocument, origin)
-                    Log.i(LOG_TAG, "Lecteur interne ${safeRoute(url)} HTTP=${response.okhttpResponse.code} sources=${nested.size}")
-                    nested.forEach { players[it.second] = it }
+        seriesPath: String,
+    ): List<com.lagradost.cloudstream3.Episode> {
+        val seasons = parseSeasonEntries(doc.html())
+        Log.i(LOG_TAG, "Saisons=${seasons.joinToString { "${it.number}:${it.id}" }}")
+
+        val byKey = LinkedHashMap<String, SiteEpisode>()
+        parseSiteEpisodes(doc, origin).forEach { byKey[it.path] = it }
+
+        val csrf = CSRF_META.find(doc.html())?.groupValues?.getOrNull(1)
+            ?: doc.selectFirst("meta[name=csrf-token]")?.attr("content")?.takeIf(String::isNotBlank)
+        val seasonSnapshot = extractWireSnapshot(doc.html(), "season-component")
+        val loadedSeasons = byKey.values.map { it.season }.toSet()
+
+        if (csrf != null && seasonSnapshot != null && seasons.isNotEmpty()) {
+            val missing = seasons.filter { it.number !in loadedSeasons }
+            Log.i(LOG_TAG, "Saisons à charger via Livewire=${missing.map { it.number }}")
+            coroutineScope {
+                missing.map { season ->
+                    async {
+                        val html = livewireCall(
+                            origin = origin,
+                            referer = "$origin$seriesPath",
+                            csrf = csrf,
+                            snapshot = seasonSnapshot,
+                            method = "updateSeason",
+                            params = listOf(season.id),
+                        )
+                        season to html
+                    }
+                }.awaitAll()
+            }.forEach { (season, html) ->
+                if (html.isNullOrBlank()) {
+                    Log.w(LOG_TAG, "Livewire saison ${season.number} vide")
+                    return@forEach
+                }
+                val fragment = Jsoup.parseBodyFragment(html, "$origin/")
+                parseSiteEpisodes(fragment, origin).forEach { item ->
+                    val fixed = item.copy(season = if (item.season > 0) item.season else season.number)
+                    byKey.putIfAbsent(fixed.path, fixed)
                 }
             }
-            if (isVidzyEmbed(url)) {
-                val response = runCatching {
-                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
-                }.onFailure { Log.w(LOG_TAG, "Lecteur Vidzy inaccessible ${safeRoute(url)}", it) }.getOrNull()
-                if (response != null && response.okhttpResponse.code in 200..299) {
-                    val mediaUrl = decodeVidzySource(response.text, URI(url).host.orEmpty())
-                    Log.i(LOG_TAG, "Lecteur Vidzy ${safeRoute(url)} HTTP=${response.okhttpResponse.code} HLS=${mediaUrl != null}")
-                    if (mediaUrl != null) {
-                        players[mediaUrl] = "Vidzy" to mediaUrl
-                        mediaReferers[mediaUrl] = url
+        } else {
+            Log.w(LOG_TAG, "Livewire skip csrf=${csrf != null} snap=${seasonSnapshot != null}")
+        }
+
+        return byKey.values
+            .sortedWith(compareBy({ it.season }, { it.episode }))
+            .map { item ->
+                newEpisode(Playback(item.path).encode()) {
+                    name = item.title
+                    season = item.season
+                    episode = item.episode
+                    posterUrl = item.poster
+                }
+            }
+    }
+
+    private fun parseSeasonEntries(html: String): List<SeasonEntry> {
+        val result = LinkedHashMap<String, SeasonEntry>()
+        // wire:click="updateSeason('1251')" ... Saison 2
+        SEASON_CLICK_BLOCK.findAll(html).forEach { m ->
+            val id = m.groupValues[1]
+            val label = m.groupValues[2].replace(Regex("\\s+"), " ").trim()
+            val number = SEASON.find(label)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: return@forEach
+            result[id] = SeasonEntry(id, number)
+        }
+        // ids seuls si le libellé n'a pas matché
+        SEASON_CLICK.findAll(html).forEach { m ->
+            val id = m.groupValues[1]
+            if (id !in result) {
+                // numéro inconnu : on ignore plutôt que d'inventer
+            }
+        }
+        // snapshot season-component (saison courante)
+        extractWireSnapshot(html, "season-component")?.let { snap ->
+            runCatching {
+                val data = JSONObject(snap).optJSONObject("data") ?: return@runCatching
+                val sid = data.opt("seasonId")?.toString()?.takeIf { it.matches(NUMERIC_ID) } ?: return@runCatching
+                val snum = data.optString("season_number").toIntOrNull()
+                    ?: data.optInt("season_number", -1).takeIf { it > 0 }
+                    ?: return@runCatching
+                result.putIfAbsent(sid, SeasonEntry(sid, snum))
+            }
+        }
+        return result.values.sortedBy { it.number }
+    }
+
+    private fun parseSiteEpisodes(document: Document, origin: String): List<SiteEpisode> {
+        val result = LinkedHashMap<String, SiteEpisode>()
+        document.select("a[href*=/episode/]").forEach { anchor ->
+            val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
+            val path = runCatching { URI(href).path }.getOrNull() ?: return@forEach
+            val numbers = EPISODE_PATH.matchEntire(path) ?: return@forEach
+            val season = numbers.groupValues[1].toIntOrNull() ?: return@forEach
+            val episode = numbers.groupValues[2].toIntOrNull() ?: return@forEach
+            val container = anchor.closest("div.relative.group") ?: anchor.parent()
+            val title = container?.selectFirst("h3")?.text()?.trim()?.takeIf(String::isNotBlank)
+                ?: "Épisode $episode"
+            val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
+                ?: container?.selectFirst("img")?.let { imageUrl(it, origin) }
+            result[path] = SiteEpisode(path, season, episode, title, poster)
+        }
+        return result.values.toList()
+    }
+
+    /**
+     * Extrait le JSON wire:snapshot d'un composant Livewire.
+     * On parse le HTML brut (regex) car les attributs `wire:*` sont capricieux avec Jsoup.
+     */
+    private fun extractWireSnapshot(html: String, componentName: String): String? {
+        for (m in WIRE_SNAPSHOT.findAll(html)) {
+            val raw = m.groupValues[1]
+                .replace("&quot;", "\"")
+                .replace("&#039;", "'")
+                .replace("&amp;", "&")
+                .replace("&#34;", "\"")
+            if (raw.contains("\"name\":\"$componentName\"") || raw.contains("\\\"name\\\":\\\"$componentName\\\"")) {
+                // parfois double-échappé
+                val normalized = if (raw.contains("\\\"name\\\"")) {
+                    raw.replace("\\\"", "\"")
+                } else raw
+                if (normalized.contains("\"name\":\"$componentName\"")) return normalized
+                return raw
+            }
+        }
+        return null
+    }
+
+    private suspend fun livewireCall(
+        origin: String,
+        referer: String,
+        csrf: String,
+        snapshot: String,
+        method: String,
+        params: List<String>,
+    ): String? {
+        val payload = mapOf(
+            "_token" to csrf,
+            "components" to listOf(
+                mapOf(
+                    "snapshot" to snapshot,
+                    "updates" to emptyMap<String, Any>(),
+                    "calls" to listOf(
+                        mapOf(
+                            "path" to "",
+                            "method" to method,
+                            "params" to params,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val response = runCatching {
+            app.post(
+                url = "$origin/livewire/update",
+                headers = headers + mapOf(
+                    "Content-Type" to "application/json",
+                    "Accept" to "*/*",
+                    "X-Livewire" to "",
+                    "X-CSRF-TOKEN" to csrf,
+                    "Origin" to origin,
+                ),
+                referer = referer,
+                json = payload,
+                cacheTime = 0,
+                timeout = 25L,
+            )
+        }.onFailure { Log.w(LOG_TAG, "Livewire $method erreur réseau", it) }.getOrNull()
+
+        if (response == null) return null
+        Log.i(LOG_TAG, "Livewire $method HTTP=${response.okhttpResponse.code} len=${response.text.length}")
+        if (response.okhttpResponse.code !in 200..299) {
+            Log.w(LOG_TAG, "Livewire body=${response.text.take(300)}")
+            return null
+        }
+        return runCatching {
+            val root = JSONObject(response.text)
+            val components = root.optJSONArray("components") ?: return@runCatching null
+            if (components.length() == 0) return@runCatching null
+            components.getJSONObject(0).optJSONObject("effects")?.optString("html")
+                ?.takeIf(String::isNotBlank)
+        }.onFailure { Log.w(LOG_TAG, "Livewire parse réponse", it) }.getOrNull()
+    }
+
+    // -------------------------------------------------------------------------
+    // Lecteurs (snapshot watch-component)
+    // -------------------------------------------------------------------------
+
+    private fun extractVideosFromWatchSnapshot(html: String): List<Pair<String, String>> {
+        val snapshot = extractWireSnapshot(html, "watch-component") ?: run {
+            Log.w(LOG_TAG, "watch-component snapshot introuvable")
+            return emptyList()
+        }
+        val result = LinkedHashMap<String, Pair<String, String>>()
+        runCatching {
+            val data = JSONObject(snapshot).optJSONObject("data") ?: return@runCatching
+            fun add(obj: JSONObject) {
+                val link = obj.optString("link").takeIf(String::isNotBlank) ?: return
+                val server = obj.optString("server_name").ifBlank { "Server" }
+                val label = obj.optString("label").ifBlank { "HD" }
+                val version = obj.optString("version").ifBlank { "" }
+                val name = listOf(server, label, version).filter(String::isNotBlank).joinToString(" · ")
+                result.putIfAbsent(link, name to link)
+            }
+            collectVideoObjects(data.opt("videos")).forEach(::add)
+            when (val byVersion = data.opt("videosByVersion")) {
+                is JSONObject -> {
+                    val keys = byVersion.keys()
+                    while (keys.hasNext()) {
+                        val ver = keys.next()
+                        collectVideoObjects(byVersion.opt(ver)).forEach { obj ->
+                            val link = obj.optString("link").takeIf(String::isNotBlank) ?: return@forEach
+                            val server = obj.optString("server_name").ifBlank { "Server" }
+                            val label = obj.optString("label").ifBlank { "HD" }
+                            result.putIfAbsent(link, listOf(server, label, ver).filter(String::isNotBlank).joinToString(" · ") to link)
+                        }
+                    }
+                }
+                is JSONArray -> collectVideoObjects(byVersion).forEach(::add)
+            }
+        }.onFailure { Log.w(LOG_TAG, "Parse watch snapshot", it) }
+        Log.i(LOG_TAG, "watch snapshot sources=${result.size}")
+        return result.values.toList()
+    }
+
+    private fun collectVideoObjects(node: Any?): List<JSONObject> {
+        val out = ArrayList<JSONObject>()
+        when (node) {
+            is JSONObject -> {
+                if (node.has("link") && node.optString("link").isNotBlank()) out += node
+                else {
+                    val keys = node.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        if (k == "s") continue
+                        out += collectVideoObjects(node.opt(k))
                     }
                 }
             }
+            is JSONArray -> for (i in 0 until node.length()) out += collectVideoObjects(node.opt(i))
         }
-        for ((label, url) in players.values) {
-            if (DIRECT_MEDIA.containsMatchIn(url)) {
-                callback(newExtractorLink(
-                    source = name,
-                    name = "Xalaflix · $label",
-                    url = url,
-                    type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = mediaReferers[url] ?: referer
-                    quality = getQualityFromName(label)
-                    headers = this@XalaflixProvider.headers
-                })
-                emitted = true
-                continue
-            }
-            if (isInternalEmbed(url, origin)) continue
-            runCatching {
-                loadExtractor(url, referer, subtitleCallback) { emitted = true; callback(it) }
-            }
-        }
-        return emitted
+        return out
     }
+
+    private suspend fun resolveVidzy(embedUrl: String, referer: String): String? {
+        val response = runCatching {
+            app.get(embedUrl, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
+        }.getOrNull() ?: return null
+        if (response.okhttpResponse.code !in 200..299) return null
+        val host = runCatching { URI(embedUrl).host.orEmpty() }.getOrDefault("")
+        return decodeVidzySource(response.text, host)
+    }
+
+    private fun decodeVidzySource(html: String, hostname: String): String? {
+        val hostKey = hostname.sumOf { it.code } and 255
+        for (match in LONG_BASE64.findAll(html)) {
+            val bytes = runCatching { Base64.decode(match.value, Base64.DEFAULT) }.getOrNull() ?: continue
+            val reversed = bytes.reversedArray()
+            val decoded = CharArray(reversed.size) { index ->
+                ((reversed[index].toInt() and 255) xor ((0x3d + index * 89 + hostKey) and 255)).toChar()
+            }.concatToString()
+            if (decoded.startsWith("http://") || decoded.startsWith("https://")) return decoded
+        }
+        return null
+    }
+
+    // -------------------------------------------------------------------------
+    // HTTP / parsing générique
+    // -------------------------------------------------------------------------
+
+    private data class Page(val document: Document, val origin: String)
 
     private suspend fun fetchWithRefresh(path: String): Page? {
         val first = ensureDomain()
@@ -277,166 +521,19 @@ class XalaflixProvider : MainAPI() {
         }.getOrNull() ?: return null
         if (response.okhttpResponse.code !in 200..299) return null
         val doc = Jsoup.parse(response.text, "$origin/")
-        return doc.takeIf { it.select("a[href*=/movie/], a[href*=/tv-show/], iframe, video, source, h1").isNotEmpty() }
-    }
-
-    private suspend fun ajaxDocument(origin: String, paths: List<String>, referer: String): Document? {
-        for (path in paths) {
-            val response = runCatching {
-                app.get(
-                    "$origin$path",
-                    headers = headers + mapOf(
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Accept" to "*/*",
-                    ),
-                    referer = referer,
-                    cacheTime = 0,
-                    timeout = 15L,
-                )
-            }.onFailure { Log.w(LOG_TAG, "AJAX impossible path=$path", it) }.getOrNull() ?: continue
-            Log.i(
-                LOG_TAG,
-                "AJAX path=$path HTTP=${response.okhttpResponse.code} taille=${response.text.length} aperçu='${preview(response.text)}'",
-            )
-            if (response.okhttpResponse.code !in 200..299) continue
-            val html = runCatching {
-                val json = JSONObject(response.text)
-                listOf("html", "result", "data").firstNotNullOfOrNull { key -> json.optString(key).takeIf(String::isNotBlank) }
-            }.getOrNull() ?: response.text
-            val document = Jsoup.parseBodyFragment(html, "$origin/")
-            if (document.select("[data-id], a[href], iframe[src]").isNotEmpty()) return document
+        return doc.takeIf {
+            it.select("a[href*=/movie/], a[href*=/tv-show/], a[href*=/episode/], h1").isNotEmpty()
+                || it.html().contains("wire:snapshot")
         }
-        return null
-    }
-
-    private suspend fun loadMovieEpisodeId(origin: String, mediaId: String, referer: String): String? {
-        val document = ajaxDocument(origin, listOf(
-            "/ajax/movie/episodes/$mediaId",
-            "/ajax/v2/movie/episodes/$mediaId",
-        ), referer) ?: return null
-        return document.selectFirst("[data-id]")?.attr("data-id")?.takeIf(String::isNotBlank)
-    }
-
-    private suspend fun loadSeriesEpisodes(origin: String, mediaId: String, referer: String): List<Quad> {
-        val seasons = ajaxDocument(origin, listOf(
-            "/ajax/v2/tv/seasons/$mediaId",
-            "/ajax/tv/seasons/$mediaId",
-        ), referer) ?: return emptyList()
-        val result = ArrayList<Quad>()
-        for ((seasonIndex, seasonNode) in seasons.select("[data-id]").withIndex()) {
-            val seasonId = seasonNode.attr("data-id").takeIf(String::isNotBlank) ?: continue
-            val seasonNumber = SEASON.find(seasonNode.text())?.groupValues?.getOrNull(1)?.toIntOrNull() ?: seasonIndex + 1
-            val episodes = ajaxDocument(origin, listOf(
-                "/ajax/v2/season/episodes/$seasonId",
-                "/ajax/season/episodes/$seasonId",
-            ), referer) ?: continue
-            episodes.select("[data-id]").forEachIndexed { index, node ->
-                val episodeId = node.attr("data-id").takeIf(String::isNotBlank) ?: return@forEachIndexed
-                val text = node.text().trim()
-                val number = EPISODE_NUMBER.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: index + 1
-                result += Quad(episodeId, seasonNumber, number, text.takeIf(String::isNotBlank))
-            }
-        }
-        return result.distinctBy { it.first }.sortedWith(compareBy<Quad> { it.second }.thenBy { it.third })
-    }
-
-    private suspend fun loadServerSources(origin: String, episodeId: String, referer: String): List<Pair<String, String>> {
-        val servers = ajaxDocument(origin, listOf(
-            "/ajax/v2/episode/servers/$episodeId",
-            "/ajax/episode/servers/$episodeId",
-        ), referer) ?: return emptyList()
-        val result = LinkedHashMap<String, Pair<String, String>>()
-        for (server in servers.select("[data-id]")) {
-            val serverId = server.attr("data-id").takeIf(String::isNotBlank) ?: continue
-            var url: String? = null
-            for (sourcePath in listOf(
-                "/ajax/v2/episode/sources/$serverId",
-                "/ajax/episode/sources/$serverId",
-            )) {
-                val response = runCatching {
-                    app.get(
-                        "$origin$sourcePath",
-                        headers = headers + mapOf(
-                            "X-Requested-With" to "XMLHttpRequest",
-                            "Accept" to "application/json, text/javascript, */*; q=0.01",
-                        ),
-                        referer = referer,
-                        cacheTime = 0,
-                        timeout = 15L,
-                    )
-                }.onFailure { Log.w(LOG_TAG, "Source impossible path=$sourcePath", it) }.getOrNull() ?: continue
-                Log.i(
-                    LOG_TAG,
-                    "Source path=$sourcePath HTTP=${response.okhttpResponse.code} taille=${response.text.length} aperçu='${preview(response.text)}'",
-                )
-                if (response.okhttpResponse.code !in 200..299) continue
-                val json = runCatching { JSONObject(response.text) }.getOrNull() ?: continue
-                url = listOf("link", "url", "file").firstNotNullOfOrNull { key ->
-                    json.optString(key).takeIf(String::isNotBlank)
-                }
-                if (url != null) break
-            }
-            val playerUrl = url ?: continue
-            val label = server.text().trim().ifBlank { "Lecteur" }
-            result[playerUrl] = label to playerUrl
-        }
-        return result.values.toList()
-    }
-
-    private fun parseInlineEpisodes(document: Document): List<Quad> {
-        val result = ArrayList<Quad>()
-        document.select("[data-id]").forEachIndexed { index, node ->
-            val text = node.text().trim()
-            val episode = EPISODE_NUMBER.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: return@forEachIndexed
-            val id = node.attr("data-id").takeIf(String::isNotBlank) ?: return@forEachIndexed
-            val season = SEASON.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
-            result += Quad(id, season, episode, text.ifBlank { "Épisode $episode" })
-        }
-        return result.distinctBy { it.first }.sortedWith(compareBy<Quad> { it.second }.thenBy { it.third })
-    }
-
-    private data class SiteEpisode(
-        val path: String,
-        val season: Int,
-        val episode: Int,
-        val title: String,
-        val poster: String?,
-        val description: String? = null,
-    )
-
-    private fun parseSiteEpisodes(document: Document, origin: String): List<SiteEpisode> {
-        val result = LinkedHashMap<String, SiteEpisode>()
-        document.select("a[href*=/episode/]").forEach { anchor ->
-            val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
-            val path = runCatching { URI(href).path }.getOrNull() ?: return@forEach
-            val numbers = EPISODE_PATH.matchEntire(path) ?: return@forEach
-            val season = numbers.groupValues[1].toIntOrNull() ?: return@forEach
-            val episode = numbers.groupValues[2].toIntOrNull() ?: return@forEach
-            val container = anchor.closest("div.relative.group") ?: anchor.parent()
-            val title = container?.selectFirst("h3")?.text()?.trim()?.takeIf(String::isNotBlank)
-                ?: "Épisode $episode"
-            val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
-            result[path] = SiteEpisode(path, season, episode, title, poster)
-        }
-        return result.values.sortedWith(compareBy<SiteEpisode> { it.season }.thenBy { it.episode })
-    }
-
-    private suspend fun enrichEpisode(item: SiteEpisode, origin: String): SiteEpisode {
-        val document = fetch(origin, item.path) ?: return item
-        val description = document.selectFirst(
-            "h1 ~ p.text-gray-400.mt-3, .flex-1 > p.text-gray-400.mt-3, " +
-                "p.text-x.text-gray-400.mt-3, .description, [class*=overview]",
-        )?.text()?.trim()?.takeIf(String::isNotBlank)
-        return item.copy(description = description)
     }
 
     private fun parseCards(doc: Document, origin: String): List<SearchResponse> {
         val results = LinkedHashMap<String, SearchResponse>()
         doc.select("a[href*=/movie/], a[href*=/tv-show/]").forEach { anchor ->
             val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
-            val path = detailPath(href) ?: return@forEach
-            val container = anchor.closest(".flw-item, .film_list-wrap, .item, article, li") ?: anchor
+            val path = contentPath(href) ?: return@forEach
+            if (path.startsWith("/episode/")) return@forEach
+            val container = anchor.closest(".flw-item, .film_list-wrap, .item, article, li, div.relative") ?: anchor
             val title = sequenceOf(
                 anchor.attr("title"),
                 container.selectFirst("h2, h3, .film-name, .title")?.text(),
@@ -446,78 +543,36 @@ class XalaflixProvider : MainAPI() {
             if (title.equals("View All", true)) return@forEach
             val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
                 ?: container.selectFirst("img")?.let { imageUrl(it, origin) }
-            val cardId = sequenceOf(anchor, container)
-                .map { it.attr("data-id") }
-                .firstOrNull { it.matches(NUMERIC_ID) }
-            val itemUrl = "$origin$path" + (cardId?.let { "#csid=$it" } ?: "")
+            val itemUrl = "$origin$path"
             val response = if (path.startsWith("/tv-show/")) {
                 newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) { posterUrl = poster }
-            } else newMovieSearchResponse(title, itemUrl, TvType.Movie) { posterUrl = poster }
+            } else {
+                newMovieSearchResponse(title, itemUrl, TvType.Movie) { posterUrl = poster }
+            }
             results.putIfAbsent(path, response)
         }
         return results.values.toList()
     }
 
-    private data class Quad(val first: String, val second: Int, val third: Int, val fourth: String?)
-
     private fun extractPlayers(doc: Document, origin: String): List<Pair<String, String>> {
         val result = LinkedHashMap<String, Pair<String, String>>()
-        doc.select("iframe[src], video[src], source[src], [data-src], [data-url], [data-link], [data-embed], a[href]").forEach { element ->
-            val raw = listOf("src", "data-src", "data-url", "data-link", "data-embed", "href")
+        doc.select("iframe[src], video[src], source[src], [data-src], [data-url], [data-link], [data-embed]").forEach { element ->
+            val raw = listOf("src", "data-src", "data-url", "data-link", "data-embed")
                 .map { element.attr(it) }.firstOrNull(String::isNotBlank) ?: return@forEach
+            if (raw.equals("iframeSrc", true)) return@forEach
             val url = absolute(raw, origin) ?: return@forEach
-            if (!url.startsWith("http") || detailPath(url) != null) return@forEach
-            val label = element.attr("title").ifBlank { element.text() }.ifBlank { URI(url).host ?: "Lecteur" }
+            if (!url.startsWith("http") || contentPath(url) != null) return@forEach
+            val label = element.attr("title").ifBlank { URI(url).host ?: "Lecteur" }
             result[url] = label to url
         }
-        URL_IN_SCRIPT.findAll(doc.html()).forEach { match ->
-            val url = cleanUrl(match.value)
-            if (!url.contains("xalaflix.", true) || DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url)) {
-                result[url] = "Lecteur" to url
-            }
-        }
-        SCRIPT_LINK.findAll(doc.html()).forEach { match ->
-            absolute(cleanUrl(match.groupValues[1]), origin)?.let { result[it] = "Lecteur" to it }
-        }
-        RELATIVE_EMBED.findAll(doc.html()).forEach { match ->
-            absolute(cleanUrl(match.value), origin)?.let { result[it] = "Lecteur interne" to it }
-        }
-        Log.i(LOG_TAG, "Lecteurs intégrés trouvés=${result.size}")
-        Log.i(LOG_TAG, "Candidats=${result.keys.mapNotNull(::safeRoute).distinct().take(50).joinToString(" | ")}")
-        val dynamicRoutes = DYNAMIC_ROUTE.findAll(doc.html())
-            .map { it.value.replace("\\/", "/").replace("&amp;", "&").substringBefore('?') }
-            .distinct().take(50).toList()
-        Log.i(LOG_TAG, "Routes dynamiques=${dynamicRoutes.joinToString(" | ")}")
         return result.values.toList()
     }
 
-    private fun safeRoute(raw: String): String? = runCatching {
-        val uri = URI(raw)
-        val host = uri.host ?: return@runCatching null
-        "$host${uri.path.orEmpty()}"
-    }.getOrNull()
-
-    private fun isInternalEmbed(raw: String, origin: String): Boolean = runCatching {
-        val uri = URI(raw)
-        uri.host.equals(URI(origin).host, true) && uri.path.orEmpty().contains("/embed-", true)
-    }.getOrDefault(false)
-
     private fun isVidzyEmbed(raw: String): Boolean = runCatching {
-        URI(raw).host.orEmpty().contains("vidzy.", true) && URI(raw).path.orEmpty().contains("/embed-", true)
+        val host = URI(raw).host.orEmpty().lowercase()
+        (host.contains("vidzy") || host.contains("vidz")) &&
+            URI(raw).path.orEmpty().contains("/embed-", true)
     }.getOrDefault(false)
-
-    private fun decodeVidzySource(html: String, hostname: String): String? {
-        val hostKey = hostname.sumOf { it.code } and 255
-        for (match in LONG_BASE64.findAll(html)) {
-            val bytes = runCatching { Base64.decode(match.value, Base64.DEFAULT) }.getOrNull() ?: continue
-            val reversed = bytes.reversedArray()
-            val decoded = CharArray(reversed.size) { index ->
-                ((reversed[index].toInt() and 255) xor ((0x3d + index * 89 + hostKey) and 255)).toChar()
-            }.concatToString()
-            if (decoded.startsWith("http://") || decoded.startsWith("https://")) return decoded
-        }
-        return null
-    }
 
     private fun cleanUrl(raw: String): String = raw
         .replace("\\/", "/")
@@ -531,29 +586,9 @@ class XalaflixProvider : MainAPI() {
         origin,
     )
 
-    private fun detailPath(url: String): String? {
-        val path = runCatching { URI(url).path }.getOrNull() ?: url.substringBefore('?')
-        return path.takeIf { DETAIL.matches(it) }
-    }
-
-    private fun findMediaId(doc: Document, sourceUrl: String): String? {
-        Regex("(?:#|&)csid=(\\d+)").find(sourceUrl)
-            ?.groupValues?.getOrNull(1)?.let { return it }
-
-        val selectors = listOf(
-            ".detail_page-infor[data-id]",
-            ".watch_block[data-id]",
-            "#watch-block[data-id]",
-            "[data-type][data-id]",
-            ".film-buttons [data-id]",
-            "[data-id]",
-        )
-        for (selector in selectors) {
-            doc.select(selector).firstOrNull { it.attr("data-id").matches(NUMERIC_ID) }
-                ?.attr("data-id")?.let { return it }
-        }
-
-        return MEDIA_ID_IN_SOURCE.find(doc.html())?.groupValues?.getOrNull(1)
+    private fun contentPath(url: String): String? {
+        val path = runCatching { URI(url).path }.getOrNull() ?: url.substringBefore('?').substringBefore('#')
+        return path.takeIf { CONTENT_PATH.matches(it) }
     }
 
     private fun absolute(raw: String?, origin: String): String? {
@@ -561,32 +596,22 @@ class XalaflixProvider : MainAPI() {
         return runCatching { URI("$origin/").resolve(raw).toString() }.getOrNull()
     }
 
-    private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
-
-    private fun preview(value: String): String = value
-        .replace(Regex("\\s+"), " ")
-        .replace(Regex("https?://[^\\s\\\"']+"), "<url>")
-        .take(180)
-
     companion object {
         private const val LOG_TAG = "XalaflixDebug"
-        private val DETAIL = Regex("^/(movie|tv-show)/[^/?#]+/?$", RegexOption.IGNORE_CASE)
+        private val CONTENT_PATH = Regex("^/(movie|tv-show|episode)/[^/?#]+(?:/\\d+-\\d+)?/?$", RegexOption.IGNORE_CASE)
         private val NUMERIC_ID = Regex("\\d+")
-        private val MEDIA_ID_IN_SOURCE = Regex(
-            "(?i)(?:movie_id|film_id|media_id|data-id)[\\s\\\"':=]+(?:\\\"|')?(\\d+)",
-        )
         private val YEAR = Regex("\\b(?:19|20)\\d{2}\\b")
-        private val SEASON = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+)")
-        private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
+        private val SEASON = Regex("(?i)(?:saison|season)\\s*(\\d+)")
+        private val SEASON_CLICK = Regex("""updateSeason\(\s*['"](\d+)['"]\s*\)""")
+        private val SEASON_CLICK_BLOCK = Regex(
+            """wire:click="updateSeason\(\s*'(\d+)'\s*\)"[^>]*>\s*([^<]+)\s*<""",
+            RegexOption.IGNORE_CASE,
+        )
         private val EPISODE_PATH = Regex("(?i)^/episode/[^/]+/(\\d+)-(\\d+)/?$")
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
-        private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
-        private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
-        private val SCRIPT_LINK = Regex("(?i)\\\"link\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"")
         private val LONG_BASE64 = Regex("[A-Za-z0-9+/]{80,}={0,2}")
-        private val RELATIVE_EMBED = Regex("(?i)/embed-[a-z0-9_-]+\\.html")
-        private val DYNAMIC_ROUTE = Regex(
-            "(?i)(?:https?://[^\\s\\\"'<>]+|/[a-z0-9_./-]*(?:ajax|api|embed|episode|server|source|watch|player)[a-z0-9_./?=&-]*)",
-        )
+        private val WIRE_SNAPSHOT = Regex("""wire:snapshot="([^"]+)"""")
+        private val CSRF_META = Regex("""name="csrf-token"\s+content="([^"]+)"""")
+        private val LINK_JSON = Regex(""""link"\s*:\s*"(https?://[^"]+)"""")
     }
 }
