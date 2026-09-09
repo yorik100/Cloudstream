@@ -719,24 +719,34 @@ class XalaflixProvider : MainAPI() {
 
     private fun extractPlayers(doc: Document, origin: String): List<Pair<String, String>> {
         val result = LinkedHashMap<String, Pair<String, String>>()
-        extractSnapshotPlayers(doc, origin).forEach { result[it.second] = it }
+        val snapshotPlayers = extractSnapshotPlayers(doc, origin)
+        if (snapshotPlayers.isNotEmpty()) {
+            Log.i(LOG_TAG, "Sources du watch-component=${snapshotPlayers.size}")
+            Log.i(LOG_TAG, "Candidats=${snapshotPlayers.mapNotNull { safeRoute(it.second) }.joinToString(" | ")}")
+            return snapshotPlayers
+        }
         doc.select("iframe[src], video[src], source[src], [data-src]:not(img), [data-url], [data-link], [data-embed]").forEach { element ->
             val raw = listOf("src", "data-src", "data-url", "data-link", "data-embed", "href")
                 .map { element.attr(it) }.firstOrNull(String::isNotBlank) ?: return@forEach
             val url = absolute(raw, origin) ?: return@forEach
-            if (!url.startsWith("http") || detailPath(url) != null) return@forEach
+            if (!url.startsWith("http") || detailPath(url) != null || isExcludedPlaybackUrl(url)) return@forEach
             val label = element.attr("title").ifBlank { element.text() }.ifBlank { URI(url).host ?: "Lecteur" }
             result[url] = label to url
         }
         val normalizedHtml = doc.html().replace("\\/", "/")
         URL_IN_SCRIPT.findAll(normalizedHtml).forEach { match ->
             val url = cleanUrl(match.value)
-            if (DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url) || isInternalEmbed(url, origin)) {
+            if (
+                !isExcludedPlaybackUrl(url) &&
+                (DIRECT_MEDIA.containsMatchIn(url) || PLAYER_HOST.containsMatchIn(url) || isInternalEmbed(url, origin))
+            ) {
                 result.putIfAbsent(url, "Lecteur" to url)
             }
         }
         SCRIPT_LINK.findAll(normalizedHtml).forEach { match ->
-            absolute(cleanUrl(match.groupValues[1]), origin)?.let { result.putIfAbsent(it, "Lecteur" to it) }
+            absolute(cleanUrl(match.groupValues[1]), origin)
+                ?.takeUnless(::isExcludedPlaybackUrl)
+                ?.let { result.putIfAbsent(it, "Lecteur" to it) }
         }
         RELATIVE_EMBED.findAll(normalizedHtml).forEach { match ->
             absolute(cleanUrl(match.value), origin)?.let { result[it] = "Lecteur interne" to it }
@@ -749,6 +759,13 @@ class XalaflixProvider : MainAPI() {
         Log.i(LOG_TAG, "Routes dynamiques=${dynamicRoutes.joinToString(" | ")}")
         return result.values.toList()
     }
+
+    private fun isExcludedPlaybackUrl(raw: String): Boolean = runCatching {
+        val host = URI(raw).host.orEmpty().lowercase().removePrefix("www.")
+        host == "youtu.be" ||
+            host == "youtube.com" || host.endsWith(".youtube.com") ||
+            host == "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com")
+    }.getOrDefault(false)
 
     private fun extractSnapshotPlayers(doc: Document, origin: String): List<Pair<String, String>> {
         val result = LinkedHashMap<String, Pair<String, String>>()
