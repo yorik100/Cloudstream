@@ -16,6 +16,8 @@ internal class FlemmixDomainResolver(
     @Volatile
     private var cachedOrigin: String? = null
 
+    fun resolvedOriginOrNull(): String? = cachedOrigin
+
     suspend fun resolve(): String {
         cachedOrigin?.let { return it }
 

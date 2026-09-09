@@ -1,5 +1,6 @@
 package com.flemmix.cloudstream
 
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -149,65 +150,60 @@ class FlemmixProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
 
-        val firstOrigin = ensureDomain()
-        searchAtOrigin(firstOrigin, query)?.let { return it }
+        // Comme Frembed : utiliser immédiatement le domaine déjà résolu en
+        // mémoire. S'il n'existe pas encore, terminer d'abord sa résolution.
+        val firstOrigin = domainResolver.resolvedOriginOrNull()
+            ?: runCatching { ensureDomain() }.getOrNull()
+            ?: return emptyList()
+        mainUrl = firstOrigin
+        Log.i(SEARCH_TAG, "Début de la recherche '$query' sur $firstOrigin")
+        searchAtOrigin(firstOrigin, query)?.let { results ->
+            Log.i(SEARCH_TAG, "Recherche '$query' sur $firstOrigin : ${results.size} résultat(s)")
+            return results
+        }
 
         domainResolver.invalidate(firstOrigin)
-        val refreshedOrigin = ensureDomain()
-        return searchAtOrigin(refreshedOrigin, query).orEmpty()
+        val refreshedOrigin = runCatching { ensureDomain() }.getOrNull() ?: return emptyList()
+        val results = searchAtOrigin(refreshedOrigin, query).orEmpty()
+        Log.i(SEARCH_TAG, "Recherche '$query' après résolution sur $refreshedOrigin : ${results.size} résultat(s)")
+        return results
     }
 
     private suspend fun searchAtOrigin(
         origin: String,
         query: String,
     ): List<SearchResponse>? {
-        val homeResponse = runCatching {
+        val response = runCatching {
             app.get(
-                url = "$origin/",
+                url = "$origin/index.php",
+                params = mapOf(
+                    "do" to "search",
+                    "subaction" to "search",
+                    "story" to query,
+                ),
                 headers = browserHeaders,
                 referer = "$origin/",
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
+        }.onFailure { error ->
+            Log.w(SEARCH_TAG, "Requête de recherche impossible sur $origin", error)
         }.getOrNull() ?: return null
 
-        if (homeResponse.okhttpResponse.code !in 200..299) return null
-        val userHash = DLE_LOGIN_HASH_REGEX.find(homeResponse.text)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.takeIf(String::isNotBlank)
-            ?: return null
-        val skin = DLE_SKIN_REGEX.find(homeResponse.text)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.takeIf(String::isNotBlank)
-            ?: return null
-
-        val response = runCatching {
-            app.post(
-                url = "$origin/index.php?controller=ajax&mod=search",
-                data = mapOf(
-                    "query" to query,
-                    "skin" to skin,
-                    "user_hash" to userHash,
-                ),
-                headers = browserHeaders + mapOf(
-                    "Accept" to "text/html, */*; q=0.01",
-                    "X-Requested-With" to "XMLHttpRequest",
-                ),
-                referer = "$origin/",
-                cacheTime = 0,
-                timeout = PAGE_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return null
-
-        if (response.okhttpResponse.code !in 200..299) return null
+        if (response.okhttpResponse.code !in 200..299) {
+            Log.w(SEARCH_TAG, "Recherche sur $origin : HTTP ${response.okhttpResponse.code}")
+            return null
+        }
+        if (!SEARCH_PAGE_REGEX.containsMatchIn(response.text)) {
+            Log.w(SEARCH_TAG, "La réponse de recherche sur $origin n'est pas une page de résultats")
+            return null
+        }
         val queryTerms = normalizeForMatch(query)
             .split(' ')
             .filter(String::isNotBlank)
         if (queryTerms.isEmpty()) return emptyList()
 
-        return parseSearchSuggestions(response.text, origin)
+        return parseItems(response.text, origin, null)
             .filter { item ->
                 sequenceOf(item.response.name, item.originalTitle)
                     .filterNotNull()
@@ -219,57 +215,6 @@ class FlemmixProvider : MainAPI() {
             .map { it.response }
             .distinctBy { it.url }
             .take(MAX_SEARCH_RESULTS)
-    }
-
-    private fun parseSearchSuggestions(
-        html: String,
-        origin: String,
-    ): List<ParsedItem> {
-        val results = LinkedHashMap<String, ParsedItem>()
-
-        for (anchor in ANCHOR_REGEX.findAll(html)) {
-            val openingTag = anchor.value.substringBefore('>')
-            if (!FAST_SEARCH_CLASS_REGEX.containsMatchIn(openingTag)) continue
-
-            val absolute = resolveUrl("$origin/", decodeHtml(anchor.groupValues[1]).trim())
-                ?: continue
-            val uri = runCatching { URI(absolute) }.getOrNull() ?: continue
-            val path = uri.path ?: continue
-            val pathMatch = DETAIL_PATH_REGEX.matchEntire(path) ?: continue
-            val type = typeFromPath(pathMatch.groupValues[1])
-            val body = anchor.groupValues[2]
-            val title = FAST_SEARCH_TITLE_REGEX.find(body)
-                ?.groupValues
-                ?.getOrNull(1)
-                ?.let(::plainText)
-                ?.takeIf(String::isNotBlank)
-                ?: continue
-            val imageTag = IMAGE_REGEX.find(body)?.value
-            val posterUrl = imageTag
-                ?.let { image ->
-                    sequenceOf("src", "data-src", "data-lazy-src")
-                        .mapNotNull { attribute(image, it) }
-                        .firstOrNull(String::isNotBlank)
-                }
-                ?.let { resolveUrl("$origin/", decodeHtml(it)) }
-            val itemUrl = "$origin$path"
-            val searchResponse = if (type == "movie") {
-                newMovieSearchResponse(title, itemUrl, TvType.Movie) {
-                    this.posterUrl = posterUrl
-                }
-            } else {
-                newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) {
-                    this.posterUrl = posterUrl
-                }
-            }
-
-            results.putIfAbsent(
-                "$type:$path",
-                ParsedItem(searchResponse, null),
-            )
-        }
-
-        return results.values.toList()
     }
 
     private fun parseItems(
@@ -805,6 +750,7 @@ class FlemmixProvider : MainAPI() {
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
     private companion object {
+        const val SEARCH_TAG = "FlemmixSearch"
         const val PAGE_TIMEOUT_SECONDS = 15L
         const val CATALOGUE_CACHE_SECONDS = 300
         const val DETAIL_CACHE_SECONDS = 120
@@ -826,28 +772,16 @@ class FlemmixProvider : MainAPI() {
             """\bclass\s*=\s*[\"'][^\"']*\bmov-t\b[^\"']*[\"']""",
             RegexOption.IGNORE_CASE,
         )
-        val FAST_SEARCH_CLASS_REGEX = Regex(
-            """\bclass\s*=\s*[\"'][^\"']*\bfsr-wrap\b[^\"']*[\"']""",
-            RegexOption.IGNORE_CASE,
-        )
-        val FAST_SEARCH_TITLE_REGEX = Regex(
-            """<span\b[^>]*class=[\"'][^\"']*\bfsr-title\b[^\"']*[\"'][^>]*>(.*?)</span>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
-        val DLE_LOGIN_HASH_REGEX = Regex(
-            """\bdle_login_hash\s*=\s*[\"']([^\"']+)[\"']""",
-            RegexOption.IGNORE_CASE,
-        )
-        val DLE_SKIN_REGEX = Regex(
-            """\bdle_skin\s*=\s*[\"']([^\"']+)[\"']""",
-            RegexOption.IGNORE_CASE,
-        )
         val TITLE0_REGEX = Regex(
             """<span\b[^>]*class=[\"'][^\"']*title0[^\"']*[\"'][^>]*>(.*?)</span>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
         val PAGE_LINK_REGEX = Regex(
             """href=[\"']([^\"']*/page/([0-9]+)/?)[\"']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val SEARCH_PAGE_REGEX = Regex(
+            """<form\b[^>]*(?:id|name)\s*=\s*[\"']fullsearch[\"']""",
             RegexOption.IGNORE_CASE,
         )
         val DETAIL_TITLE_REGEX = Regex(
