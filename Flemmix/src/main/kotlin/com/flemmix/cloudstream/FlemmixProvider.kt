@@ -161,14 +161,11 @@ class FlemmixProvider : MainAPI() {
         origin: String,
         query: String,
     ): List<SearchResponse>? {
+        val searchUrl =
+            "$origin/index.php?do=search&subaction=search&story=${encode(query)}"
         val response = runCatching {
-            app.post(
-                url = "$origin/",
-                data = mapOf(
-                    "do" to "search",
-                    "subaction" to "search",
-                    "story" to query,
-                ),
+            app.get(
+                url = searchUrl,
                 headers = browserHeaders,
                 referer = "$origin/",
                 cacheTime = 0,
@@ -177,18 +174,14 @@ class FlemmixProvider : MainAPI() {
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
-
-        // Flemmix injecte les cartes vedettes de l'accueil avant les vrais
-        // résultats. Le formulaire fullsearch marque le début de la section
-        // de recherche renvoyée par DataLife Engine.
-        val searchStart = SEARCH_RESULTS_START_REGEX.find(response.text)
-            ?.range
-            ?.first
-            ?: return null
-        val searchHtml = response.text.substring(searchStart)
+        if (!SEARCH_PAGE_REGEX.containsMatchIn(response.text)) return null
         val normalizedQuery = normalizeForMatch(query)
 
-        return parseItems(searchHtml, origin, null)
+        // La page de recherche contient aussi des cartes de recommandation.
+        // On analyse toute la réponse afin de ne pas dépendre de la position
+        // du formulaire DLE, puis on conserve strictement les titres liés à
+        // la requête.
+        return parseItems(response.text, origin, null)
             .filter { item ->
                 sequenceOf(item.response.name, item.originalTitle)
                     .filterNotNull()
@@ -219,7 +212,7 @@ class FlemmixProvider : MainAPI() {
             val uri = runCatching { URI(absolute) }.getOrNull() ?: continue
             val path = uri.path ?: continue
             val pathMatch = DETAIL_PATH_REGEX.matchEntire(path) ?: continue
-            val type = if (pathMatch.groupValues[1].equals("film", true)) "movie" else "tv"
+            val type = typeFromPath(pathMatch.groupValues[1])
             if (forcedType != null && forcedType != type) continue
 
             val body = anchor.groupValues[2]
@@ -317,7 +310,7 @@ class FlemmixProvider : MainAPI() {
         path: String,
     ): SourceDetails? {
         val match = DETAIL_PATH_REGEX.matchEntire(path) ?: return null
-        val type = if (match.groupValues[1].equals("film", true)) "movie" else "tv"
+        val type = typeFromPath(match.groupValues[1])
         val title = DETAIL_TITLE_REGEX.find(html)?.groupValues?.getOrNull(1)
             ?.let(::plainText)
             ?.takeIf(String::isNotBlank)
@@ -705,6 +698,9 @@ class FlemmixProvider : MainAPI() {
     private fun stripSeason(value: String): String =
         SEASON_IN_TITLE_REGEX.replace(value, "").trim(' ', '-', ':')
 
+    private fun typeFromPath(route: String): String =
+        if (route.lowercase(Locale.ROOT).startsWith("film")) "movie" else "tv"
+
     private fun year(date: String?): Int? = date?.take(4)?.toIntOrNull()
 
     private fun todayUtc(): Date {
@@ -742,7 +738,7 @@ class FlemmixProvider : MainAPI() {
         const val MINIMUM_TMDB_SCORE = 70
 
         val DETAIL_PATH_REGEX = Regex(
-            """/(film|serie)-en-streaming/[0-9]+-[^/?#]+\.html""",
+            """/(film-en-streaming|serie-en-streaming|film-ancien|saison-complete)/[0-9]+-[^/?#]+\.html""",
             RegexOption.IGNORE_CASE,
         )
         val ANCHOR_REGEX = Regex(
@@ -762,8 +758,8 @@ class FlemmixProvider : MainAPI() {
             """href=[\"']([^\"']*/page/([0-9]+)/?)[\"']""",
             RegexOption.IGNORE_CASE,
         )
-        val SEARCH_RESULTS_START_REGEX = Regex(
-            """<form\b[^>]*(?:id|name)\s*=\s*[\"']fullsearch[\"'][^>]*>""",
+        val SEARCH_PAGE_REGEX = Regex(
+            """<form\b[^>]*(?:id|name)\s*=\s*[\"']fullsearch[\"']""",
             RegexOption.IGNORE_CASE,
         )
         val DETAIL_TITLE_REGEX = Regex(
