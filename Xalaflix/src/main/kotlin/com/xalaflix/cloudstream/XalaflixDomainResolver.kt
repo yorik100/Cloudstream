@@ -53,11 +53,16 @@ internal class XalaflixDomainResolver(
             val label = anchor.text().lowercase()
             ACCESS_MARKERS.any(label::contains)
         }?.absUrl("href")
-        val candidates = sequenceOf(marked) + document.select("a[href]").asSequence().map { it.absUrl("href") }
-        return candidates.mapNotNull(::normalizeOrigin)
+        val candidates = (sequenceOf(marked) +
+            document.select("a[href]").asSequence().map { it.absUrl("href") })
+            .mapNotNull(::normalizeOrigin)
             .filter { it != REGISTRY_ORIGIN }
-            .mapNotNull { validate(it) }
-            .firstOrNull()
+            .distinct()
+
+        for (candidate in candidates) {
+            validate(candidate)?.let { return it }
+        }
+        return null
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -70,7 +75,10 @@ internal class XalaflixDomainResolver(
             )
         }.getOrNull() ?: return null
         if (response.okhttpResponse.code !in 200..299) return null
-        return response.text.lineSequence().mapNotNull(::normalizeOrigin).mapNotNull { validate(it) }.firstOrNull()
+        for (candidate in response.text.lineSequence().mapNotNull(::normalizeOrigin).distinct()) {
+            validate(candidate)?.let { return it }
+        }
+        return null
     }
 
     private suspend fun validate(candidate: String): String? {

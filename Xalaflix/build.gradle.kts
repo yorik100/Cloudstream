@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -7,6 +7,7 @@ val publishedIconBase =
 
 dependencies {
     implementation("org.jsoup:jsoup:1.18.3")
+    compileOnly("org.jspecify:jspecify:1.0.0")
     compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 }
 
