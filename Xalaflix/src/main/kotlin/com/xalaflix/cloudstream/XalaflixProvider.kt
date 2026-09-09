@@ -20,6 +20,8 @@ import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.extractorApis
+import com.lagradost.cloudstream3.utils.getAndUnpack
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -162,6 +164,11 @@ class XalaflixProvider : MainAPI() {
             this.plot = plot
             this.year = year
             this.tags = tags
+            // L'ancienne fiche ne contenait que la saison 9 et CloudStream a
+            // mémorisé ce choix. Cette nouvelle clé réinitialise cette préférence
+            // une seule fois ; CloudStream choisit alors la saison la plus proche
+            // de 1, donc la première réellement disponible.
+            uniqueUrl = "${loaded.origin}$path#xalaflix-complete-seasons"
         }
     }
 
@@ -292,14 +299,120 @@ class XalaflixProvider : MainAPI() {
                 continue
             }
             if (isInternalEmbed(url, origin)) continue
+            var sourceEmitted = false
             runCatching {
                 loadExtractor(url, playerReferers[url] ?: referer, subtitleCallback) {
+                    sourceEmitted = true
                     emitted = true
                     callback(it)
                 }
             }
+            if (!sourceEmitted) {
+                sourceEmitted = extractUqloadDirect(url, playerReferers[url] ?: referer, callback)
+            }
+            if (!sourceEmitted) {
+                sourceEmitted = loadNamedHostExtractor(
+                    url = url,
+                    referer = playerReferers[url] ?: referer,
+                    subtitleCallback = subtitleCallback,
+                    callback = callback,
+                )
+                if (sourceEmitted) emitted = true
+            }
+            Log.i(LOG_TAG, "Source ${safeRoute(url)} valide=$sourceEmitted")
         }
         return emitted
+    }
+
+    private suspend fun extractUqloadDirect(
+        url: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        if (knownHostName(url) != "uqload") return false
+        val response = runCatching {
+            app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 20L)
+        }.onFailure { Log.w(LOG_TAG, "Page Uqload inaccessible ${safeRoute(url)}", it) }
+            .getOrNull() ?: return false
+        if (response.okhttpResponse.code !in 200..299) return false
+
+        val unpacked = runCatching { getAndUnpack(response.text) }
+            .onFailure { Log.w(LOG_TAG, "Script Uqload indécompactable ${safeRoute(url)}", it) }
+            .getOrNull().orEmpty()
+        val mediaUrl = sequenceOf(unpacked, response.text)
+            .flatMap { html -> URL_IN_SCRIPT.findAll(html.replace("\\/", "/")).map { cleanUrl(it.value) } }
+            .firstOrNull { DIRECT_MEDIA.containsMatchIn(it) }
+            ?: return false
+        val playerOrigin = runCatching {
+            val uri = URI(response.okhttpResponse.request.url.toString())
+            "${uri.scheme}://${uri.host}/"
+        }.getOrDefault(referer)
+        callback(newExtractorLink(
+            source = name,
+            name = "Xalaflix · Uqload",
+            url = mediaUrl,
+            type = if (mediaUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+        ) {
+            this.referer = playerOrigin
+            quality = getQualityFromName("HD")
+            headers = this@XalaflixProvider.headers
+        })
+        return true
+    }
+
+    private fun normalizeExtractorName(value: String): String =
+        value.lowercase().replace(Regex("[^a-z0-9]"), "")
+
+    private fun knownHostName(url: String): String? {
+        val host = runCatching { URI(url).host.orEmpty().lowercase() }.getOrDefault("")
+        return when {
+            "uqload" in host -> "uqload"
+            "vidzy" in host -> "vidzy"
+            host == "voe.sx" || host.startsWith("voe.") || ".voe." in host -> "voe"
+            "dood" in host -> "dood"
+            "streamtape" in host -> "streamtape"
+            "vidmoly" in host -> "vidmoly"
+            "filemoon" in host -> "filemoon"
+            "streamwish" in host || "wish" in host -> "streamwish"
+            "mixdrop" in host -> "mixdrop"
+            else -> null
+        }
+    }
+
+    private suspend fun loadNamedHostExtractor(
+        url: String,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val hostName = knownHostName(url) ?: return false
+        for (index in extractorApis.lastIndex downTo 0) {
+            val extractor = extractorApis[index]
+            val extractorName = normalizeExtractorName(extractor.name)
+            if (extractorName.isBlank()) continue
+            if (
+                extractorName != hostName &&
+                !extractorName.contains(hostName) &&
+                !hostName.contains(extractorName)
+            ) continue
+
+            var emitted = false
+            runCatching {
+                extractor.getUrl(
+                    url = url,
+                    referer = referer,
+                    subtitleCallback = subtitleCallback,
+                    callback = {
+                        emitted = true
+                        callback(it)
+                    },
+                )
+            }.onFailure {
+                Log.w(LOG_TAG, "Extracteur nommé $hostName impossible pour ${safeRoute(url)}", it)
+            }
+            if (emitted) return true
+        }
+        return false
     }
 
     private suspend fun fetchWithRefresh(path: String): Page? {
