@@ -27,6 +27,9 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.json.JSONObject
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import java.net.URI
 import java.net.URLEncoder
 
@@ -125,14 +128,19 @@ class XalaflixProvider : MainAPI() {
             }
         }
 
-        val episodeLinks = mediaId?.let {
-            loadSeriesEpisodes(loaded.origin, it, "${loaded.origin}$path")
-        }.orEmpty().ifEmpty { parseInlineEpisodes(doc) }
-        val episodes = episodeLinks.map { episode ->
-            newEpisode(Playback(path, mediaId, episode.first).encode()) {
-                name = episode.fourth ?: "Épisode ${episode.third}"
-                season = episode.second
-                this.episode = episode.third
+        val siteEpisodes = parseSiteEpisodes(doc, loaded.origin)
+        val enrichedEpisodes = coroutineScope {
+            siteEpisodes.map { item ->
+                async { enrichEpisode(item, loaded.origin) }
+            }.awaitAll()
+        }
+        val episodes = enrichedEpisodes.map { item ->
+            newEpisode(Playback(item.path, null).encode()) {
+                name = item.title
+                season = item.season
+                episode = item.episode
+                posterUrl = item.poster
+                description = item.description
             }
         }
         if (episodes.isEmpty()) throw ErrorLoadingException("Aucun épisode Xalaflix disponible")
@@ -388,6 +396,41 @@ class XalaflixProvider : MainAPI() {
         return result.distinctBy { it.first }.sortedWith(compareBy<Quad> { it.second }.thenBy { it.third })
     }
 
+    private data class SiteEpisode(
+        val path: String,
+        val season: Int,
+        val episode: Int,
+        val title: String,
+        val poster: String?,
+        val description: String? = null,
+    )
+
+    private fun parseSiteEpisodes(document: Document, origin: String): List<SiteEpisode> {
+        val result = LinkedHashMap<String, SiteEpisode>()
+        document.select("a[href*=/episode/]").forEach { anchor ->
+            val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
+            val path = runCatching { URI(href).path }.getOrNull() ?: return@forEach
+            val numbers = EPISODE_PATH.matchEntire(path) ?: return@forEach
+            val season = numbers.groupValues[1].toIntOrNull() ?: return@forEach
+            val episode = numbers.groupValues[2].toIntOrNull() ?: return@forEach
+            val container = anchor.closest("div.relative.group") ?: anchor.parent()
+            val title = container?.selectFirst("h3")?.text()?.trim()?.takeIf(String::isNotBlank)
+                ?: "Épisode $episode"
+            val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
+            result[path] = SiteEpisode(path, season, episode, title, poster)
+        }
+        return result.values.sortedWith(compareBy<SiteEpisode> { it.season }.thenBy { it.episode })
+    }
+
+    private suspend fun enrichEpisode(item: SiteEpisode, origin: String): SiteEpisode {
+        val document = fetch(origin, item.path) ?: return item
+        val description = document.selectFirst(
+            "h1 ~ p.text-gray-400.mt-3, .flex-1 > p.text-gray-400.mt-3, " +
+                "p.text-x.text-gray-400.mt-3, .description, [class*=overview]",
+        )?.text()?.trim()?.takeIf(String::isNotBlank)
+        return item.copy(description = description)
+    }
+
     private fun parseCards(doc: Document, origin: String): List<SearchResponse> {
         val results = LinkedHashMap<String, SearchResponse>()
         doc.select("a[href*=/movie/], a[href*=/tv-show/]").forEach { anchor ->
@@ -535,6 +578,7 @@ class XalaflixProvider : MainAPI() {
         private val YEAR = Regex("\\b(?:19|20)\\d{2}\\b")
         private val SEASON = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+)")
         private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
+        private val EPISODE_PATH = Regex("(?i)^/episode/[^/]+/(\\d+)-(\\d+)/?$")
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
