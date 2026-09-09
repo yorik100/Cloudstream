@@ -2,7 +2,7 @@ import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.tasks.Sync
 
-version = 60
+version = 61
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -42,7 +42,7 @@ tasks.named<CompileDexTask>("compileDex") {
 }
 
 cloudstream {
-    description = "AfterDark - détection checkbox dans le Shadow DOM fermé"
+    description = "AfterDark - vérification + lancement de vidéo automatique"
     authors = listOf("yorik100")
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
