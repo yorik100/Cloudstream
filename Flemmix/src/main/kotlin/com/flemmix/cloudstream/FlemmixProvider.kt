@@ -162,20 +162,14 @@ class FlemmixProvider : MainAPI() {
         query: String,
     ): List<SearchResponse>? {
         val response = runCatching {
-            // The current Flemmix quick-search form posts directly to the
-            // site root. Its hidden DLE fields are present but intentionally
-            // empty; sending the former index.php GET query only returns the
-            // regular catalogue instead of actual search results.
-            app.post(
-                url = "$origin/",
-                data = mapOf(
-                    "do" to "",
-                    "subaction" to "",
+            app.get(
+                url = "$origin/index.php",
+                params = mapOf(
+                    "do" to "search",
+                    "subaction" to "search",
                     "story" to query,
                 ),
-                headers = browserHeaders + (
-                    "Content-Type" to "application/x-www-form-urlencoded"
-                ),
+                headers = browserHeaders,
                 referer = "$origin/",
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
@@ -184,7 +178,10 @@ class FlemmixProvider : MainAPI() {
 
         if (response.okhttpResponse.code !in 200..299) return null
         if (!SEARCH_PAGE_REGEX.containsMatchIn(response.text)) return null
-        val normalizedQuery = normalizeForMatch(query)
+        val queryTerms = normalizeForMatch(query)
+            .split(' ')
+            .filter(String::isNotBlank)
+        if (queryTerms.isEmpty()) return emptyList()
 
         // La page de recherche contient aussi des cartes de recommandation.
         // On analyse toute la réponse afin de ne pas dépendre de la position
@@ -196,8 +193,7 @@ class FlemmixProvider : MainAPI() {
                     .filterNotNull()
                     .map(::normalizeForMatch)
                     .any { title ->
-                        title.contains(normalizedQuery) ||
-                            normalizedQuery.contains(title)
+                        queryTerms.all { term -> title.contains(term) }
                     }
             }
             .map { it.response }
