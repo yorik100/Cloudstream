@@ -161,12 +161,21 @@ class FlemmixProvider : MainAPI() {
         origin: String,
         query: String,
     ): List<SearchResponse>? {
-        val searchUrl =
-            "$origin/index.php?do=search&subaction=search&story=${encode(query)}"
         val response = runCatching {
-            app.get(
-                url = searchUrl,
-                headers = browserHeaders,
+            // The current Flemmix quick-search form posts directly to the
+            // site root. Its hidden DLE fields are present but intentionally
+            // empty; sending the former index.php GET query only returns the
+            // regular catalogue instead of actual search results.
+            app.post(
+                url = "$origin/",
+                data = mapOf(
+                    "do" to "",
+                    "subaction" to "",
+                    "story" to query,
+                ),
+                headers = browserHeaders + (
+                    "Content-Type" to "application/x-www-form-urlencoded"
+                ),
                 referer = "$origin/",
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
