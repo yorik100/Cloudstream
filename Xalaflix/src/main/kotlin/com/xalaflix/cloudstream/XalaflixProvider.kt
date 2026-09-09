@@ -107,7 +107,10 @@ class XalaflixProvider : MainAPI() {
             ?: doc.title().substringBefore(" Streaming").trim().takeIf(String::isNotBlank)
             ?: throw ErrorLoadingException("Titre Xalaflix introuvable")
         val poster = absolute(doc.selectFirst(".detail_page-infor img, .film-poster-img, .movie-poster img, img[src*=image.tmdb]")?.absUrl("src"), loaded.origin)
-        val plot = doc.selectFirst(".description, .detail_page-infor .description, .film-description, [class*=overview]")?.text()?.trim()
+        val plot = doc.selectFirst(
+            "h1 ~ p.text-gray-400.mt-3, .flex-1 > p.text-gray-400.mt-3, " +
+                ".description, .detail_page-infor .description, .film-description, [class*=overview]",
+        )?.text()?.trim()?.takeIf(String::isNotBlank)
         val year = YEAR.find(doc.text())?.value?.toIntOrNull()
         val tags = doc.select("a[href*=/genre/]").map { it.text().trim() }.filter(String::isNotBlank).distinct()
         val mediaId = findMediaId(doc, url)
