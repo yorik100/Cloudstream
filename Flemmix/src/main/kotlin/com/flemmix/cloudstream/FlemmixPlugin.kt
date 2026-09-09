@@ -13,6 +13,7 @@ class FlemmixPlugin : Plugin() {
     private val discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun load(context: Context) {
+        FlemmixRuntime.init(context)
         val provider = FlemmixProvider()
         registerMainAPI(provider)
 

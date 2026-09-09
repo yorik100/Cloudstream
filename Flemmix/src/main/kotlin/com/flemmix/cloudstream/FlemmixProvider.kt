@@ -229,6 +229,8 @@ class FlemmixProvider : MainAPI() {
         }.onFailure { error ->
             Log.w(SEARCH_TAG, "Navigation de recherche impossible sur $origin", error)
         }.getOrNull()
+        val navigationBlocked = navigationResponse?.text
+            ?.contains(BOT_SHIELD_TEXT, ignoreCase = true) == true
 
         if (navigationResponse != null && navigationResponse.okhttpResponse.code in 200..299) {
             val navigationResults = filterSearchItems(
@@ -281,6 +283,23 @@ class FlemmixProvider : MainAPI() {
             parseSearchSuggestions(response.text, origin),
             queryTerms,
         )
+
+        val ajaxBlocked = response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)
+        if (results.isEmpty() && (navigationBlocked || ajaxBlocked)) {
+            Log.i(SEARCH_TAG, "Bot Shield détecté, recherche WebView en arrière-plan")
+            val browserHtml = FlemmixSearchWebView.load(origin, query)
+            val browserResults = browserHtml?.let {
+                filterSearchItems(parseItems(it, origin, null), queryTerms)
+            }.orEmpty()
+            if (browserResults.isNotEmpty()) {
+                Log.i(SEARCH_TAG, "Recherche WebView '$query' : ${browserResults.size} résultat(s)")
+                return browserResults
+            }
+            Log.w(
+                SEARCH_TAG,
+                "Recherche WebView sans résultat ; taille=${browserHtml?.length ?: 0}",
+            )
+        }
 
         if (results.isEmpty()) {
             Log.w(
@@ -892,6 +911,7 @@ class FlemmixProvider : MainAPI() {
         const val ITEM_CONTEXT_SIZE = 2500
         const val MAX_SEARCH_RESULTS = 40
         const val MINIMUM_TMDB_SCORE = 70
+        const val BOT_SHIELD_TEXT = "Bot shield active."
 
         val DETAIL_PATH_REGEX = Regex(
             """/(film-en-streaming|serie-en-streaming|film-ancien|saison-complete)/[0-9]+-[^/?#]+\.html""",
