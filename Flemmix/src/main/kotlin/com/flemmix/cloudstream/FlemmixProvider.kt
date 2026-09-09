@@ -1,6 +1,15 @@
 package com.flemmix.cloudstream
 
+import android.annotation.SuppressLint
+import android.graphics.Color
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -26,6 +35,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.Session
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
 import java.net.URI
 import java.net.URLEncoder
 import java.text.Normalizer
@@ -33,6 +43,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import kotlin.math.max
 
 class FlemmixProvider : MainAPI() {
@@ -985,4 +998,109 @@ class FlemmixProvider : MainAPI() {
         val HEX_ENTITY_REGEX = Regex("""&#x([0-9a-f]+);""", RegexOption.IGNORE_CASE)
         val DECIMAL_ENTITY_REGEX = Regex("""&#([0-9]+);""")
     }
+}
+
+object FlemmixSearchWebView {
+    private const val TIMEOUT_MS = 25_000L
+    private const val POLL_INTERVAL_MS = 500L
+
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun load(origin: String, query: String): String? =
+        suspendCoroutine { continuation ->
+            val handler = Handler(Looper.getMainLooper())
+            val finished = AtomicBoolean(false)
+            var webView: WebView? = null
+            var searchStarted = false
+            var pollingStarted = false
+
+            val searchUrl = Uri.parse("$origin/index.php").buildUpon()
+                .appendQueryParameter("do", "search")
+                .appendQueryParameter("subaction", "search")
+                .appendQueryParameter("story", query)
+                .build()
+                .toString()
+
+            lateinit var timeout: Runnable
+            fun finish(html: String?) {
+                if (!finished.compareAndSet(false, true)) return
+                handler.removeCallbacks(timeout)
+                handler.post {
+                    runCatching {
+                        val view = webView
+                        (view?.parent as? ViewGroup)?.removeView(view)
+                        view?.stopLoading()
+                        view?.destroy()
+                    }
+                    webView = null
+                }
+                continuation.resume(html)
+            }
+
+            timeout = Runnable { finish(null) }
+            handler.post {
+                val activity = FlemmixRuntime.currentActivity()
+                if (activity == null || activity.isFinishing) {
+                    finish(null)
+                    return@post
+                }
+
+                try {
+                    val cookieManager = CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    val view = WebView(activity).apply {
+                        setBackgroundColor(Color.TRANSPARENT)
+                        alpha = 0.01f
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.userAgentString =
+                            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
+                                "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, url: String) {
+                                if (finished.get() || url == "about:blank") return
+
+                                if (!searchStarted) {
+                                    searchStarted = true
+                                    handler.postDelayed({
+                                        if (!finished.get()) {
+                                            view.loadUrl(searchUrl, mapOf("Referer" to "$origin/"))
+                                        }
+                                    }, 500L)
+                                    return
+                                }
+
+                                if (pollingStarted) return
+                                pollingStarted = true
+                                lateinit var poll: Runnable
+                                poll = Runnable {
+                                    if (finished.get()) return@Runnable
+                                    view.evaluateJavascript(
+                                        "(function(){return document.documentElement.outerHTML;})()",
+                                    ) { encoded ->
+                                        if (finished.get()) return@evaluateJavascript
+                                        val html = runCatching {
+                                            JSONTokener(encoded).nextValue() as? String
+                                        }.getOrNull()
+                                        val hasCards = html?.contains("mov-t", ignoreCase = true) == true
+                                        if (hasCards && html.length > 500) {
+                                            finish(html)
+                                        } else {
+                                            handler.postDelayed(poll, POLL_INTERVAL_MS)
+                                        }
+                                    }
+                                }
+                                handler.post(poll)
+                            }
+                        }
+                    }
+                    webView = view
+                    cookieManager.setAcceptThirdPartyCookies(view, true)
+                    activity.addContentView(view, ViewGroup.LayoutParams(1, 1))
+                    view.loadUrl("$origin/")
+                    handler.postDelayed(timeout, TIMEOUT_MS)
+                } catch (_: Throwable) {
+                    finish(null)
+                }
+            }
+        }
 }
