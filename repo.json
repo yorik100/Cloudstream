@@ -1,6 +1,6 @@
 {
   "name": "French providers repository",
-  "description": "AfterDark & Frembed",
+  "description": "AfterDark, Frembed & Flemmix/Wiflix",
   "manifestVersion": 1,
   "pluginLists": [
     "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/plugins.json"

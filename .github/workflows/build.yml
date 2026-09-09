@@ -39,9 +39,26 @@ jobs:
         with:
           gradle-version: "8.14.4"
 
-      - name: Build AfterDark and Frembed
+      - name: Build AfterDark, Frembed and Flemmix
         run: |
-          gradle :AfterDark:make :Frembed:make makePluginsJson --stacktrace
+          gradle :AfterDark:make :Frembed:make :Flemmix:make makePluginsJson --stacktrace
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          plugins_file = Path("build/plugins.json")
+          plugins = json.loads(plugins_file.read_text(encoding="utf-8"))
+
+          for plugin in plugins:
+              if plugin.get("internalName") == "Flemmix":
+                  plugin["name"] = "Flemmix/Wiflix"
+
+          plugins_file.write_text(
+              json.dumps(plugins, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Prepare builds branch contents
         shell: bash
@@ -51,18 +68,18 @@ jobs:
           rm -rf /tmp/cloudstream-publish
           mkdir -p /tmp/cloudstream-publish
 
-          find AfterDark/build Frembed/build -maxdepth 1 -type f -name '*.cs3' \
+          find AfterDark/build Frembed/build Flemmix/build -maxdepth 1 -type f -name '*.cs3' \
             -exec cp -v {} /tmp/cloudstream-publish/ \;
 
-          find AfterDark/build Frembed/build -maxdepth 1 -type f -name '*.jar' \
+          find AfterDark/build Frembed/build Flemmix/build -maxdepth 1 -type f -name '*.jar' \
             -exec cp -v {} /tmp/cloudstream-publish/ \;
 
           cp -v build/plugins.json /tmp/cloudstream-publish/plugins.json
           cp -v repo.json /tmp/cloudstream-publish/repo.json
 
           CS3_COUNT="$(find /tmp/cloudstream-publish -maxdepth 1 -type f -name '*.cs3' | wc -l)"
-          if [ "$CS3_COUNT" -lt 2 ]; then
-            echo "ERROR: expected at least 2 .cs3 files, found $CS3_COUNT"
+          if [ "$CS3_COUNT" -lt 3 ]; then
+            echo "ERROR: expected at least 3 .cs3 files, found $CS3_COUNT"
             find /tmp/cloudstream-publish -maxdepth 1 -type f -print
             exit 1
           fi
