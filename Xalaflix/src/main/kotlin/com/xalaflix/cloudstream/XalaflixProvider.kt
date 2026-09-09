@@ -24,6 +24,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.json.JSONObject
 import java.net.URI
 import java.net.URLEncoder
 
@@ -58,13 +59,14 @@ class XalaflixProvider : MainAPI() {
     }
 
     private data class Page(val document: Document, val origin: String)
-    private data class Playback(val path: String, val episodePath: String? = null) {
-        fun encode(): String = listOf(path, episodePath.orEmpty()).joinToString("\n")
+    private data class Playback(val path: String, val mediaId: String, val episodeId: String? = null) {
+        fun encode(): String = listOf(path, mediaId, episodeId.orEmpty()).joinToString("\n")
         companion object {
             fun decode(raw: String): Playback? {
-                val parts = raw.split('\n', limit = 2)
+                val parts = raw.split('\n', limit = 3)
                 val path = parts.firstOrNull()?.takeIf { it.startsWith('/') } ?: return null
-                return Playback(path, parts.getOrNull(1)?.takeIf(String::isNotBlank))
+                val mediaId = parts.getOrNull(1)?.takeIf(String::isNotBlank) ?: return null
+                return Playback(path, mediaId, parts.getOrNull(2)?.takeIf(String::isNotBlank))
             }
         }
     }
@@ -83,7 +85,7 @@ class XalaflixProvider : MainAPI() {
         // Aucun appel de recherche n'est effectué avant la résolution.
         val origin = resolver.resolvedOriginOrNull() ?: runCatching { ensureDomain() }.getOrNull() ?: return emptyList()
         mainUrl = origin
-        val route = "/search?keyword=${encode(query)}"
+        val route = "/search/${query.trim().replace(Regex("\\s+"), "-")}"
         fetch(origin, route)?.let { page ->
             val results = parseCards(page, origin)
             if (results.isNotEmpty()) return results
@@ -106,9 +108,12 @@ class XalaflixProvider : MainAPI() {
         val plot = doc.selectFirst(".description, .detail_page-infor .description, .film-description, [class*=overview]")?.text()?.trim()
         val year = YEAR.find(doc.text())?.value?.toIntOrNull()
         val tags = doc.select("a[href*=/genre/]").map { it.text().trim() }.filter(String::isNotBlank).distinct()
+        val mediaId = doc.selectFirst(".detail_page-infor[data-id], .film-poster[data-id], [data-id][class*=detail]")
+            ?.attr("data-id")?.takeIf(String::isNotBlank)
+            ?: throw ErrorLoadingException("Identifiant Xalaflix introuvable")
 
         if (type == TvType.Movie) {
-            return newMovieLoadResponse(title, url, type, Playback(path).encode()) {
+            return newMovieLoadResponse(title, url, type, Playback(path, mediaId).encode()) {
                 posterUrl = poster
                 this.plot = plot
                 this.year = year
@@ -116,14 +121,15 @@ class XalaflixProvider : MainAPI() {
             }
         }
 
-        val episodeLinks = parseEpisodes(doc, loaded.origin)
-        val episodes = if (episodeLinks.isNotEmpty()) episodeLinks.map { episode ->
-            newEpisode(Playback(path, episode.first).encode()) {
+        val episodeLinks = loadSeriesEpisodes(loaded.origin, mediaId)
+        val episodes = episodeLinks.map { episode ->
+            newEpisode(Playback(path, mediaId, episode.first).encode()) {
                 name = episode.fourth ?: "Épisode ${episode.third}"
                 season = episode.second
                 this.episode = episode.third
             }
-        } else listOf(newEpisode(Playback(path).encode()) { name = "Lecture"; season = 1; episode = 1 })
+        }
+        if (episodes.isEmpty()) throw ErrorLoadingException("Aucun épisode Xalaflix disponible")
 
         return newTvSeriesLoadResponse(title, url, type, episodes) {
             posterUrl = poster
@@ -141,19 +147,10 @@ class XalaflixProvider : MainAPI() {
     ): Boolean {
         val playback = Playback.decode(data) ?: return false
         // Même garde que load(): résolution obligatoire avant toute lecture.
-        val route = playback.episodePath ?: playback.path
-        val loaded = fetchWithRefresh(route) ?: return false
-        val referer = "${loaded.origin}$route"
-        val urls = extractPlayers(loaded.document, loaded.origin).toMutableList()
-        // Certains boutons Xalaflix ouvrent d'abord une page lecteur interne.
-        // On la déroule une seule fois avant de déléguer aux extracteurs.
-        urls.filter { it.second.startsWith(loaded.origin) }.toList().forEach { (_, internalUrl) ->
-            val internalPath = runCatching {
-                val uri = URI(internalUrl)
-                uri.rawPath + (uri.rawQuery?.let { "?$it" } ?: "")
-            }.getOrNull() ?: return@forEach
-            fetch(loaded.origin, internalPath)?.let { urls += extractPlayers(it, loaded.origin) }
-        }
+        val loaded = fetchWithRefresh(playback.path) ?: return false
+        val referer = "${loaded.origin}${playback.path}"
+        val playableId = playback.episodeId ?: loadMovieEpisodeId(loaded.origin, playback.mediaId) ?: return false
+        val urls = loadServerSources(loaded.origin, playableId)
         var emitted = false
         for ((label, playerUrl) in urls.distinctBy { it.second }) {
             if (DIRECT_MEDIA.containsMatchIn(playerUrl)) {
@@ -197,6 +194,89 @@ class XalaflixProvider : MainAPI() {
         return doc.takeIf { it.select("a[href*=/movie/], a[href*=/tv-show/], iframe, video, source, h1").isNotEmpty() }
     }
 
+    private suspend fun ajaxDocument(origin: String, paths: List<String>): Document? {
+        for (path in paths) {
+            val response = runCatching {
+                app.get("$origin$path", headers = headers + ("X-Requested-With" to "XMLHttpRequest"), referer = "$origin/", cacheTime = 0, timeout = 15L)
+            }.getOrNull() ?: continue
+            if (response.okhttpResponse.code !in 200..299) continue
+            val html = runCatching {
+                val json = JSONObject(response.text)
+                listOf("html", "result", "data").firstNotNullOfOrNull { key -> json.optString(key).takeIf(String::isNotBlank) }
+            }.getOrNull() ?: response.text
+            val document = Jsoup.parseBodyFragment(html, "$origin/")
+            if (document.select("[data-id], a[href], iframe[src]").isNotEmpty()) return document
+        }
+        return null
+    }
+
+    private suspend fun loadMovieEpisodeId(origin: String, mediaId: String): String? {
+        val document = ajaxDocument(origin, listOf(
+            "/ajax/movie/episodes/$mediaId",
+            "/ajax/v2/movie/episodes/$mediaId",
+        )) ?: return null
+        return document.selectFirst("[data-id]")?.attr("data-id")?.takeIf(String::isNotBlank)
+    }
+
+    private suspend fun loadSeriesEpisodes(origin: String, mediaId: String): List<Quad> {
+        val seasons = ajaxDocument(origin, listOf(
+            "/ajax/v2/tv/seasons/$mediaId",
+            "/ajax/tv/seasons/$mediaId",
+        )) ?: return emptyList()
+        val result = ArrayList<Quad>()
+        for ((seasonIndex, seasonNode) in seasons.select("[data-id]").withIndex()) {
+            val seasonId = seasonNode.attr("data-id").takeIf(String::isNotBlank) ?: continue
+            val seasonNumber = SEASON.find(seasonNode.text())?.groupValues?.getOrNull(1)?.toIntOrNull() ?: seasonIndex + 1
+            val episodes = ajaxDocument(origin, listOf(
+                "/ajax/v2/season/episodes/$seasonId",
+                "/ajax/season/episodes/$seasonId",
+            )) ?: continue
+            episodes.select("[data-id]").forEachIndexed { index, node ->
+                val episodeId = node.attr("data-id").takeIf(String::isNotBlank) ?: return@forEachIndexed
+                val text = node.text().trim()
+                val number = EPISODE_NUMBER.find(text)?.groupValues?.getOrNull(1)?.toIntOrNull() ?: index + 1
+                result += Quad(episodeId, seasonNumber, number, text.takeIf(String::isNotBlank))
+            }
+        }
+        return result.distinctBy { it.first }.sortedWith(compareBy<Quad> { it.second }.thenBy { it.third })
+    }
+
+    private suspend fun loadServerSources(origin: String, episodeId: String): List<Pair<String, String>> {
+        val servers = ajaxDocument(origin, listOf(
+            "/ajax/v2/episode/servers/$episodeId",
+            "/ajax/episode/servers/$episodeId",
+        )) ?: return emptyList()
+        val result = LinkedHashMap<String, Pair<String, String>>()
+        for (server in servers.select("[data-id]")) {
+            val serverId = server.attr("data-id").takeIf(String::isNotBlank) ?: continue
+            var url: String? = null
+            for (sourcePath in listOf(
+                "/ajax/v2/episode/sources/$serverId",
+                "/ajax/episode/sources/$serverId",
+            )) {
+                val response = runCatching {
+                    app.get(
+                        "$origin$sourcePath",
+                        headers = headers + ("X-Requested-With" to "XMLHttpRequest"),
+                        referer = "$origin/",
+                        cacheTime = 0,
+                        timeout = 15L,
+                    )
+                }.getOrNull() ?: continue
+                if (response.okhttpResponse.code !in 200..299) continue
+                val json = runCatching { JSONObject(response.text) }.getOrNull() ?: continue
+                url = listOf("link", "url", "file").firstNotNullOfOrNull { key ->
+                    json.optString(key).takeIf(String::isNotBlank)
+                }
+                if (url != null) break
+            }
+            val playerUrl = url ?: continue
+            val label = server.text().trim().ifBlank { "Lecteur" }
+            result[playerUrl] = label to playerUrl
+        }
+        return result.values.toList()
+    }
+
     private fun parseCards(doc: Document, origin: String): List<SearchResponse> {
         val results = LinkedHashMap<String, SearchResponse>()
         doc.select("a[href*=/movie/], a[href*=/tv-show/]").forEach { anchor ->
@@ -219,22 +299,6 @@ class XalaflixProvider : MainAPI() {
             results.putIfAbsent(path, response)
         }
         return results.values.toList()
-    }
-
-    private fun parseEpisodes(doc: Document, origin: String): List<Quad> {
-        val result = LinkedHashMap<String, Quad>()
-        doc.select("a[href]").forEach { link ->
-            val text = link.text().trim()
-            val href = link.absUrl("href").ifBlank { link.attr("href") }
-            val match = EPISODE.find("$text $href") ?: return@forEach
-            val episode = match.groupValues[2].toIntOrNull() ?: return@forEach
-            val season = match.groupValues[1].toIntOrNull() ?: 1
-            val uri = runCatching { URI(href) }.getOrNull()
-            val path = uri?.rawPath?.plus(uri.rawQuery?.let { "?$it" }.orEmpty()) ?: href
-            if (!path.startsWith('/')) return@forEach
-            result.putIfAbsent(path, Quad(path, season, episode, text.takeIf(String::isNotBlank)))
-        }
-        return result.values.sortedWith(compareBy<Quad> { it.second }.thenBy { it.third })
     }
 
     private data class Quad(val first: String, val second: Int, val third: Int, val fourth: String?)
@@ -275,7 +339,8 @@ class XalaflixProvider : MainAPI() {
     companion object {
         private val DETAIL = Regex("^/(movie|tv-show)/[^/?#]+/?$", RegexOption.IGNORE_CASE)
         private val YEAR = Regex("\\b(?:19|20)\\d{2}\\b")
-        private val EPISODE = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+).*?(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
+        private val SEASON = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+)")
+        private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
     }
