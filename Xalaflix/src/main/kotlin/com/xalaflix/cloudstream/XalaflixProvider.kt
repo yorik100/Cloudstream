@@ -72,7 +72,10 @@ class XalaflixProvider : MainAPI() {
         companion object {
             fun decode(raw: String): Playback? {
                 val parts = raw.split('\n', limit = 3)
-                val path = parts.firstOrNull()?.takeIf { it.startsWith('/') } ?: return null
+                val first = parts.firstOrNull()?.trim().orEmpty()
+                val path = first.takeIf { it.startsWith('/') }
+                    ?: runCatching { URI(first).path }.getOrNull()?.takeIf { it.startsWith('/') }
+                    ?: return null
                 val mediaId = parts.getOrNull(1)?.takeIf(String::isNotBlank)
                 return Playback(path, mediaId, parts.getOrNull(2)?.takeIf(String::isNotBlank))
             }
@@ -508,9 +511,20 @@ class XalaflixProvider : MainAPI() {
         snapshot: String,
         seasonId: String,
     ): LivewireSeasonPage? {
-        val call = mapOf("path" to "", "method" to "updateSeason", "params" to listOf(seasonId))
-        val component = mapOf("snapshot" to snapshot, "updates" to emptyMap<String, String>(), "calls" to listOf(call))
-        val payload = mapOf("_token" to csrf, "components" to listOf(component))
+        // Session(app.baseClient) ne conserve pas le ResponseParser de CloudStream.
+        // Une Map serait donc envoyée via Map.toString() et non en JSON. JSONObject
+        // force NiceHttp à produire un véritable corps application/json.
+        val call = JSONObject()
+            .put("path", "")
+            .put("method", "updateSeason")
+            .put("params", JSONArray().put(seasonId))
+        val component = JSONObject()
+            .put("snapshot", snapshot)
+            .put("updates", JSONObject())
+            .put("calls", JSONArray().put(call))
+        val payload = JSONObject()
+            .put("_token", csrf)
+            .put("components", JSONArray().put(component))
         val response = runCatching {
             siteSession.post(
                 "$origin/livewire/update",
