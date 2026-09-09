@@ -2,7 +2,6 @@ package com.flemmix.cloudstream
 
 import android.annotation.SuppressLint
 import android.graphics.Color
-import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -1015,12 +1014,10 @@ object FlemmixSearchWebViewV16 {
             var lastHtml: String? = null
             var lastUrl: String? = null
 
-            val searchUrl = Uri.parse("$origin/index.php").buildUpon()
-                .appendQueryParameter("do", "search")
-                .appendQueryParameter("subaction", "search")
-                .appendQueryParameter("story", query)
-                .build()
-                .toString()
+            val quotedQuery = JSONObject.quote(query)
+            val quotedAction = JSONObject.quote(
+                "$origin/index.php?do=search&subaction=search",
+            )
 
             lateinit var timeout: Runnable
             fun finish(html: String?) {
@@ -1071,7 +1068,35 @@ object FlemmixSearchWebViewV16 {
                                     searchStarted = true
                                     handler.postDelayed({
                                         if (!finished.get()) {
-                                            view.loadUrl(searchUrl, mapOf("Referer" to "$origin/"))
+                                            view.evaluateJavascript(
+                                                """
+                                                (function() {
+                                                    var form = document.querySelector('#quicksearch');
+                                                    if (!form) return 'missing-form';
+                                                    var story = form.querySelector('[name="story"]');
+                                                    if (!story) return 'missing-story';
+                                                    story.value = $quotedQuery;
+                                                    var doField = form.querySelector('[name="do"]');
+                                                    var subaction = form.querySelector('[name="subaction"]');
+                                                    if (doField) doField.value = 'search';
+                                                    if (subaction) subaction.value = 'search';
+                                                    form.method = 'post';
+                                                    form.action = $quotedAction;
+                                                    if (typeof form.requestSubmit === 'function') {
+                                                        form.requestSubmit();
+                                                    } else {
+                                                        form.submit();
+                                                    }
+                                                    return 'submitted';
+                                                })();
+                                                """.trimIndent(),
+                                            ) { result ->
+                                                Log.i(
+                                                    "FlemmixSearchWebView",
+                                                    "Soumission du formulaire : $result",
+                                                )
+                                                if (result.contains("missing-")) finish(null)
+                                            }
                                         }
                                     }, 500L)
                                     return
