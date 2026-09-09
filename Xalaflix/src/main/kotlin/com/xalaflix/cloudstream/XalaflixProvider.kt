@@ -59,13 +59,13 @@ class XalaflixProvider : MainAPI() {
     }
 
     private data class Page(val document: Document, val origin: String)
-    private data class Playback(val path: String, val mediaId: String, val episodeId: String? = null) {
-        fun encode(): String = listOf(path, mediaId, episodeId.orEmpty()).joinToString("\n")
+    private data class Playback(val path: String, val mediaId: String?, val episodeId: String? = null) {
+        fun encode(): String = listOf(path, mediaId.orEmpty(), episodeId.orEmpty()).joinToString("\n")
         companion object {
             fun decode(raw: String): Playback? {
                 val parts = raw.split('\n', limit = 3)
                 val path = parts.firstOrNull()?.takeIf { it.startsWith('/') } ?: return null
-                val mediaId = parts.getOrNull(1)?.takeIf(String::isNotBlank) ?: return null
+                val mediaId = parts.getOrNull(1)?.takeIf(String::isNotBlank)
                 return Playback(path, mediaId, parts.getOrNull(2)?.takeIf(String::isNotBlank))
             }
         }
@@ -108,9 +108,7 @@ class XalaflixProvider : MainAPI() {
         val plot = doc.selectFirst(".description, .detail_page-infor .description, .film-description, [class*=overview]")?.text()?.trim()
         val year = YEAR.find(doc.text())?.value?.toIntOrNull()
         val tags = doc.select("a[href*=/genre/]").map { it.text().trim() }.filter(String::isNotBlank).distinct()
-        val mediaId = doc.selectFirst(".detail_page-infor[data-id], .film-poster[data-id], [data-id][class*=detail]")
-            ?.attr("data-id")?.takeIf(String::isNotBlank)
-            ?: throw ErrorLoadingException("Identifiant Xalaflix introuvable")
+        val mediaId = findMediaId(doc, url)
 
         if (type == TvType.Movie) {
             return newMovieLoadResponse(title, url, type, Playback(path, mediaId).encode()) {
@@ -121,7 +119,7 @@ class XalaflixProvider : MainAPI() {
             }
         }
 
-        val episodeLinks = loadSeriesEpisodes(loaded.origin, mediaId)
+        val episodeLinks = mediaId?.let { loadSeriesEpisodes(loaded.origin, it) }.orEmpty()
         val episodes = episodeLinks.map { episode ->
             newEpisode(Playback(path, mediaId, episode.first).encode()) {
                 name = episode.fourth ?: "Épisode ${episode.third}"
@@ -149,7 +147,8 @@ class XalaflixProvider : MainAPI() {
         // Même garde que load(): résolution obligatoire avant toute lecture.
         val loaded = fetchWithRefresh(playback.path) ?: return false
         val referer = "${loaded.origin}${playback.path}"
-        val playableId = playback.episodeId ?: loadMovieEpisodeId(loaded.origin, playback.mediaId) ?: return false
+        val mediaId = playback.mediaId ?: findMediaId(loaded.document, referer) ?: return false
+        val playableId = playback.episodeId ?: loadMovieEpisodeId(loaded.origin, mediaId) ?: return false
         val urls = loadServerSources(loaded.origin, playableId)
         var emitted = false
         for ((label, playerUrl) in urls.distinctBy { it.second }) {
@@ -292,7 +291,10 @@ class XalaflixProvider : MainAPI() {
             if (title.equals("View All", true)) return@forEach
             val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
                 ?: container.selectFirst("img")?.let { imageUrl(it, origin) }
-            val itemUrl = "$origin$path"
+            val cardId = sequenceOf(anchor, container)
+                .map { it.attr("data-id") }
+                .firstOrNull { it.matches(NUMERIC_ID) }
+            val itemUrl = "$origin$path" + (cardId?.let { "#csid=$it" } ?: "")
             val response = if (path.startsWith("/tv-show/")) {
                 newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) { posterUrl = poster }
             } else newMovieSearchResponse(title, itemUrl, TvType.Movie) { posterUrl = poster }
@@ -329,6 +331,26 @@ class XalaflixProvider : MainAPI() {
         return path.takeIf { DETAIL.matches(it) }
     }
 
+    private fun findMediaId(doc: Document, sourceUrl: String): String? {
+        Regex("(?:#|&)csid=(\\d+)").find(sourceUrl)
+            ?.groupValues?.getOrNull(1)?.let { return it }
+
+        val selectors = listOf(
+            ".detail_page-infor[data-id]",
+            ".watch_block[data-id]",
+            "#watch-block[data-id]",
+            "[data-type][data-id]",
+            ".film-buttons [data-id]",
+            "[data-id]",
+        )
+        for (selector in selectors) {
+            doc.select(selector).firstOrNull { it.attr("data-id").matches(NUMERIC_ID) }
+                ?.attr("data-id")?.let { return it }
+        }
+
+        return MEDIA_ID_IN_SOURCE.find(doc.html())?.groupValues?.getOrNull(1)
+    }
+
     private fun absolute(raw: String?, origin: String): String? {
         if (raw.isNullOrBlank() || raw.startsWith("data:") || raw.startsWith("javascript:")) return null
         return runCatching { URI("$origin/").resolve(raw).toString() }.getOrNull()
@@ -338,6 +360,10 @@ class XalaflixProvider : MainAPI() {
 
     companion object {
         private val DETAIL = Regex("^/(movie|tv-show)/[^/?#]+/?$", RegexOption.IGNORE_CASE)
+        private val NUMERIC_ID = Regex("\\d+")
+        private val MEDIA_ID_IN_SOURCE = Regex(
+            "(?i)(?:movie_id|film_id|media_id|data-id)[\\s\\\"':=]+(?:\\\"|')?(\\d+)",
+        )
         private val YEAR = Regex("\\b(?:19|20)\\d{2}\\b")
         private val SEASON = Regex("(?i)(?:saison|season|s)[ ._-]*(\\d+)")
         private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
