@@ -1,5 +1,6 @@
 package com.xalaflix.cloudstream
 
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -109,6 +110,7 @@ class XalaflixProvider : MainAPI() {
         val year = YEAR.find(doc.text())?.value?.toIntOrNull()
         val tags = doc.select("a[href*=/genre/]").map { it.text().trim() }.filter(String::isNotBlank).distinct()
         val mediaId = findMediaId(doc, url)
+        Log.i(LOG_TAG, "Fiche type=$type path=$path mediaId=${mediaId ?: "absent"}")
 
         if (type == TvType.Movie) {
             return newMovieLoadResponse(title, url, type, Playback(path, mediaId).encode()) {
@@ -153,9 +155,11 @@ class XalaflixProvider : MainAPI() {
         val playableId = playback.episodeId
             ?: loadMovieEpisodeId(loaded.origin, mediaId, referer)
             ?: return extractAndEmit(loaded.document, loaded.origin, referer, subtitleCallback, callback)
+        Log.i(LOG_TAG, "Lecture path=${playback.path} mediaId=$mediaId playableId=$playableId")
         val urls = loadServerSources(loaded.origin, playableId, referer).ifEmpty {
             extractPlayers(loaded.document, loaded.origin)
         }
+        Log.i(LOG_TAG, "Sources trouvées=${urls.size}")
         var emitted = false
         for ((label, playerUrl) in urls.distinctBy { it.second }) {
             if (DIRECT_MEDIA.containsMatchIn(playerUrl)) {
@@ -228,7 +232,11 @@ class XalaflixProvider : MainAPI() {
                     cacheTime = 0,
                     timeout = 15L,
                 )
-            }.getOrNull() ?: continue
+            }.onFailure { Log.w(LOG_TAG, "AJAX impossible path=$path", it) }.getOrNull() ?: continue
+            Log.i(
+                LOG_TAG,
+                "AJAX path=$path HTTP=${response.okhttpResponse.code} taille=${response.text.length} aperçu='${preview(response.text)}'",
+            )
             if (response.okhttpResponse.code !in 200..299) continue
             val html = runCatching {
                 val json = JSONObject(response.text)
@@ -295,7 +303,11 @@ class XalaflixProvider : MainAPI() {
                         cacheTime = 0,
                         timeout = 15L,
                     )
-                }.getOrNull() ?: continue
+                }.onFailure { Log.w(LOG_TAG, "Source impossible path=$sourcePath", it) }.getOrNull() ?: continue
+                Log.i(
+                    LOG_TAG,
+                    "Source path=$sourcePath HTTP=${response.okhttpResponse.code} taille=${response.text.length} aperçu='${preview(response.text)}'",
+                )
                 if (response.okhttpResponse.code !in 200..299) continue
                 val json = runCatching { JSONObject(response.text) }.getOrNull() ?: continue
                 url = listOf("link", "url", "file").firstNotNullOfOrNull { key ->
@@ -405,7 +417,13 @@ class XalaflixProvider : MainAPI() {
 
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
 
+    private fun preview(value: String): String = value
+        .replace(Regex("\\s+"), " ")
+        .replace(Regex("https?://[^\\s\\\"']+"), "<url>")
+        .take(180)
+
     companion object {
+        private const val LOG_TAG = "XalaflixDebug"
         private val DETAIL = Regex("^/(movie|tv-show)/[^/?#]+/?$", RegexOption.IGNORE_CASE)
         private val NUMERIC_ID = Regex("\\d+")
         private val MEDIA_ID_IN_SOURCE = Regex(
