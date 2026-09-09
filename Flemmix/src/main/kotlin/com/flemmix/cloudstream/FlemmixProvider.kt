@@ -148,30 +148,56 @@ class FlemmixProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return emptyList()
-        val origin = ensureDomain()
-        val url = "$origin/index.php?do=search&subaction=search&story=${encode(query)}"
+
+        val firstOrigin = ensureDomain()
+        searchAtOrigin(firstOrigin, query)?.let { return it }
+
+        domainResolver.invalidate(firstOrigin)
+        val refreshedOrigin = ensureDomain()
+        return searchAtOrigin(refreshedOrigin, query).orEmpty()
+    }
+
+    private suspend fun searchAtOrigin(
+        origin: String,
+        query: String,
+    ): List<SearchResponse>? {
         val response = runCatching {
-            app.get(
-                url = url,
+            app.post(
+                url = "$origin/",
+                data = mapOf(
+                    "do" to "search",
+                    "subaction" to "search",
+                    "story" to query,
+                ),
                 headers = browserHeaders,
                 referer = "$origin/",
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
-        }.getOrNull() ?: return emptyList()
+        }.getOrNull() ?: return null
 
-        if (response.okhttpResponse.code !in 200..299) return emptyList()
+        if (response.okhttpResponse.code !in 200..299) return null
 
-        val results = parseItems(response.text, origin, null)
+        // Flemmix injecte les cartes vedettes de l'accueil avant les vrais
+        // résultats. Le formulaire fullsearch marque le début de la section
+        // de recherche renvoyée par DataLife Engine.
+        val searchStart = SEARCH_RESULTS_START_REGEX.find(response.text)
+            ?.range
+            ?.first
+            ?: return null
+        val searchHtml = response.text.substring(searchStart)
         val normalizedQuery = normalizeForMatch(query)
-        return results.filter { item ->
-            sequenceOf(item.response.name, item.originalTitle)
-                .filterNotNull()
-                .map(::normalizeForMatch)
-                .any { title ->
-                    title.contains(normalizedQuery) || normalizedQuery.contains(title)
-                }
-        }.ifEmpty { results.take(MAX_SEARCH_RESULTS) }
+
+        return parseItems(searchHtml, origin, null)
+            .filter { item ->
+                sequenceOf(item.response.name, item.originalTitle)
+                    .filterNotNull()
+                    .map(::normalizeForMatch)
+                    .any { title ->
+                        title.contains(normalizedQuery) ||
+                            normalizedQuery.contains(title)
+                    }
+            }
             .map { it.response }
             .distinctBy { it.url }
             .take(MAX_SEARCH_RESULTS)
@@ -734,6 +760,10 @@ class FlemmixProvider : MainAPI() {
         )
         val PAGE_LINK_REGEX = Regex(
             """href=[\"']([^\"']*/page/([0-9]+)/?)[\"']""",
+            RegexOption.IGNORE_CASE,
+        )
+        val SEARCH_RESULTS_START_REGEX = Regex(
+            """<form\b[^>]*(?:id|name)\s*=\s*[\"']fullsearch[\"'][^>]*>""",
             RegexOption.IGNORE_CASE,
         )
         val DETAIL_TITLE_REGEX = Regex(
