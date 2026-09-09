@@ -1,6 +1,11 @@
 import com.lagradost.cloudstream3.gradle.tasks.GenerateManifestTask
 
-version = 1
+version = 2
+
+val publishedIconBase =
+    "https://raw.githubusercontent.com/" +
+        (System.getenv("GITHUB_REPOSITORY") ?: "yorik100/Cloudstream") +
+        "/refs/heads/main/icons"
 
 dependencies {
     // CloudStream already provides coroutines at runtime.
@@ -14,8 +19,7 @@ cloudstream {
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
     isCrossPlatform = false
-    iconUrl =
-        "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/icons/KeepLink3.png"
+    iconUrl = "$publishedIconBase/KeepLink3.png"
 }
 
 // Le nom technique du projet reste "Flemmix" afin de produire un fichier
