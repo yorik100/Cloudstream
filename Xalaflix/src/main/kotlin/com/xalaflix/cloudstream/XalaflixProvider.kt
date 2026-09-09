@@ -1,6 +1,7 @@
 package com.xalaflix.cloudstream
 
 import android.util.Log
+import android.util.Base64
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -200,6 +201,7 @@ class XalaflixProvider : MainAPI() {
         var emitted = false
         val firstLevel = extractPlayers(document, origin)
         val players = LinkedHashMap<String, Pair<String, String>>()
+        val mediaReferers = HashMap<String, String>()
         firstLevel.forEach { players[it.second] = it }
         for ((_, url) in firstLevel) {
             if (isInternalEmbed(url, origin)) {
@@ -213,6 +215,19 @@ class XalaflixProvider : MainAPI() {
                     nested.forEach { players[it.second] = it }
                 }
             }
+            if (isVidzyEmbed(url)) {
+                val response = runCatching {
+                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
+                }.onFailure { Log.w(LOG_TAG, "Lecteur Vidzy inaccessible ${safeRoute(url)}", it) }.getOrNull()
+                if (response != null && response.okhttpResponse.code in 200..299) {
+                    val mediaUrl = decodeVidzySource(response.text, URI(url).host.orEmpty())
+                    Log.i(LOG_TAG, "Lecteur Vidzy ${safeRoute(url)} HTTP=${response.okhttpResponse.code} HLS=${mediaUrl != null}")
+                    if (mediaUrl != null) {
+                        players[mediaUrl] = "Vidzy" to mediaUrl
+                        mediaReferers[mediaUrl] = url
+                    }
+                }
+            }
         }
         for ((label, url) in players.values) {
             if (DIRECT_MEDIA.containsMatchIn(url)) {
@@ -222,7 +237,7 @@ class XalaflixProvider : MainAPI() {
                     url = url,
                     type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
                 ) {
-                    this.referer = referer
+                    this.referer = mediaReferers[url] ?: referer
                     quality = getQualityFromName(label)
                     headers = this@XalaflixProvider.headers
                 })
@@ -415,6 +430,9 @@ class XalaflixProvider : MainAPI() {
                 result[url] = "Lecteur" to url
             }
         }
+        SCRIPT_LINK.findAll(doc.html()).forEach { match ->
+            absolute(cleanUrl(match.groupValues[1]), origin)?.let { result[it] = "Lecteur" to it }
+        }
         RELATIVE_EMBED.findAll(doc.html()).forEach { match ->
             absolute(cleanUrl(match.value), origin)?.let { result[it] = "Lecteur interne" to it }
         }
@@ -437,6 +455,23 @@ class XalaflixProvider : MainAPI() {
         val uri = URI(raw)
         uri.host.equals(URI(origin).host, true) && uri.path.orEmpty().contains("/embed-", true)
     }.getOrDefault(false)
+
+    private fun isVidzyEmbed(raw: String): Boolean = runCatching {
+        URI(raw).host.orEmpty().contains("vidzy.", true) && URI(raw).path.orEmpty().contains("/embed-", true)
+    }.getOrDefault(false)
+
+    private fun decodeVidzySource(html: String, hostname: String): String? {
+        val hostKey = hostname.sumOf { it.code } and 255
+        for (match in LONG_BASE64.findAll(html)) {
+            val bytes = runCatching { Base64.decode(match.value, Base64.DEFAULT) }.getOrNull() ?: continue
+            val reversed = bytes.reversedArray()
+            val decoded = CharArray(reversed.size) { index ->
+                ((reversed[index].toInt() and 255) xor ((0x3d + index * 89 + hostKey) and 255)).toChar()
+            }.concatToString()
+            if (decoded.startsWith("http://") || decoded.startsWith("https://")) return decoded
+        }
+        return null
+    }
 
     private fun cleanUrl(raw: String): String = raw
         .replace("\\/", "/")
@@ -500,6 +535,8 @@ class XalaflixProvider : MainAPI() {
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
+        private val SCRIPT_LINK = Regex("(?i)\\\"link\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"")
+        private val LONG_BASE64 = Regex("[A-Za-z0-9+/]{80,}={0,2}")
         private val RELATIVE_EMBED = Regex("(?i)/embed-[a-z0-9_-]+\\.html")
         private val DYNAMIC_ROUTE = Regex(
             "(?i)(?:https?://[^\\s\\\"'<>]+|/[a-z0-9_./-]*(?:ajax|api|embed|episode|server|source|watch|player)[a-z0-9_./?=&-]*)",
