@@ -218,25 +218,42 @@ class XalaflixProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
         var emitted = false
-        val firstLevel = extractPlayers(document, origin)
         val players = LinkedHashMap<String, Pair<String, String>>()
+        val pending = ArrayList<Pair<String, String>>()
+        val visited = HashSet<String>()
+        val playerReferers = HashMap<String, String>()
         val mediaReferers = HashMap<String, String>()
-        firstLevel.forEach { players[it.second] = it }
-        for ((_, url) in firstLevel) {
+
+        fun enqueue(items: List<Pair<String, String>>, sourceReferer: String) {
+            items.forEach { item ->
+                if (players.putIfAbsent(item.second, item) == null) {
+                    pending += item
+                    playerReferers[item.second] = sourceReferer
+                }
+            }
+        }
+
+        enqueue(extractPlayers(document, origin), referer)
+        var cursor = 0
+        while (cursor < pending.size) {
+            val (_, url) = pending[cursor++]
+            if (!visited.add(url)) continue
+            val sourceReferer = playerReferers[url] ?: referer
             if (isInternalEmbed(url, origin)) {
                 val response = runCatching {
-                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
+                    app.get(url, headers = headers, referer = sourceReferer, cacheTime = 0, timeout = 15L)
                 }.onFailure { Log.w(LOG_TAG, "Lecteur interne inaccessible ${safeRoute(url)}", it) }.getOrNull()
                 if (response != null && response.okhttpResponse.code in 200..299) {
-                    val embedDocument = Jsoup.parse(response.text, url)
+                    val finalUrl = response.okhttpResponse.request.url.toString()
+                    val embedDocument = Jsoup.parse(response.text, finalUrl)
                     val nested = extractPlayers(embedDocument, origin)
                     Log.i(LOG_TAG, "Lecteur interne ${safeRoute(url)} HTTP=${response.okhttpResponse.code} sources=${nested.size}")
-                    nested.forEach { players[it.second] = it }
+                    enqueue(nested, finalUrl)
                 }
             }
             if (isVidzyEmbed(url)) {
                 val response = runCatching {
-                    app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 15L)
+                    app.get(url, headers = headers, referer = sourceReferer, cacheTime = 0, timeout = 15L)
                 }.onFailure { Log.w(LOG_TAG, "Lecteur Vidzy inaccessible ${safeRoute(url)}", it) }.getOrNull()
                 if (response != null && response.okhttpResponse.code in 200..299) {
                     val finalUrl = response.okhttpResponse.request.url.toString()
@@ -267,7 +284,10 @@ class XalaflixProvider : MainAPI() {
             }
             if (isInternalEmbed(url, origin)) continue
             runCatching {
-                loadExtractor(url, referer, subtitleCallback) { emitted = true; callback(it) }
+                loadExtractor(url, playerReferers[url] ?: referer, subtitleCallback) {
+                    emitted = true
+                    callback(it)
+                }
             }
         }
         return emitted
@@ -440,8 +460,8 @@ class XalaflixProvider : MainAPI() {
         val csrf = document.selectFirst("meta[name=csrf-token]")?.attr("content")?.takeIf(String::isNotBlank)
             ?: return parseSiteEpisodes(document, origin)
         val snapshotData = runCatching { JSONObject(snapshot).optJSONObject("data") }.getOrNull()
-        val currentSeasonId = snapshotData?.opt("seasonId")?.toString()
-        val currentSeasonNumber = snapshotData?.opt("season_number")?.toString()?.toIntOrNull()
+        val currentSeasonId = livewireScalar(snapshotData?.opt("seasonId"))
+        val currentSeasonNumber = livewireScalar(snapshotData?.opt("season_number"))?.toIntOrNull()
         val options = LinkedHashMap<String, Int>()
         document.getAllElements().forEach { element ->
             val action = element.attr("wire:click")
@@ -451,12 +471,15 @@ class XalaflixProvider : MainAPI() {
         }
         if (currentSeasonId != null && currentSeasonNumber != null) options[currentSeasonId] = currentSeasonNumber
 
-        val pages = coroutineScope {
-            options.filterKeys { it != currentSeasonId }.map { (seasonId, seasonNumber) ->
-                async {
-                    loadSeasonPage(origin, referer, csrf, snapshot, seasonId)?.let { seasonNumber to it }
-                }
-            }.awaitAll().filterNotNull()
+        // Livewire et son cookie de session ne sont pas fiables quand plusieurs
+        // mutations du même composant sont envoyées en parallèle.
+        val pages = ArrayList<Pair<Int, Document>>()
+        for ((seasonId, seasonNumber) in options) {
+            if (seasonId == currentSeasonId) continue
+            loadSeasonPage(origin, referer, csrf, snapshot, seasonId)?.let {
+                Log.i(LOG_TAG, "Saison Livewire id=$seasonId saison=$seasonNumber épisodes=${parseSiteEpisodes(it, origin).size}")
+                pages += seasonNumber to it
+            }
         }
         Log.i(LOG_TAG, "Livewire saisons demandées=${options.size} chargées=${pages.size + 1}")
         val merged = LinkedHashMap<String, SiteEpisode>()
@@ -500,8 +523,16 @@ class XalaflixProvider : MainAPI() {
         val html = runCatching {
             JSONObject(response.text).getJSONArray("components").getJSONObject(0)
                 .getJSONObject("effects").getString("html")
+        }.onFailure {
+            Log.w(LOG_TAG, "Réponse Livewire illisible id=$seasonId aperçu='${preview(response.text)}'", it)
         }.getOrNull()?.takeIf(String::isNotBlank) ?: return null
         return Jsoup.parseBodyFragment(html, "$origin/")
+    }
+
+    private fun livewireScalar(value: Any?): String? = when (value) {
+        null, JSONObject.NULL -> null
+        is org.json.JSONArray -> livewireScalar(value.opt(0))
+        else -> value.toString().takeIf { it.isNotBlank() && it != "null" }
     }
 
     private suspend fun enrichEpisode(item: SiteEpisode, origin: String): SiteEpisode {
