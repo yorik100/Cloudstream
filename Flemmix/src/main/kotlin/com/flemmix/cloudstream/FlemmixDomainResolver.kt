@@ -5,7 +5,6 @@ import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.jsoup.Jsoup
 import java.net.URI
 import java.text.Normalizer
 
@@ -67,21 +66,35 @@ internal class FlemmixDomainResolver(
     }
 
     private fun extractRegistryTarget(html: String): String? {
-        val document = Jsoup.parse(html, REGISTRY_URL)
-        val mainLabel = document.select("span.card-featured-label").firstOrNull {
-            normalizeText(it.text()) == PRIMARY_LABEL
+        val mainLabel = SPAN_REGEX.findAll(html).firstOrNull { span ->
+            "card-featured-label" in extractClasses(span.value) &&
+                normalizeText(TAG_REGEX.replace(span.groupValues[1], " ")) ==
+                PRIMARY_LABEL
         } ?: return null
 
-        val mainCard = mainLabel.nextElementSibling()?.takeIf {
-            it.tagName().equals("a", ignoreCase = true) &&
-                it.hasClass("domain-card") &&
-                it.hasClass("card-featured")
-        } ?: return null
+        val contentAfterLabel = html.substring(mainLabel.range.last + 1)
+        val mainCard = ANCHOR_REGEX.find(contentAfterLabel) ?: return null
+        val contentBeforeCard = contentAfterLabel.substring(0, mainCard.range.first)
+        if (COMMENT_REGEX.replace(contentBeforeCard, " ").isNotBlank()) return null
 
-        val target = mainCard.absUrl("href").ifBlank { mainCard.attr("href") }
-        val candidate = normalizeOrigin(decodeHtml(target))
+        val cardClasses = extractClasses(mainCard.value)
+        if ("domain-card" !in cardClasses || "card-featured" !in cardClasses) {
+            return null
+        }
+
+        val candidate = normalizeOrigin(decodeHtml(mainCard.groupValues[1]))
             ?: return null
         return candidate.takeIf { it != REGISTRY_ORIGIN }
+    }
+
+    private fun extractClasses(tag: String): Set<String> {
+        val classes = CLASS_ATTRIBUTE_REGEX.find(tag)?.groupValues?.get(2)
+            ?: return emptySet()
+        return decodeHtml(classes)
+            .lowercase()
+            .split(Regex("\\s+"))
+            .filter(String::isNotBlank)
+            .toSet()
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -183,9 +196,26 @@ internal class FlemmixDomainResolver(
             "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
             RegexOption.IGNORE_CASE,
         )
+        val SPAN_REGEX = Regex(
+            """<span\b[^>]*>(.*?)</span>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val ANCHOR_REGEX = Regex(
+            """<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val CLASS_ATTRIBUTE_REGEX = Regex(
+            """\bclass\s*=\s*(["'])(.*?)\1""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val COMMENT_REGEX = Regex(
+            """<!--.*?-->""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
         val DETAIL_LINK_REGEX = Regex(
             """href\s*=\s*["'](?:https://[^/"']+)?/(?:film|serie)-en-streaming/(\d+-[^"']+\.html)["']""",
             RegexOption.IGNORE_CASE,
         )
+        val TAG_REGEX = Regex("""<[^>]+>""")
     }
 }
