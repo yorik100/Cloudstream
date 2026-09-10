@@ -36,6 +36,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.net.URI
 import java.net.URLEncoder
+import java.text.Normalizer
+import java.util.Locale
 
 class XalaflixProvider : MainAPI() {
     override var mainUrl = XalaflixDomainResolver.REGISTRY_ORIGIN
@@ -139,14 +141,18 @@ class XalaflixProvider : MainAPI() {
         val initiallyVisibleEpisodes = parseSiteEpisodes(doc, loaded.origin)
         val siteEpisodes = loadAllSeasons(doc, loaded.origin, "${loaded.origin}$path")
             .ifEmpty { initiallyVisibleEpisodes }
-        val enrichedEpisodes = coroutineScope {
-            siteEpisodes.map { item ->
-                async {
-                    val visible = initiallyVisibleEpisodes.any { it.path == item.path }
-                    if (visible) enrichEpisode(item, loaded.origin) else item
-                }
-            }.awaitAll()
-        }
+        val enrichedEpisodes = enrichEpisodesFromTmdb(title, year, siteEpisodes)
+            ?: coroutineScope {
+                // Compatibility fallback: if TMDB is unavailable, retain the
+                // previous exact-site enrichment for the initially visible
+                // season without requesting every episode of a large series.
+                siteEpisodes.map { item ->
+                    async {
+                        val visible = initiallyVisibleEpisodes.any { it.path == item.path }
+                        if (visible) enrichEpisode(item, loaded.origin) else item
+                    }
+                }.awaitAll()
+            }
         Log.i(LOG_TAG, "Série saisons=${siteEpisodes.map { it.season }.distinct().size} épisodes=${siteEpisodes.size}")
         val episodes = enrichedEpisodes.map { item ->
             newEpisode(item.path) {
@@ -555,10 +561,12 @@ class XalaflixProvider : MainAPI() {
         val title: String,
         val poster: String?,
         val description: String? = null,
+        val posterIsDefault: Boolean = false,
     )
 
     private fun parseSiteEpisodes(document: Document, origin: String): List<SiteEpisode> {
         val result = LinkedHashMap<String, SiteEpisode>()
+        val seasonPosters = parseSeasonPosters(document, origin)
         document.select("a[href*=/episode/]").forEach { anchor ->
             val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
             val path = runCatching { URI(href).path }.getOrNull() ?: return@forEach
@@ -569,9 +577,49 @@ class XalaflixProvider : MainAPI() {
             val title = container?.selectFirst("h3")?.text()?.trim()?.takeIf(String::isNotBlank)
                 ?: "Épisode $episode"
             val poster = anchor.selectFirst("img")?.let { imageUrl(it, origin) }
-            result[path] = SiteEpisode(path, season, episode, title, poster)
+            val posterIsDefault = poster != null && (
+                seasonPosters[season]
+                    ?.let { seasonPoster -> sameImageAsset(poster, seasonPoster) }
+                    ?: false
+                )
+            result[path] = SiteEpisode(
+                path = path,
+                season = season,
+                episode = episode,
+                title = title,
+                poster = poster,
+                posterIsDefault = posterIsDefault,
+            )
         }
         return result.values.sortedWith(compareBy<SiteEpisode> { it.season }.thenBy { it.episode })
+    }
+
+    private fun parseSeasonPosters(document: Document, origin: String): Map<Int, String> {
+        val result = LinkedHashMap<Int, String>()
+        document.getAllElements().forEach { element ->
+            val season = SEASON.find(element.text())
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+                ?: return@forEach
+            val script = sequenceOf("@click", "x-on:click", "onclick")
+                .map { element.attr(it) }
+                .firstOrNull(String::isNotBlank)
+                ?: return@forEach
+            val rawPoster = UPDATE_POSTER.find(script)?.groupValues?.getOrNull(1)
+                ?: return@forEach
+            absolute(rawPoster, origin)?.let { result[season] = it }
+        }
+        return result
+    }
+
+    private fun sameImageAsset(first: String, second: String): Boolean {
+        fun identity(url: String): String? = runCatching {
+            URI(url).path.substringAfterLast('/').lowercase(Locale.ROOT)
+        }.getOrNull()?.takeIf(String::isNotBlank)
+
+        val firstIdentity = identity(first) ?: return false
+        return firstIdentity == identity(second)
     }
 
     private suspend fun loadAllSeasons(document: Document, origin: String, referer: String): List<SiteEpisode> {
@@ -776,6 +824,231 @@ class XalaflixProvider : MainAPI() {
         return item.copy(description = description)
     }
 
+    private data class TmdbEpisodeMetadata(
+        val title: String?,
+        val description: String?,
+        val poster: String?,
+    )
+
+    private suspend fun enrichEpisodesFromTmdb(
+        title: String,
+        releaseYear: Int?,
+        episodes: List<SiteEpisode>,
+    ): List<SiteEpisode>? {
+        val tmdbId = findTmdbSeriesId(title, releaseYear) ?: run {
+            Log.w(LOG_TAG, "Descriptions TMDB : série introuvable titre='$title'")
+            return null
+        }
+        val metadata = LinkedHashMap<Pair<Int, Int>, TmdbEpisodeMetadata>()
+        val seasons = episodes.map { it.season }.distinct().sorted()
+
+        for (batch in seasons.chunked(TMDB_SEASON_BATCH_SIZE)) {
+            val results = coroutineScope {
+                batch.map { seasonNumber ->
+                    async {
+                        seasonNumber to runCatching {
+                            tmdbGet("/tv/$tmdbId/season/$seasonNumber")
+                        }.getOrNull()
+                    }
+                }.awaitAll()
+            }
+            results.forEach { (seasonNumber, seasonDetails) ->
+                val seasonPoster = tmdbPoster(seasonDetails?.optString("poster_path"))
+                val episodeArray = seasonDetails?.optJSONArray("episodes") ?: JSONArray()
+                for (index in 0 until episodeArray.length()) {
+                    val item = episodeArray.optJSONObject(index) ?: continue
+                    val episodeNumber = item.optInt("episode_number", 0).takeIf { it > 0 }
+                        ?: continue
+                    metadata[seasonNumber to episodeNumber] = TmdbEpisodeMetadata(
+                        title = item.optString("name").trim().takeIf(String::isNotBlank),
+                        description = item.optString("overview").trim().takeIf(String::isNotBlank),
+                        poster = tmdbPoster(item.optString("still_path")) ?: seasonPoster,
+                    )
+                }
+            }
+        }
+
+        val missingSeasons = seasons.filter { seasonNumber ->
+            episodes.any { it.season == seasonNumber } &&
+                metadata.keys.none { it.first == seasonNumber }
+        }.toSet()
+        if (missingSeasons.isNotEmpty()) {
+            metadata.putAll(
+                loadAlternativeTmdbEpisodeMetadata(tmdbId, missingSeasons),
+            )
+        }
+
+        if (metadata.isEmpty()) return null
+        var replacedTitles = 0
+        var replacedPosters = 0
+        val enriched = episodes.map { episode ->
+            val item = metadata[episode.season to episode.episode] ?: return@map episode
+            val genericTitle = isGenericEpisodeTitle(episode.title, episode.episode)
+            val tmdbPoster = item.poster
+            if (genericTitle && item.title != null) replacedTitles++
+            if ((episode.poster == null || episode.posterIsDefault) && tmdbPoster != null) {
+                replacedPosters++
+            }
+            episode.copy(
+                title = if (genericTitle) item.title ?: episode.title else episode.title,
+                poster = if (episode.poster == null || episode.posterIsDefault) {
+                    tmdbPoster ?: episode.poster
+                } else {
+                    episode.poster
+                },
+                description = item.description ?: episode.description,
+                posterIsDefault = episode.posterIsDefault && tmdbPoster == null,
+            )
+        }
+        Log.i(
+            LOG_TAG,
+            "Descriptions TMDB tmdbId=$tmdbId saisons=${seasons.size} épisodes=${metadata.size} " +
+                "titresRemplacés=$replacedTitles imagesRemplacées=$replacedPosters",
+        )
+        return enriched
+    }
+
+    private suspend fun loadAlternativeTmdbEpisodeMetadata(
+        tmdbId: Int,
+        wantedSeasons: Set<Int>,
+    ): Map<Pair<Int, Int>, TmdbEpisodeMetadata> {
+        val groupIndex = runCatching {
+            tmdbGet("/tv/$tmdbId/episode_groups")
+        }.getOrNull() ?: return emptyMap()
+        val candidates = (groupIndex.optJSONArray("results") ?: JSONArray())
+            .let { array -> (0 until array.length()).mapNotNull(array::optJSONObject) }
+            // Digital order generally matches the extra season numbers used by
+            // Xalaflix; DVD order is the next most useful fallback.
+            .sortedBy { item ->
+                when (item.optInt("type", 0)) {
+                    4 -> 0
+                    3 -> 1
+                    else -> 2
+                }
+            }
+        val result = LinkedHashMap<Pair<Int, Int>, TmdbEpisodeMetadata>()
+        val resolvedSeasons = HashSet<Int>()
+
+        for (candidate in candidates) {
+            val groupId = candidate.optString("id").takeIf(String::isNotBlank) ?: continue
+            val details = runCatching {
+                tmdbGet("/tv/episode_group/$groupId")
+            }.getOrNull() ?: continue
+            val groups = details.optJSONArray("groups") ?: JSONArray()
+            for (groupIndexPosition in 0 until groups.length()) {
+                val group = groups.optJSONObject(groupIndexPosition) ?: continue
+                val seasonNumber = SEASON.find(group.optString("name"))
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.toIntOrNull()
+                    ?.takeIf { it in wantedSeasons && it !in resolvedSeasons }
+                    ?: continue
+                val groupEpisodes = group.optJSONArray("episodes") ?: JSONArray()
+                for (episodeIndex in 0 until groupEpisodes.length()) {
+                    val item = groupEpisodes.optJSONObject(episodeIndex) ?: continue
+                    val episodeNumber = item.optInt("order", episodeIndex) + 1
+                    result[seasonNumber to episodeNumber] = TmdbEpisodeMetadata(
+                        title = item.optString("name").trim().takeIf(String::isNotBlank),
+                        description = item.optString("overview").trim().takeIf(String::isNotBlank),
+                        poster = tmdbPoster(item.optString("still_path")),
+                    )
+                }
+                if (groupEpisodes.length() > 0) resolvedSeasons += seasonNumber
+            }
+            if (resolvedSeasons.containsAll(wantedSeasons)) break
+        }
+
+        if (resolvedSeasons.isNotEmpty()) {
+            Log.i(
+                LOG_TAG,
+                "Ordre alternatif TMDB saisons=${resolvedSeasons.sorted().joinToString()}",
+            )
+        }
+        return result
+    }
+
+    private fun isGenericEpisodeTitle(title: String, episodeNumber: Int): Boolean =
+        GENERIC_EPISODE_TITLE.matches(title.trim()) &&
+            GENERIC_EPISODE_NUMBER.find(title)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull() == episodeNumber
+
+    private suspend fun findTmdbSeriesId(title: String, releaseYear: Int?): Int? {
+        val root = runCatching {
+            tmdbGet(
+                "/search/tv",
+                mapOf(
+                    "query" to title,
+                    "page" to "1",
+                ),
+            )
+        }.getOrNull() ?: return null
+        val wanted = normalizeTitle(title)
+        val candidates = root.optJSONArray("results") ?: JSONArray()
+        return (0 until candidates.length())
+            .mapNotNull { candidates.optJSONObject(it) }
+            .map { candidate ->
+                val names = listOf(
+                    candidate.optString("name"),
+                    candidate.optString("original_name"),
+                ).map(::normalizeTitle)
+                var score = names.maxOfOrNull { name ->
+                    when {
+                        name == wanted -> 100
+                        name.contains(wanted) || wanted.contains(name) -> 60
+                        else -> 0
+                    }
+                } ?: 0
+                val candidateYear = candidate.optString("first_air_date")
+                    .take(4)
+                    .toIntOrNull()
+                if (releaseYear != null && candidateYear != null) {
+                    score += when (kotlin.math.abs(releaseYear - candidateYear)) {
+                        0 -> 25
+                        1 -> 5
+                        else -> -25
+                    }
+                }
+                candidate to score
+            }
+            .maxByOrNull { it.second }
+            ?.takeIf { it.second >= 70 }
+            ?.first
+            ?.optInt("id", 0)
+            ?.takeIf { it > 0 }
+    }
+
+    private suspend fun tmdbGet(
+        path: String,
+        params: Map<String, String> = emptyMap(),
+    ): JSONObject {
+        val query = linkedMapOf(
+            "api_key" to TMDB_API_KEY,
+            "language" to "fr-FR",
+        ).apply { putAll(params) }
+        val url = "$TMDB_API$path?" + query.entries.joinToString("&") { (key, value) ->
+            "${encode(key)}=${encode(value)}"
+        }
+        val response = app.get(url, cacheTime = TMDB_CACHE_SECONDS)
+        if (response.okhttpResponse.code !in 200..299) {
+            throw ErrorLoadingException("TMDB HTTP ${response.okhttpResponse.code}")
+        }
+        return JSONObject(response.text)
+    }
+
+    private fun tmdbPoster(path: String?, size: String = "w500"): String? =
+        path?.trim()
+            ?.takeIf { it.isNotBlank() && !it.equals("null", ignoreCase = true) }
+            ?.let { "$TMDB_IMAGES/$size$it" }
+
+    private fun normalizeTitle(value: String): String =
+        Normalizer.normalize(value, Normalizer.Form.NFD)
+            .replace(Regex("\\p{M}+"), "")
+            .lowercase(Locale.ROOT)
+            .replace(Regex("[^a-z0-9]+"), " ")
+            .trim()
+
     private fun parseCards(doc: Document, origin: String): List<SearchResponse> {
         val results = LinkedHashMap<String, SearchResponse>()
         doc.select("a[href*=/movie/], a[href*=/tv-show/]").forEach { anchor ->
@@ -972,6 +1245,11 @@ class XalaflixProvider : MainAPI() {
 
     companion object {
         private const val LOG_TAG = "XalaflixDebug"
+        private const val TMDB_API = "https://api.themoviedb.org/3"
+        private const val TMDB_IMAGES = "https://image.tmdb.org/t/p"
+        private const val TMDB_API_KEY = "f3d757824f08ea2cff45eb8f47ca3a1e"
+        private const val TMDB_CACHE_SECONDS = 300
+        private const val TMDB_SEASON_BATCH_SIZE = 6
         private val DETAIL = Regex("^/(movie|tv-show)/[^/?#]+/?$", RegexOption.IGNORE_CASE)
         private val NUMERIC_ID = Regex("\\d+")
         private val MEDIA_ID_IN_SOURCE = Regex(
@@ -982,6 +1260,11 @@ class XalaflixProvider : MainAPI() {
         private val EPISODE_NUMBER = Regex("(?i)(?:episode|épisode|ep|e)[ ._-]*(\\d+)")
         private val EPISODE_PATH = Regex("(?i)^/episode/[^/]+/(\\d+)-(\\d+)/?$")
         private val UPDATE_SEASON = Regex("(?i)updateSeason\\(['\"]?(\\d+)")
+        private val UPDATE_POSTER = Regex("(?i)updatePoster\\(['\"]([^'\"]+)")
+        private val GENERIC_EPISODE_TITLE = Regex(
+            "(?i)^(?:episode|épisode|ep\\.?)[ ._-]*0*\\d+$",
+        )
+        private val GENERIC_EPISODE_NUMBER = Regex("(\\d+)$")
         private val DIRECT_MEDIA = Regex("(?i)\\.(?:m3u8|mp4|mpd)(?:[?#]|$)")
         private val PLAYER_HOST = Regex("(?i)(?:embed|player|stream|vid|filemoon|uqload|voe|dood|wish|sibnet)")
         private val URL_IN_SCRIPT = Regex("https?://[^\\s\\\"'<>]+")
