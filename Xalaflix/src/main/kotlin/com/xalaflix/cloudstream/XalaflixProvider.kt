@@ -282,7 +282,6 @@ class XalaflixProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit,
     ): Boolean {
-        var emitted = false
         val players = LinkedHashMap<String, Pair<String, String>>()
         val pending = ArrayList<Pair<String, String>>()
         val visited = HashSet<String>()
@@ -332,45 +331,139 @@ class XalaflixProvider : MainAPI() {
                 }
             }
         }
-        for ((label, url) in players.values) {
-            if (DIRECT_MEDIA.containsMatchIn(url)) {
-                callback(newExtractorLink(
-                    source = name,
-                    name = "Xalaflix · $label",
-                    url = url,
-                    type = if (url.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = mediaReferers[url] ?: referer
-                    quality = getQualityFromName(label)
-                    headers = this@XalaflixProvider.headers
-                })
-                emitted = true
-                continue
-            }
-            if (isInternalEmbed(url, origin)) continue
-            var sourceEmitted = false
-            runCatching {
-                loadExtractor(url, playerReferers[url] ?: referer, subtitleCallback) {
-                    sourceEmitted = true
-                    emitted = true
-                    callback(it)
-                }
-            }
-            if (!sourceEmitted) {
-                sourceEmitted = extractUqloadDirect(url, playerReferers[url] ?: referer, callback)
-            }
-            if (!sourceEmitted) {
-                sourceEmitted = loadNamedHostExtractor(
-                    url = url,
-                    referer = playerReferers[url] ?: referer,
-                    subtitleCallback = subtitleCallback,
-                    callback = callback,
-                )
-                if (sourceEmitted) emitted = true
-            }
-            Log.i(LOG_TAG, "Source ${safeRoute(url)} valide=$sourceEmitted")
+        val safeSubtitleCallback: (SubtitleFile) -> Unit = { subtitle ->
+            synchronized(subtitleCallback) { subtitleCallback(subtitle) }
         }
-        return emitted
+        val safeLinkCallback: (ExtractorLink) -> Unit = { link ->
+            synchronized(callback) { callback(link) }
+        }
+        val resolved = coroutineScope {
+            players.values.map { (label, url) ->
+                async {
+                    if (isInternalEmbed(url, origin)) return@async false
+                    withTimeoutOrNull(PLAYER_RESOLUTION_TIMEOUT_MS) {
+                        if (DIRECT_MEDIA.containsMatchIn(url)) {
+                            safeLinkCallback(newExtractorLink(
+                                source = name,
+                                name = "Xalaflix · $label",
+                                url = url,
+                                type = if (url.contains(".m3u8", true)) {
+                                    ExtractorLinkType.M3U8
+                                } else {
+                                    ExtractorLinkType.VIDEO
+                                },
+                            ) {
+                                this.referer = mediaReferers[url] ?: referer
+                                quality = getQualityFromName(label)
+                                headers = this@XalaflixProvider.headers
+                            })
+                            true
+                        } else {
+                            val sourceReferer = playerReferers[url] ?: referer
+                            val sourceEmitted = AtomicBoolean(false)
+                            // Livavid n'est pas reconnu par les extracteurs globaux :
+                            // tenter son flux direct avant de leur céder le délai.
+                            sourceEmitted.set(extractLivavidDirect(url, sourceReferer, safeLinkCallback))
+                            if (!sourceEmitted.get()) {
+                                runCatching {
+                                    loadExtractor(url, sourceReferer, safeSubtitleCallback) {
+                                        sourceEmitted.set(true)
+                                        safeLinkCallback(it)
+                                    }
+                                }.onFailure {
+                                    if (it is CancellationException) throw it
+                                    Log.w(LOG_TAG, "Extracteur impossible ${safeRoute(url)}", it)
+                                }
+                            }
+                            if (!sourceEmitted.get()) {
+                                sourceEmitted.set(extractUqloadDirect(url, sourceReferer, safeLinkCallback))
+                            }
+                            if (!sourceEmitted.get()) {
+                                sourceEmitted.set(loadNamedHostExtractor(
+                                    url = url,
+                                    referer = sourceReferer,
+                                    subtitleCallback = safeSubtitleCallback,
+                                    callback = safeLinkCallback,
+                                ))
+                            }
+                            Log.i(LOG_TAG, "Source ${safeRoute(url)} valide=${sourceEmitted.get()}")
+                            sourceEmitted.get()
+                        }
+                    } ?: run {
+                        Log.w(LOG_TAG, "Source ${safeRoute(url)} abandonnée après ${PLAYER_RESOLUTION_TIMEOUT_MS} ms")
+                        false
+                    }
+                }
+            }.awaitAll().any { it }
+        }
+        return resolved
+    }
+
+    private suspend fun extractLivavidDirect(
+        url: String,
+        referer: String,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        val host = runCatching { URI(url).host.orEmpty().lowercase() }.getOrDefault("")
+        if ("livavid" !in host) return false
+        val response = runCatching {
+            app.get(url, headers = headers, referer = referer, cacheTime = 0, timeout = 10L)
+        }.onFailure {
+            if (it is CancellationException) throw it
+            Log.w(LOG_TAG, "Page Livavid inaccessible ${safeRoute(url)}", it)
+        }.getOrNull() ?: return false
+        if (response.okhttpResponse.code !in 200..299) return false
+
+        val contents = ArrayList<String>()
+        contents += response.text
+        runCatching { getAndUnpack(response.text) }
+            .getOrNull()
+            ?.takeIf(String::isNotBlank)
+            ?.let(contents::add)
+        LONG_BASE64.findAll(response.text).forEach { match ->
+            runCatching { String(Base64.decode(match.value, Base64.DEFAULT), Charsets.UTF_8) }
+                .getOrNull()
+                ?.takeIf { it.contains("http", ignoreCase = true) }
+                ?.let(contents::add)
+        }
+
+        val mediaUrls = contents.asSequence()
+            .flatMap { content ->
+                URL_IN_SCRIPT.findAll(content.replace("\\/", "/"))
+                    .map { cleanUrl(it.value) }
+            }
+            .filter { DIRECT_MEDIA.containsMatchIn(it) }
+            .distinct()
+            .toList()
+        Log.i(
+            LOG_TAG,
+            "Lecteur Livavid ${safeRoute(response.okhttpResponse.request.url.toString())} " +
+                "HTTP=${response.okhttpResponse.code} médias=${mediaUrls.size}",
+        )
+        if (mediaUrls.isEmpty()) {
+            Log.w(
+                LOG_TAG,
+                "Livavid sans média taille=${response.text.length} aperçu='${preview(response.text)}'",
+            )
+        }
+        val playerUrl = response.okhttpResponse.request.url.toString()
+        mediaUrls.forEach { mediaUrl ->
+            callback(newExtractorLink(
+                source = name,
+                name = "Xalaflix · Livavid",
+                url = mediaUrl,
+                type = if (mediaUrl.contains(".m3u8", true)) {
+                    ExtractorLinkType.M3U8
+                } else {
+                    ExtractorLinkType.VIDEO
+                },
+            ) {
+                this.referer = playerUrl
+                quality = getQualityFromName("HD")
+                headers = this@XalaflixProvider.headers
+            })
+        }
+        return mediaUrls.isNotEmpty()
     }
 
     private suspend fun extractUqloadDirect(
