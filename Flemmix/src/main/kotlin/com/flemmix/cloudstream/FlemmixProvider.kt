@@ -193,9 +193,29 @@ class FlemmixProvider : MainAPI() {
         origin: String,
         query: String,
     ): List<SearchResponse>? {
+        val queryTerms = normalizeForMatch(query)
+            .split(' ')
+            .filter(String::isNotBlank)
+        if (queryTerms.isEmpty()) return emptyList()
+
         // Dès qu'un domaine a confirmé que son Bot Shield refuse les clients
         // HTTP, ne pas refaire les trois requêtes lentes à chaque recherche.
         if (webViewSearchOrigins.contains(origin)) {
+            // Si un cookie Bot Shield valide a déjà été obtenu par le
+            // warm-up ou une recherche WebView précédente, on l'essaie
+            // d'abord en HTTP classique : résultat en une fraction de
+            // seconde, pas de WebView à rouvrir. On ne retombe sur le
+            // WebView (20-30s) que si ce cookie est absent ou a expiré
+            // (Bot Shield toujours actif malgré le cookie).
+            val cachedCookie = FlemmixSearchWebViewV16.cookieHeader(origin)
+            if (cachedCookie != null) {
+                val quick = quickCookieSearch(origin, query, queryTerms, cachedCookie)
+                if (quick != null) {
+                    Log.i(SEARCH_TAG, "Recherche rapide (cookie réutilisé) : ${quick.size} résultat(s)")
+                    return quick
+                }
+                Log.i(SEARCH_TAG, "Cookie Bot Shield expiré sur $origin, renouvellement WebView")
+            }
             return searchWithWebView(origin, query)
         }
 
@@ -228,11 +248,6 @@ class FlemmixProvider : MainAPI() {
             )
             return null
         }
-
-        val queryTerms = normalizeForMatch(query)
-            .split(' ')
-            .filter(String::isNotBlank)
-        if (queryTerms.isEmpty()) return emptyList()
 
         // La recherche complète est une navigation normale acceptée par le
         // site. Contrairement au contrôleur AJAX, elle ne renvoie pas
@@ -324,6 +339,42 @@ class FlemmixProvider : MainAPI() {
             )
         }
         return results
+    }
+
+    // Recherche HTTP classique réutilisant un cookie Bot Shield déjà obtenu
+    // par le WebView. Retourne null (et non une liste vide) si le Bot
+    // Shield bloque toujours malgré le cookie, afin que l'appelant sache
+    // qu'il doit renouveler le cookie via le WebView plutôt que de croire
+    // à une recherche sans résultat.
+    private suspend fun quickCookieSearch(
+        origin: String,
+        query: String,
+        queryTerms: List<String>,
+        cookie: String,
+    ): List<SearchResponse>? {
+        val response = runCatching {
+            app.get(
+                url = "$origin/index.php?do=search&subaction=search&story=${encode(query)}",
+                headers = browserHeaders + mapOf(
+                    "Cookie" to cookie,
+                    "Sec-Fetch-Dest" to "document",
+                    "Sec-Fetch-Mode" to "navigate",
+                    "Sec-Fetch-Site" to "same-origin",
+                    "Sec-Fetch-User" to "?1",
+                    "Upgrade-Insecure-Requests" to "1",
+                ),
+                referer = "$origin/",
+                cacheTime = 0,
+                timeout = PAGE_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(SEARCH_TAG, "Recherche rapide (cookie) impossible sur $origin", error)
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+        if (response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)) return null
+
+        return filterSearchItems(parseItems(response.text, origin, null), queryTerms)
     }
 
     private suspend fun searchWithWebView(
@@ -1063,8 +1114,16 @@ object FlemmixSearchWebViewV16 {
     private const val TIMEOUT_MS = 25_000L
     private const val WARM_UP_TIMEOUT_MS = 15_000L
     private const val POLL_INTERVAL_MS = 500L
+    private const val WARM_UP_POLL_INTERVAL_MS = 100L
     private val initializedOrigins = ConcurrentHashMap.newKeySet<String>()
     private val warmingOrigins = ConcurrentHashMap.newKeySet<String>()
+
+    // Permet au chemin HTTP classique de réutiliser le cookie Bot Shield
+    // déjà obtenu par le WebView (warm-up ou recherche précédente), pour
+    // éviter de rouvrir un WebView à chaque recherche.
+    fun cookieHeader(origin: String): String? = runCatching {
+        CookieManager.getInstance().getCookie(origin)?.takeIf(String::isNotBlank)
+    }.getOrNull()
 
     @SuppressLint("SetJavaScriptEnabled")
     fun warmUp(origin: String) {
@@ -1087,12 +1146,15 @@ object FlemmixSearchWebViewV16 {
 
             val finished = AtomicBoolean(false)
             var webView: WebView? = null
+            var pollingStarted = false
             val startedAt = System.nanoTime()
             lateinit var timeout: Runnable
+            lateinit var poll: Runnable
 
             fun finish(success: Boolean) {
                 if (!finished.compareAndSet(false, true)) return
                 handler.removeCallbacks(timeout)
+                handler.removeCallbacks(poll)
                 if (success) {
                     initializedOrigins.add(origin)
                     cookieManager.flush()
@@ -1109,6 +1171,20 @@ object FlemmixSearchWebViewV16 {
                 webView = null
             }
 
+            // Pas de challenge ni de minuteur côté site : le cookie est posé
+            // dès les tout premiers instants du chargement. Pas besoin
+            // d'attendre onPageFinished (toute la page, pubs et trackers
+            // compris) : on sonde le cookie dès onPageStarted et on coupe
+            // le WebView dès qu'il apparaît.
+            poll = Runnable {
+                if (finished.get()) return@Runnable
+                if (!cookieManager.getCookie(origin).isNullOrBlank()) {
+                    finish(true)
+                } else {
+                    handler.postDelayed(poll, WARM_UP_POLL_INTERVAL_MS)
+                }
+            }
+
             timeout = Runnable { finish(false) }
             try {
                 cookieManager.setAcceptCookie(true)
@@ -1118,11 +1194,25 @@ object FlemmixSearchWebViewV16 {
                     settings.javaScriptEnabled = true
                     settings.domStorageEnabled = true
                     webViewClient = object : WebViewClient() {
+                        override fun onPageStarted(
+                            view: WebView,
+                            url: String,
+                            favicon: android.graphics.Bitmap?,
+                        ) {
+                            if (finished.get() || url == "about:blank" || pollingStarted) return
+                            pollingStarted = true
+                            handler.post(poll)
+                        }
+
                         override fun onPageFinished(view: WebView, url: String) {
                             if (finished.get() || url == "about:blank") return
-                            // Laisser un court délai au JavaScript anti-bot pour
-                            // enregistrer ses cookies et son stockage local.
-                            handler.postDelayed({ finish(true) }, 1_500L)
+                            // Filet de sécurité si, sur ce déploiement, le
+                            // cookie n'apparaît qu'après un chargement complet.
+                            handler.postDelayed({
+                                if (!finished.get()) {
+                                    finish(!cookieManager.getCookie(origin).isNullOrBlank())
+                                }
+                            }, 500L)
                         }
                     }
                 }

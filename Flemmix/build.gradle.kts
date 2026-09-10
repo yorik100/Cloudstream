@@ -1,6 +1,6 @@
 import com.lagradost.cloudstream3.gradle.tasks.GenerateManifestTask
 
-version = 22
+version = 23
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
