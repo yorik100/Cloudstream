@@ -164,7 +164,7 @@ object AfterDarkProofWebView {
                 target.evaluateJavascript(
                     """
                     (() => {
-                      const TARGET_TEXT = "Ouvrir le lien et lancer la vidéo";
+                      const OPEN_LINK_TEXT = "ouvrir le lien";
                       const EXPECTED_HOST = '$verificationHostForJs';
                       const RELOAD_ON_INTERACTIVE_CHECKBOX =
                         ${if (reloadOnInteractiveCheckbox) "true" else "false"};
@@ -206,10 +206,19 @@ object AfterDarkProofWebView {
                         try {
                           sessionStorage.setItem(SEEN_KEY, "1");
                         } catch (_) {}
-                        stopCheckboxWatcher();
                         try {
                           window.AfterDarkNative.verificationButtonSeen();
                         } catch (_) {}
+                      };
+
+                      const buttonState = element => {
+                        const text = normalize(element && element.textContent);
+                        if (!text) return null;
+                        const normalizedText =
+                          text.toLocaleLowerCase("fr-FR");
+                        return normalizedText.includes(OPEN_LINK_TEXT)
+                          ? normalizedText
+                          : null;
                       };
 
                       const findAndClick = () => {
@@ -217,10 +226,9 @@ object AfterDarkProofWebView {
                           document.querySelectorAll('a,button,[role="button"]')
                         );
 
-                        const button = candidates.find(element => {
-                          const text = normalize(element.textContent);
-                          return text === TARGET_TEXT || text.includes(TARGET_TEXT);
-                        });
+                        const button = candidates.find(
+                          element => buttonState(element) !== null
+                        );
 
                         if (!button) return false;
 
@@ -228,9 +236,18 @@ object AfterDarkProofWebView {
                         // checkbox must never reload this verification.
                         markSeen();
 
-                        if (button.dataset.afterdarkAutoOpened === "1") return true;
+                        const state = buttonState(button);
+                        const openedStates =
+                          window.__afterdarkAutoOpenedStates || new Set();
+                        window.__afterdarkAutoOpenedStates = openedStates;
 
-                        button.dataset.afterdarkAutoOpened = "1";
+                        // React can reuse the same button or replace it between
+                        // any number of intermediate steps. Each distinct text
+                        // is clicked once, regardless of the DOM element.
+                        if (!state || openedStates.has(state)) return true;
+
+                        openedStates.add(state);
+                        button.dataset.afterdarkAutoOpenedState = state;
                         button.click();
                         return true;
                       };
@@ -295,7 +312,7 @@ object AfterDarkProofWebView {
                         return true;
                       };
 
-                      if (findAndClick()) return;
+                      findAndClick();
                       if (reportInteractiveCheckbox()) return;
 
                       if (window.__afterdarkAutoOpenObserver) {
@@ -303,11 +320,7 @@ object AfterDarkProofWebView {
                       }
 
                       const observer = new MutationObserver(() => {
-                        if (findAndClick()) {
-                          try { observer.disconnect(); } catch (_) {}
-                          window.__afterdarkAutoOpenObserver = null;
-                          return;
-                        }
+                        findAndClick();
                         if (reportInteractiveCheckbox()) {
                           try { observer.disconnect(); } catch (_) {}
                           window.__afterdarkAutoOpenObserver = null;
@@ -325,7 +338,8 @@ object AfterDarkProofWebView {
                       stopCheckboxWatcher();
                       if (RELOAD_ON_INTERACTIVE_CHECKBOX && !wasSeen()) {
                         window.__afterdarkCheckboxWatcher = setInterval(() => {
-                          if (findAndClick() || reportInteractiveCheckbox()) {
+                          findAndClick();
+                          if (reportInteractiveCheckbox()) {
                             stopCheckboxWatcher();
                           }
                         }, 250);
