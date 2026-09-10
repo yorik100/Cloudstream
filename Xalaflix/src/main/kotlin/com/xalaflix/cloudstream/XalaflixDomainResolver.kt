@@ -105,7 +105,9 @@ internal class XalaflixDomainResolver(
         const val TAG = "XalaflixResolver"
         const val REGISTRY_ORIGIN = "https://xalaflix.online"
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
-        const val KEEP_LINK_URL = "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/KeepLinkXalaflix.txt"
+        const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
+        const val KEEP_LINK_URL =
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLinkXalaflix.txt"
         private val ACCESS_MARKERS = listOf("acceder a la page d'accueil", "accéder à la page d'accueil", "ouvrir le site", "acceder au site")
         private val HOST_REGEX = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", RegexOption.IGNORE_CASE)
     }
