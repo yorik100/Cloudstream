@@ -1,4 +1,4 @@
-version = 24
+version = 25
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +

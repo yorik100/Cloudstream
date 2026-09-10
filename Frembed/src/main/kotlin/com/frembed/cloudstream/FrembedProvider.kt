@@ -1,5 +1,6 @@
 package com.frembed.cloudstream
 
+import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -63,6 +64,9 @@ class FrembedProvider : MainAPI() {
         val HEX_ENTITY_REGEX = Regex("""&#x([0-9a-fA-F]+);""")
         val DECIMAL_ENTITY_REGEX = Regex("""&#(\d+);""")
         val REGISTRY_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
+        const val SERIES_PAGE_CACHE_SECONDS = 60
+        const val SERIES_PAGE_TIMEOUT_SECONDS = 25L
+        const val LOG_TAG = "FrembedDebug"
     }
 
     override var mainUrl = FrembedDomainResolver.KEEP_LINK_ORIGIN
@@ -293,7 +297,7 @@ class FrembedProvider : MainAPI() {
                 headers = browserHeaders,
                 referer = "$origin/",
                 cacheTime = CATALOGUE_CACHE_SECONDS,
-                timeout = CATALOGUE_TIMEOUT_SECONDS,
+                timeout = SERIES_PAGE_TIMEOUT_SECONDS,
             )
         }.getOrNull() ?: return null
 
@@ -554,6 +558,19 @@ class FrembedProvider : MainAPI() {
             val today = todayUtc()
             val episodes = ArrayList<com.lagradost.cloudstream3.Episode>()
             var hasAvailableEpisode = false
+            // The public title page exposes every season and its hasLinks
+            // flags in one response. Keep the older exact API checks only as
+            // a compatibility fallback if Frembed changes that page format.
+            val siteAvailability = fetchSeriesAvailability(tmdbId)
+            if (siteAvailability != null) {
+                Log.i(
+                    LOG_TAG,
+                    "Disponibilités fiche unique saisons=${siteAvailability.size} " +
+                        "épisodes=${siteAvailability.values.sumOf { it.size }}",
+                )
+            } else {
+                Log.w(LOG_TAG, "Fiche unique illisible, secours API épisode par épisode")
+            }
 
             for (season in seasons) {
                 val seasonNumber = season.optInt("season_number", 0)
@@ -583,9 +600,13 @@ class FrembedProvider : MainAPI() {
 
                     // Frembed itself decides whether this exact episode exists.
                     // A future TMDB date never blocks an early Frembed release.
-                    val availableOnFrembed = runCatching {
-                        fetchSeriesServers(playback).isNotEmpty()
-                    }.getOrDefault(false)
+                    val availableOnFrembed = siteAvailability
+                        ?.let { availability ->
+                            availability[seasonNumber]?.contains(episodeNumber) == true
+                        }
+                        ?: runCatching {
+                            fetchSeriesServers(playback).isNotEmpty()
+                        }.getOrDefault(false)
 
                     if (availableOnFrembed) {
                         hasAvailableEpisode = true
@@ -687,6 +708,91 @@ class FrembedProvider : MainAPI() {
         val episode = request.episode ?: return null
 
         return "$mainUrl/series?id=${request.tmdbId}&sa=$season&epi=$episode"
+    }
+
+    private fun seriesCatalogueUrl(tmdbId: Int): String =
+        "$mainUrl/tv-show/cloudstream/$tmdbId"
+
+    /**
+     * The Next.js title page embeds every season and episode in
+     * `initialSeasons`. Reading it once is much cheaper than querying
+     * /api/series separately for every episode of a long-running show.
+     *
+     * A null result means the page format could not be read and lets the
+     * caller use the exact per-episode API as a compatibility fallback.
+     */
+    private suspend fun fetchSeriesAvailability(
+        tmdbId: Int,
+    ): Map<Int, Set<Int>>? {
+        val response = runCatching {
+            app.get(
+                url = seriesCatalogueUrl(tmdbId),
+                headers = browserHeaders,
+                referer = "$mainUrl/",
+                cacheTime = SERIES_PAGE_CACHE_SECONDS,
+                timeout = CATALOGUE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        val seasons = extractInitialSeasons(response.text) ?: return null
+        val result = LinkedHashMap<Int, Set<Int>>()
+        for (index in 0 until seasons.length()) {
+            val season = seasons.optJSONObject(index) ?: continue
+            val seasonNumber = season.optInt("sa", -1).takeIf { it >= 0 } ?: continue
+            val availableEpisodes = LinkedHashSet<Int>()
+            val episodeArray = season.optJSONArray("episodes") ?: JSONArray()
+            for (episodeIndex in 0 until episodeArray.length()) {
+                val episode = episodeArray.optJSONObject(episodeIndex) ?: continue
+                val episodeNumber = episode.optInt("epi", 0).takeIf { it > 0 } ?: continue
+                // hasVip can be true while no public player is available.
+                if (episode.optBoolean("hasLinks", false)) {
+                    availableEpisodes += episodeNumber
+                }
+            }
+            result[seasonNumber] = availableEpisodes
+        }
+        return result
+    }
+
+    private fun extractInitialSeasons(html: String): JSONArray? {
+        // Next.js serializes the page props inside an escaped RSC string.
+        val decoded = html.replace("\\\"", "\"")
+        val marker = "\"initialSeasons\":"
+        val markerIndex = decoded.indexOf(marker)
+        if (markerIndex < 0) return null
+        val arrayStart = decoded.indexOf('[', markerIndex + marker.length)
+        if (arrayStart < 0) return null
+
+        var depth = 0
+        var inString = false
+        var escaped = false
+        for (index in arrayStart until decoded.length) {
+            val character = decoded[index]
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    character == '\\' -> escaped = true
+                    character == '\"' -> inString = false
+                }
+                continue
+            }
+
+            when (character) {
+                '\"' -> inString = true
+                '[' -> depth++
+                ']' -> {
+                    depth--
+                    if (depth == 0) {
+                        return runCatching {
+                            JSONArray(decoded.substring(arrayStart, index + 1))
+                        }.getOrNull()
+                    }
+                }
+            }
+        }
+        return null
     }
 
     private fun seriesEmbedUrl(request: FrembedPlaybackRequest): String? {
