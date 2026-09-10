@@ -28,10 +28,10 @@ internal class XalaflixDomainResolver(
                 Log.i(TAG, "Domaine Xalaflix obtenu depuis la page d'annonce : $it")
                 return@withLock it
             }
-            Log.w(TAG, "Page d'annonce indisponible ou invalide, essai de KeepLink4.txt")
+            Log.w(TAG, "Page d'annonce indisponible ou invalide, essai de KeepLinkXalaflix.txt")
             resolveFromKeepLink()?.let {
                 cachedOrigin = it
-                Log.i(TAG, "Domaine Xalaflix obtenu depuis KeepLink4.txt : $it")
+                Log.i(TAG, "Domaine Xalaflix obtenu depuis KeepLinkXalaflix.txt : $it")
                 return@withLock it
             }
             throw ErrorLoadingException("Aucun domaine Xalaflix utilisable")
@@ -105,7 +105,7 @@ internal class XalaflixDomainResolver(
         const val TAG = "XalaflixResolver"
         const val REGISTRY_ORIGIN = "https://xalaflix.online"
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
-        const val KEEP_LINK_URL = "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/KeepLink4.txt"
+        const val KEEP_LINK_URL = "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/KeepLinkXalaflix.txt"
         private val ACCESS_MARKERS = listOf("acceder a la page d'accueil", "accéder à la page d'accueil", "ouvrir le site", "acceder au site")
         private val HOST_REGEX = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$", RegexOption.IGNORE_CASE)
     }

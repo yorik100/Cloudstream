@@ -1,6 +1,6 @@
 import com.lagradost.cloudstream3.gradle.tasks.GenerateManifestTask
 
-version = 23
+version = 24
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -19,7 +19,7 @@ cloudstream {
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
     isCrossPlatform = false
-    iconUrl = "$publishedIconBase/KeepLink3.png"
+    iconUrl = "$publishedIconBase/KeepLinkFlemmix.png"
 }
 
 // Le nom technique du projet reste "Flemmix" afin de produire un fichier

@@ -2,7 +2,7 @@ import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.tasks.Sync
 
-version = 61
+version = 62
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -47,6 +47,6 @@ cloudstream {
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
-    iconUrl = "$publishedIconBase/KeepLink2.png"
+    iconUrl = "$publishedIconBase/KeepLinkAfterDark.png"
     isCrossPlatform = false
 }

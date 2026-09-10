@@ -30,10 +30,10 @@ internal class FlemmixDomainResolver(
                 return@withLock resolved
             }
 
-            Log.w(TAG, "Page d'annonce indisponible ou invalide, essai de KeepLink3.txt")
+            Log.w(TAG, "Page d'annonce indisponible ou invalide, essai de KeepLinkFlemmix.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLink3.txt : $resolved")
+                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLinkFlemmix.txt : $resolved")
                 return@withLock resolved
             }
 
@@ -95,7 +95,7 @@ internal class FlemmixDomainResolver(
                 timeout = RESOLVER_TIMEOUT_SECONDS,
             )
         }.onFailure { error ->
-            Log.w(TAG, "Lecture de KeepLink3.txt impossible", error)
+            Log.w(TAG, "Lecture de KeepLinkFlemmix.txt impossible", error)
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
@@ -171,7 +171,7 @@ internal class FlemmixDomainResolver(
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
-            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink3.txt"
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLinkFlemmix.txt"
 
         const val RESOLVER_TIMEOUT_SECONDS = 10L
         const val VALIDATION_TIMEOUT_SECONDS = 12L

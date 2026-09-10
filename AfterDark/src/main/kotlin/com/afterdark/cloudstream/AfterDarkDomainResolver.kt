@@ -33,15 +33,15 @@ internal class AfterDarkDomainResolver {
 
             Log.w(
                 TAG,
-                "cherishmylove.space invalide ou indisponible, essai de KeepLink2.txt",
+                "cherishmylove.space invalide ou indisponible, essai de KeepLinkAfterDark.txt",
             )
             resolveFromKeepLink()?.let { origin ->
                 cachedOrigin = origin
-                Log.i(TAG, "Domaine AfterDark obtenu depuis KeepLink2.txt : $origin")
+                Log.i(TAG, "Domaine AfterDark obtenu depuis KeepLinkAfterDark.txt : $origin")
                 return@withLock origin
             }
 
-            Log.w(TAG, "KeepLink2.txt invalide ou indisponible")
+            Log.w(TAG, "KeepLinkAfterDark.txt invalide ou indisponible")
             null
         }
     }
@@ -69,7 +69,7 @@ internal class AfterDarkDomainResolver {
 
     /**
      * Fallback equivalent to Frembed's KeepLink path: read the first valid
-     * HTTPS origin published in KeepLink2.txt, then validate the actual site
+     * HTTPS origin published in KeepLinkAfterDark.txt, then validate the actual site
      * before accepting or caching it. Nothing is persisted on the device.
      */
     private suspend fun resolveFromKeepLink(): String? {
@@ -84,7 +84,7 @@ internal class AfterDarkDomainResolver {
                 timeout = KEEP_LINK_TIMEOUT_SECONDS,
             )
         }.onFailure { error ->
-            Log.w(TAG, "Lecture de KeepLink2.txt impossible", error)
+            Log.w(TAG, "Lecture de KeepLinkAfterDark.txt impossible", error)
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
@@ -137,7 +137,7 @@ internal class AfterDarkDomainResolver {
         const val SOURCE_HOST = "cherishmylove.space"
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
-            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink2.txt"
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLinkAfterDark.txt"
         const val CLASSIC_TIMEOUT_SECONDS = 15L
         const val KEEP_LINK_TIMEOUT_SECONDS = 8L
         const val TAG = "AfterDarkResolver"

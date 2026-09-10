@@ -1,4 +1,4 @@
-version = 25
+version = 26
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -16,6 +16,6 @@ cloudstream {
     status = 3
     tvTypes = listOf("Movie", "TvSeries")
     language = "fr"
-    iconUrl = "$publishedIconBase/KeepLink.png"
+    iconUrl = "$publishedIconBase/KeepLinkFrembed.png"
     isCrossPlatform = false
 }

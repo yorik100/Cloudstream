@@ -33,14 +33,14 @@ internal class FrembedDomainResolver(
                 return@withLock resolved
             }
 
-            Log.w(TAG, "config.json invalide ou indisponible, essai de KeepLink.txt")
+            Log.w(TAG, "config.json invalide ou indisponible, essai de KeepLinkFrembed.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Frembed obtenu depuis KeepLink.txt : $resolved")
+                Log.i(TAG, "Domaine Frembed obtenu depuis KeepLinkFrembed.txt : $resolved")
                 return@withLock resolved
             }
 
-            Log.w(TAG, "KeepLink.txt invalide ou indisponible, recours à crt.sh")
+            Log.w(TAG, "KeepLinkFrembed.txt invalide ou indisponible, recours à crt.sh")
             val candidates = discoverCandidates()
             if (candidates.isEmpty()) {
                 throw ErrorLoadingException(
@@ -151,7 +151,7 @@ internal class FrembedDomainResolver(
     }
 
     /**
-     * Fast path: only GitHub's KeepLink.txt, the announced Frembed site and
+     * Fast path: only GitHub's KeepLinkFrembed.txt, the announced Frembed site and
      * that site's own public API are contacted. Nothing is persisted.
      */
     private suspend fun resolveFromKeepLink(): String? {
@@ -166,7 +166,7 @@ internal class FrembedDomainResolver(
                 timeout = KEEP_LINK_TIMEOUT_SECONDS,
             )
         }.onFailure { error ->
-            Log.w(TAG, "Lecture de KeepLink.txt impossible", error)
+            Log.w(TAG, "Lecture de KeepLinkFrembed.txt impossible", error)
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
@@ -330,7 +330,7 @@ internal class FrembedDomainResolver(
 
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
-            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLink.txt"
+            "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLinkFrembed.txt"
 
         const val DISCOVERY_ORIGIN = "https://crt.sh"
         const val DISCOVERY_URL =
