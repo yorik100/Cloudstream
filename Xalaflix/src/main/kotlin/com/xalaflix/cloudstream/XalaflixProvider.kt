@@ -100,7 +100,7 @@ class XalaflixProvider : MainAPI() {
         // Aucun appel de recherche n'est effectué avant la résolution.
         val origin = resolver.resolvedOriginOrNull() ?: runCatching { ensureDomain() }.getOrNull() ?: return emptyList()
         mainUrl = origin
-        val route = "/search/${query.trim().replace(Regex("\\s+"), "-")}"
+        val route = "/search/${encodePathSegment(query.trim())}"
         fetch(origin, route)?.let { page ->
             val results = parseCards(page, origin)
             if (results.isNotEmpty()) return results
@@ -1237,6 +1237,9 @@ class XalaflixProvider : MainAPI() {
     }
 
     private fun encode(value: String): String = URLEncoder.encode(value, "UTF-8")
+
+    private fun encodePathSegment(value: String): String =
+        encode(value).replace("+", "%20")
 
     private fun preview(value: String): String = value
         .replace(Regex("\\s+"), " ")

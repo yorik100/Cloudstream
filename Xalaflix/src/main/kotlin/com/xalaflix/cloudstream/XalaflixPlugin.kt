@@ -14,7 +14,7 @@ class XalaflixPlugin : Plugin() {
     private val discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun load(context: Context) {
-        Log.i("XalaflixDebug", "Extension Xalaflix v26 chargée")
+        Log.i("XalaflixDebug", "Extension Xalaflix v27 chargée")
         val provider = XalaflixProvider()
         registerMainAPI(provider)
         discoveryScope.launch { runCatching { provider.prepareDomain() } }
