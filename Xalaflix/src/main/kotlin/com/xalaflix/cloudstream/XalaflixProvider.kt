@@ -31,13 +31,16 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.URI
 import java.net.URLEncoder
 import java.text.Normalizer
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 class XalaflixProvider : MainAPI() {
     override var mainUrl = XalaflixDomainResolver.REGISTRY_ORIGIN
@@ -206,30 +209,70 @@ class XalaflixProvider : MainAPI() {
             extractPlayers(loaded.document, loaded.origin)
         }
         Log.i(LOG_TAG, "Sources trouvées=${urls.size}")
-        var emitted = false
-        for ((label, playerUrl) in urls.distinctBy { it.second }) {
-            if (DIRECT_MEDIA.containsMatchIn(playerUrl)) {
-                callback(newExtractorLink(
-                    source = name,
-                    name = "Xalaflix · $label",
-                    url = playerUrl,
-                    type = if (playerUrl.contains(".m3u8", true)) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                ) {
-                    this.referer = referer
-                    quality = getQualityFromName(label)
-                    headers = this@XalaflixProvider.headers
-                })
-                emitted = true
-            } else runCatching {
-                loadExtractor(
-                    url = playerUrl,
-                    referer = referer,
-                    subtitleCallback = subtitleCallback,
-                    callback = { emitted = true; callback(it) },
-                )
-            }
+        val candidates = urls.distinctBy { it.second }
+        Log.i(
+            LOG_TAG,
+            "Lecteurs candidats=${candidates.joinToString(" | ") { (label, url) -> "$label=${safeRoute(url)}" }}",
+        )
+        val safeSubtitleCallback: (SubtitleFile) -> Unit = { subtitle ->
+            synchronized(subtitleCallback) { subtitleCallback(subtitle) }
         }
-        return emitted
+        val safeLinkCallback: (ExtractorLink) -> Unit = { link ->
+            synchronized(callback) { callback(link) }
+        }
+
+        // Les lecteurs doivent être résolus en parallèle. Un serveur hors ligne
+        // (Premium 1, par exemple) ne doit pas consommer à lui seul tout le délai
+        // accordé par CloudStream avant que Premium 2 ne soit essayé.
+        return coroutineScope {
+            candidates.map { (label, playerUrl) ->
+                async {
+                    withTimeoutOrNull(PLAYER_RESOLUTION_TIMEOUT_MS) {
+                        if (DIRECT_MEDIA.containsMatchIn(playerUrl)) {
+                            safeLinkCallback(newExtractorLink(
+                                source = name,
+                                name = "Xalaflix · $label",
+                                url = playerUrl,
+                                type = if (playerUrl.contains(".m3u8", true)) {
+                                    ExtractorLinkType.M3U8
+                                } else {
+                                    ExtractorLinkType.VIDEO
+                                },
+                            ) {
+                                this.referer = referer
+                                quality = getQualityFromName(label)
+                                headers = this@XalaflixProvider.headers
+                            })
+                            true
+                        } else {
+                            val sourceEmitted = AtomicBoolean(false)
+                            runCatching {
+                                loadExtractor(
+                                    url = playerUrl,
+                                    referer = referer,
+                                    subtitleCallback = safeSubtitleCallback,
+                                    callback = {
+                                        sourceEmitted.set(true)
+                                        safeLinkCallback(it)
+                                    },
+                                )
+                            }.onFailure {
+                                if (it is CancellationException) throw it
+                                Log.w(LOG_TAG, "Lecteur $label en échec ${safeRoute(playerUrl)}", it)
+                            }
+                            Log.i(LOG_TAG, "Lecteur $label valide=${sourceEmitted.get()}")
+                            sourceEmitted.get()
+                        }
+                    } ?: run {
+                        Log.w(
+                            LOG_TAG,
+                            "Lecteur $label abandonné après ${PLAYER_RESOLUTION_TIMEOUT_MS} ms ${safeRoute(playerUrl)}",
+                        )
+                        false
+                    }
+                }
+            }.awaitAll().any { it }
+        }
     }
 
     private suspend fun extractAndEmit(
@@ -1248,6 +1291,7 @@ class XalaflixProvider : MainAPI() {
 
     companion object {
         private const val LOG_TAG = "XalaflixDebug"
+        private const val PLAYER_RESOLUTION_TIMEOUT_MS = 10_000L
         private const val TMDB_API = "https://api.themoviedb.org/3"
         private const val TMDB_IMAGES = "https://image.tmdb.org/t/p"
         private const val TMDB_API_KEY = "f3d757824f08ea2cff45eb8f47ca3a1e"
