@@ -67,14 +67,18 @@ jobs:
             sleep 2
           done
 
-          python3 -m pip install --disable-pip-version-check curl-cffi selenium
+          python3 -m pip install \
+            --disable-pip-version-check \
+            curl-cffi \
+            selenium \
+            pillow
 
       - name: Resolve all KeepLink files
         id: keep-links
         shell: bash
         run: |
           set -euo pipefail
-          echo "Resolver revision: static-script-target-v8"
+          echo "Resolver revision: static-script-target-v10-icon-script"
 
           shopt -s nullglob
           files=(KeepLink*.txt)
@@ -875,6 +879,7 @@ jobs:
             local next_url
             local resolved_url=""
             local body_file="$temp_dir/${file//\//_}.html"
+            local icon_file="icons/${file%.txt}.png"
             local -A visited=()
 
             current_url="$(
@@ -963,6 +968,18 @@ jobs:
               return 0
             fi
 
+            # The final page has already been downloaded by the resolver.
+            # Always pass it to the project's canonical icon extractor,
+            # including when the resolved URL itself did not change.
+            if ! python3 scripts/dump_keep_link_icon.py \
+              --page-file "$body_file" \
+              --page-url "$effective_url" \
+              --origin "$resolved_url" \
+              --output "$icon_file" \
+              --tor-port 9050; then
+              echo "::warning file=$file::Icon could not be refreshed; keeping the previous file"
+            fi
+
             if [[ "$resolved_url" == "$current_url" ]]; then
               echo "$file is already current: $current_url"
               return 0
@@ -986,13 +1003,13 @@ jobs:
             exit 1
           fi
 
-          if git diff --quiet -- "${files[@]}"; then
+          if git diff --quiet -- "${files[@]}" icons/KeepLink*.png; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit updated URLs
+      - name: Commit updated URLs and icons
         if: steps.keep-links.outputs.changed == 'true'
         shell: bash
         run: |
@@ -1002,6 +1019,6 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -- KeepLink*.txt
-          git commit -m "chore: update KeepLink redirects"
+          git add -- KeepLink*.txt icons/KeepLink*.png
+          git commit -m "chore: update KeepLink redirects and icons"
           git push
