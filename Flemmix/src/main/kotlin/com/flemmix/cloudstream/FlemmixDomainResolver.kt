@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.jsoup.Jsoup
 import java.net.URI
 import java.text.Normalizer
 
@@ -26,11 +27,11 @@ internal class FlemmixDomainResolver(
 
             resolveFromRegistry()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis la page d'annonce : $resolved")
+                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis Wiflix Adresses (Lien principal) : $resolved")
                 return@withLock resolved
             }
 
-            Log.w(TAG, "Page d'annonce indisponible ou invalide, essai de KeepLinkFlemmix.txt")
+            Log.w(TAG, "Wiflix Adresses indisponible ou sans Lien principal valide, essai de KeepLinkFlemmix.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
                 Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLinkFlemmix.txt : $resolved")
@@ -66,21 +67,21 @@ internal class FlemmixDomainResolver(
     }
 
     private fun extractRegistryTarget(html: String): String? {
-        for (anchor in ANCHOR_REGEX.findAll(html)) {
-            val label = normalizeText(TAG_REGEX.replace(anchor.groupValues[2], " "))
-            if (ACCESS_NOW_MARKERS.none(label::contains)) continue
+        val document = Jsoup.parse(html, REGISTRY_URL)
+        val mainLabel = document.select("span.card-featured-label").firstOrNull {
+            normalizeText(it.text()) == PRIMARY_LABEL
+        } ?: return null
 
-            normalizeOrigin(decodeHtml(anchor.groupValues[1]))?.let { candidate ->
-                if (candidate != REGISTRY_ORIGIN) return candidate
-            }
-        }
+        val mainCard = mainLabel.nextElementSibling()?.takeIf {
+            it.tagName().equals("a", ignoreCase = true) &&
+                it.hasClass("domain-card") &&
+                it.hasClass("card-featured")
+        } ?: return null
 
-        for (match in WINDOW_OPEN_REGEX.findAll(decodeHtml(html))) {
-            val candidate = normalizeOrigin(match.groupValues[1]) ?: continue
-            if (candidate != REGISTRY_ORIGIN) return candidate
-        }
-
-        return null
+        val target = mainCard.absUrl("href").ifBlank { mainCard.attr("href") }
+        val candidate = normalizeOrigin(decodeHtml(target))
+            ?: return null
+        return candidate.takeIf { it != REGISTRY_ORIGIN }
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -167,7 +168,7 @@ internal class FlemmixDomainResolver(
 
     internal companion object {
         const val TAG = "FlemmixResolver"
-        const val REGISTRY_ORIGIN = "https://www.neufneuf.space"
+        const val REGISTRY_ORIGIN = "https://ww1.wiflix-adresses.fun"
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
@@ -176,29 +177,15 @@ internal class FlemmixDomainResolver(
         const val RESOLVER_TIMEOUT_SECONDS = 10L
         const val VALIDATION_TIMEOUT_SECONDS = 12L
         const val MINIMUM_CATALOGUE_LINKS = 3
+        const val PRIMARY_LABEL = "lien principal"
 
         val HOST_REGEX = Regex(
             "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
             RegexOption.IGNORE_CASE,
         )
-        val ANCHOR_REGEX = Regex(
-            """<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
-        val WINDOW_OPEN_REGEX = Regex(
-            """window\.open\(\s*["'](https://[^"']+)["']""",
-            RegexOption.IGNORE_CASE,
-        )
         val DETAIL_LINK_REGEX = Regex(
             """href\s*=\s*["'](?:https://[^/"']+)?/(?:film|serie)-en-streaming/(\d+-[^"']+\.html)["']""",
             RegexOption.IGNORE_CASE,
-        )
-        val TAG_REGEX = Regex("""<[^>]+>""")
-        val ACCESS_NOW_MARKERS = listOf(
-            "acceder maintenant",
-            "acceder au site",
-            "ouvrir le site",
-            "continuer vers le site",
         )
     }
 }
