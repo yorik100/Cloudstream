@@ -105,6 +105,11 @@ class FlemmixProvider : MainAPI() {
     private suspend fun ensureDomain(): String {
         val resolved = domainResolver.resolve()
         mainUrl = resolved
+        // La recherche de ce déploiement est protégée par Bot Shield. Éviter
+        // les essais HTTP connus comme inutiles et préparer sa session WebView
+        // avant même que l'utilisateur commence à saisir une recherche.
+        webViewSearchOrigins.add(resolved)
+        FlemmixSearchWebViewV16.warmUp(resolved)
         return resolved
     }
 
@@ -1056,8 +1061,81 @@ class FlemmixProvider : MainAPI() {
 
 object FlemmixSearchWebViewV16 {
     private const val TIMEOUT_MS = 25_000L
+    private const val WARM_UP_TIMEOUT_MS = 15_000L
     private const val POLL_INTERVAL_MS = 500L
     private val initializedOrigins = ConcurrentHashMap.newKeySet<String>()
+    private val warmingOrigins = ConcurrentHashMap.newKeySet<String>()
+
+    @SuppressLint("SetJavaScriptEnabled")
+    fun warmUp(origin: String) {
+        if (initializedOrigins.contains(origin) || !warmingOrigins.add(origin)) return
+
+        val handler = Handler(Looper.getMainLooper())
+        handler.post {
+            val cookieManager = CookieManager.getInstance()
+            if (!cookieManager.getCookie(origin).isNullOrBlank()) {
+                initializedOrigins.add(origin)
+                warmingOrigins.remove(origin)
+                Log.i("FlemmixSearchWebView", "Session WebView existante réutilisée sur $origin")
+                return@post
+            }
+            val activity = FlemmixRuntimeV16.currentActivity()
+            if (activity == null || activity.isFinishing) {
+                warmingOrigins.remove(origin)
+                return@post
+            }
+
+            val finished = AtomicBoolean(false)
+            var webView: WebView? = null
+            val startedAt = System.nanoTime()
+            lateinit var timeout: Runnable
+
+            fun finish(success: Boolean) {
+                if (!finished.compareAndSet(false, true)) return
+                handler.removeCallbacks(timeout)
+                if (success) {
+                    initializedOrigins.add(origin)
+                    cookieManager.flush()
+                    Log.i(
+                        "FlemmixSearchWebView",
+                        "Session préchargée sur $origin en ${(System.nanoTime() - startedAt) / 1_000_000} ms",
+                    )
+                }
+                warmingOrigins.remove(origin)
+                val view = webView
+                (view?.parent as? ViewGroup)?.removeView(view)
+                view?.stopLoading()
+                view?.destroy()
+                webView = null
+            }
+
+            timeout = Runnable { finish(false) }
+            try {
+                cookieManager.setAcceptCookie(true)
+                val view = WebView(activity).apply {
+                    setBackgroundColor(Color.TRANSPARENT)
+                    alpha = 0.01f
+                    settings.javaScriptEnabled = true
+                    settings.domStorageEnabled = true
+                    webViewClient = object : WebViewClient() {
+                        override fun onPageFinished(view: WebView, url: String) {
+                            if (finished.get() || url == "about:blank") return
+                            // Laisser un court délai au JavaScript anti-bot pour
+                            // enregistrer ses cookies et son stockage local.
+                            handler.postDelayed({ finish(true) }, 1_500L)
+                        }
+                    }
+                }
+                webView = view
+                cookieManager.setAcceptThirdPartyCookies(view, true)
+                activity.addContentView(view, ViewGroup.LayoutParams(1, 1))
+                view.loadUrl("$origin/")
+                handler.postDelayed(timeout, WARM_UP_TIMEOUT_MS)
+            } catch (_: Throwable) {
+                finish(false)
+            }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun load(origin: String, query: String): String? =
@@ -1205,7 +1283,10 @@ object FlemmixSearchWebViewV16 {
                     webView = view
                     cookieManager.setAcceptThirdPartyCookies(view, true)
                     activity.addContentView(view, ViewGroup.LayoutParams(1, 1))
-                    val hasReusableSession = initializedOrigins.contains(origin) &&
+                    // Les cookies WebView survivent au redémarrage de
+                    // l'extension. Les tenter directement ; le mécanisme de
+                    // secours recharge l'accueil s'ils sont devenus invalides.
+                    val hasReusableSession = initializedOrigins.contains(origin) ||
                         !cookieManager.getCookie(origin).isNullOrBlank()
                     if (hasReusableSession) {
                         directAttempt = true
