@@ -74,7 +74,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "Resolver revision: explicit-onclick-v7"
+          echo "Resolver revision: static-script-target-v8"
 
           shopt -s nullglob
           files=(KeepLink*.txt)
@@ -336,6 +336,71 @@ jobs:
               return response
 
 
+          def append_same_origin_scripts(content, page_url):
+              """Read redirect configuration stored in external JS bundles."""
+              source = (
+                  content.decode("utf-8", errors="ignore")
+                  if isinstance(content, bytes)
+                  else str(content)
+              )
+              page = urlparse(page_url)
+              assets = []
+              seen = set()
+              for match in re.finditer(
+                  r"<script\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"]",
+                  source,
+                  re.I,
+              ):
+                  from urllib.parse import urljoin
+
+                  asset_url = urljoin(page_url, match.group(1))
+                  parsed = urlparse(asset_url)
+                  if (
+                      parsed.scheme != "https"
+                      or parsed.hostname != page.hostname
+                      or asset_url in seen
+                      or len(assets) >= 8
+                  ):
+                      continue
+                  seen.add(asset_url)
+                  try:
+                      asset = requests.get(
+                          asset_url,
+                          impersonate="chrome",
+                          headers={
+                              "Accept": "*/*",
+                              "Referer": page_url,
+                          },
+                          proxies={
+                              "http": "socks5h://keeplink-assets:isolated@127.0.0.1:9050",
+                              "https": "socks5h://keeplink-assets:isolated@127.0.0.1:9050",
+                          },
+                          allow_redirects=True,
+                          timeout=45,
+                      )
+                  except requests.RequestsError:
+                      continue
+                  if (
+                      asset.status_code != 200
+                      or not asset.content
+                      or len(asset.content) > 4 * 1024 * 1024
+                  ):
+                      continue
+                  assets.append(asset.content)
+
+              if assets:
+                  print(
+                      f"Static redirect scripts read: {len(assets)}",
+                      file=sys.stderr,
+                  )
+                  return (
+                      content
+                      + b"\n/* KEEPLINK_EXTERNAL_SCRIPT */\n"
+                      + b"\n".join(assets)
+                  )
+              return content
+
+
           requested_url, body_file = sys.argv[1:]
           response = None
 
@@ -377,6 +442,8 @@ jobs:
 
           if any(urlparse(url).scheme != "https" for url in redirect_urls):
               raise RuntimeError("Refusing a non-HTTPS redirect")
+
+          content = append_same_origin_scripts(content, final_url)
 
           with open(body_file, "wb") as output:
               output.write(content)
@@ -624,7 +691,7 @@ jobs:
                       self.current_clickable = None
 
           parser = PageParser()
-          parser.feed(source)
+          parser.feed(source.split("/* KEEPLINK_EXTERNAL_SCRIPT */", 1)[0])
 
           candidates = []
           candidate_index = 0
@@ -692,6 +759,31 @@ jobs:
                       1000,
                       "explicit_onclick",
                   )
+
+          # Applications JavaScript : certains hubs placent leur domaine
+          # officiel dans un tableau de configuration puis donnent cette
+          # variable au compte à rebours. Les bundles minifiés représentent
+          # souvent `primary: true` par `primary: !0`.
+          primary_script_patterns = (
+              r"\{[^{}]{0,1200}?url\s*:\s*['\"](https://[^'\"]+)['\"]"
+              r"[^{}]{0,1200}?primary\s*:\s*(?:true|!0)[^{}]*\}",
+              r"\{[^{}]{0,1200}?primary\s*:\s*(?:true|!0)"
+              r"[^{}]{0,1200}?url\s*:\s*['\"](https://[^'\"]+)['\"][^{}]*\}",
+          )
+          for pattern in primary_script_patterns:
+              for match in re.finditer(pattern, source, re.I | re.S):
+                  add_candidate(match.group(1), 990, "javascript_redirect")
+
+          # Version HTML/noscript du même mécanisme. Le lien doit se trouver
+          # immédiatement après une affirmation explicite d'adresse active.
+          for match in re.finditer(
+              r"(?:la\s+seule\s+adresse(?:\s+officielle)?(?:\s+actuellement)?\s+active"
+              r"|adresse\s+officielle\s+active).{0,800}?"
+              r"<a\b[^>]*href\s*=\s*['\"](https://[^'\"]+)['\"]",
+              source,
+              re.I | re.S,
+          ):
+              add_candidate(match.group(1), 980, "explicit_cta")
 
           # Adresse écrite après les indications AfterDark.
           visible_text = " ".join(parser.text)
