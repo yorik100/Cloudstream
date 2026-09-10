@@ -1,0 +1,86 @@
+[
+  {
+    "iconUrl": "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/icons/KeepLinkAfterDark.png",
+    "fileHash": "sha256-c179ffe5a5f26835d2e39f9d0d88a72198d87e6aa6d348eff541ed802d2f66c9",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/yorik100/Cloudstream",
+    "fileSize": 152871,
+    "status": 3,
+    "language": "fr",
+    "authors": [
+      "yorik100"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 64,
+    "internalName": "AfterDark",
+    "description": "AfterDark - vérification + lancement de vidéo automatique",
+    "url": "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/AfterDark.cs3",
+    "name": "AfterDark"
+  },
+  {
+    "iconUrl": "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/icons/KeepLinkFlemmix.png",
+    "fileHash": "sha256-26501ad041a00ff03063fe92a7231cbb20798548a0d908bcedcbc5f22813ad85",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/yorik100/Cloudstream",
+    "fileSize": 75728,
+    "status": 3,
+    "language": "fr",
+    "authors": [
+      "yorik100"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 25,
+    "internalName": "Flemmix",
+    "description": "Flemmix/Wiflix - lecteur natif",
+    "url": "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/Flemmix.cs3",
+    "name": "Flemmix/Wiflix"
+  },
+  {
+    "iconUrl": "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/icons/KeepLinkFrembed.png",
+    "fileHash": "sha256-aeda82dc30219ecaf8381a6fa0ca57a981464d364a47380a130fd9b5e5aba4ae",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/yorik100/Cloudstream",
+    "fileSize": 78714,
+    "status": 3,
+    "language": "fr",
+    "authors": [
+      "yorik100"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 26,
+    "internalName": "Frembed",
+    "description": "Frembed - lecteur natif",
+    "url": "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/Frembed.cs3",
+    "name": "Frembed"
+  },
+  {
+    "iconUrl": "https://raw.githubusercontent.com/yorik100/Cloudstream/refs/heads/main/icons/KeepLinkXalaflix.png",
+    "fileHash": "sha256-499a98d319316746e34d4707e1f5e94773d6ca4c1f54a008e7639dd47b0abf18",
+    "apiVersion": 1,
+    "repositoryUrl": "https://github.com/yorik100/Cloudstream",
+    "fileSize": 91001,
+    "status": 3,
+    "language": "fr",
+    "authors": [
+      "yorik100"
+    ],
+    "tvTypes": [
+      "Movie",
+      "TvSeries"
+    ],
+    "version": 31,
+    "internalName": "Xalaflix",
+    "description": "Xalaflix - lecteur natif",
+    "url": "https://raw.githubusercontent.com/yorik100/Cloudstream/builds/Xalaflix.cs3",
+    "name": "Xalaflix"
+  }
+]
