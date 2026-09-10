@@ -42,9 +42,10 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.math.max
 
 class FlemmixProvider : MainAPI() {
@@ -73,6 +74,7 @@ class FlemmixProvider : MainAPI() {
     )
 
     private val domainResolver = FlemmixDomainResolver(browserHeaders)
+    private val webViewSearchOrigins = ConcurrentHashMap.newKeySet<String>()
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImages = "https://image.tmdb.org/t/p"
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
@@ -186,6 +188,12 @@ class FlemmixProvider : MainAPI() {
         origin: String,
         query: String,
     ): List<SearchResponse>? {
+        // Dès qu'un domaine a confirmé que son Bot Shield refuse les clients
+        // HTTP, ne pas refaire les trois requêtes lentes à chaque recherche.
+        if (webViewSearchOrigins.contains(origin)) {
+            return searchWithWebView(origin, query)
+        }
+
         // DLE lie le jeton de recherche aux cookies créés en chargeant la
         // page d'accueil. Une Session est donc indispensable : deux appels
         // via l'objet global `app` peuvent utiliser des contextes différents.
@@ -298,19 +306,9 @@ class FlemmixProvider : MainAPI() {
 
         val ajaxBlocked = response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)
         if (results.isEmpty() && (navigationBlocked || ajaxBlocked)) {
+            webViewSearchOrigins.add(origin)
             Log.i(SEARCH_TAG, "Bot Shield détecté, recherche WebView en arrière-plan")
-            val browserHtml = FlemmixSearchWebViewV16.load(origin, query)
-            val browserResults = browserHtml?.let {
-                filterSearchItems(parseItems(it, origin, null), queryTerms)
-            }.orEmpty()
-            if (browserResults.isNotEmpty()) {
-                Log.i(SEARCH_TAG, "Recherche WebView '$query' : ${browserResults.size} résultat(s)")
-                return browserResults
-            }
-            Log.w(
-                SEARCH_TAG,
-                "Recherche WebView sans résultat ; taille=${browserHtml?.length ?: 0}",
-            )
+            return searchWithWebView(origin, query)
         }
 
         if (results.isEmpty()) {
@@ -321,6 +319,31 @@ class FlemmixProvider : MainAPI() {
             )
         }
         return results
+    }
+
+    private suspend fun searchWithWebView(
+        origin: String,
+        query: String,
+    ): List<SearchResponse>? {
+        val queryTerms = normalizeForMatch(query)
+            .split(' ')
+            .filter(String::isNotBlank)
+        val startedAt = System.nanoTime()
+        val browserHtml = FlemmixSearchWebViewV16.load(origin, query)
+        if (browserHtml == null) {
+            Log.w(SEARCH_TAG, "Recherche WebView annulée ou inaccessible pour '$query'")
+            return null
+        }
+        val parsed = parseItems(browserHtml, origin, null).ifEmpty {
+            parseSearchSuggestions(browserHtml, origin)
+        }
+        val browserResults = filterSearchItems(parsed, queryTerms)
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+        Log.i(
+            SEARCH_TAG,
+            "Recherche WebView '$query' : ${browserResults.size} résultat(s) en ${elapsedMs} ms",
+        )
+        return browserResults
     }
 
     private fun filterSearchItems(
@@ -1034,15 +1057,18 @@ class FlemmixProvider : MainAPI() {
 object FlemmixSearchWebViewV16 {
     private const val TIMEOUT_MS = 25_000L
     private const val POLL_INTERVAL_MS = 500L
+    private val initializedOrigins = ConcurrentHashMap.newKeySet<String>()
 
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun load(origin: String, query: String): String? =
-        suspendCoroutine { continuation ->
+        suspendCancellableCoroutine { continuation ->
             val handler = Handler(Looper.getMainLooper())
             val finished = AtomicBoolean(false)
             var webView: WebView? = null
             var searchStarted = false
             var pollingStarted = false
+            var directAttempt = false
+            var homeRetryDone = false
             var lastHtml: String? = null
             var lastUrl: String? = null
 
@@ -1064,7 +1090,7 @@ object FlemmixSearchWebViewV16 {
                     }
                     webView = null
                 }
-                continuation.resume(html)
+                if (continuation.isActive) continuation.resume(html)
             }
 
             timeout = Runnable {
@@ -1075,6 +1101,7 @@ object FlemmixSearchWebViewV16 {
                 )
                 finish(lastHtml)
             }
+            continuation.invokeOnCancellation { finish(null) }
             handler.post {
                 val activity = FlemmixRuntimeV16.currentActivity()
                 if (activity == null || activity.isFinishing) {
@@ -1097,6 +1124,7 @@ object FlemmixSearchWebViewV16 {
                                 Log.i("FlemmixSearchWebView", "Page terminée : $url")
 
                                 if (!searchStarted) {
+                                    initializedOrigins.add(origin)
                                     searchStarted = true
                                     handler.postDelayed({
                                         if (!finished.get()) {
@@ -1147,8 +1175,23 @@ object FlemmixSearchWebViewV16 {
                                             JSONTokener(encoded).nextValue() as? String
                                         }.getOrNull()
                                         if (!html.isNullOrBlank()) lastHtml = html
-                                        val hasCards = html?.contains("mov-t", ignoreCase = true) == true
-                                        if (hasCards && html.length > 500) {
+                                        val blocked = html?.contains(
+                                            "Bot shield active.",
+                                            ignoreCase = true,
+                                        ) == true
+                                        if (blocked && directAttempt && !homeRetryDone) {
+                                            // Le cookie mémorisé a expiré : repasser une seule fois
+                                            // par l'accueil afin de renouveler la preuve anti-bot.
+                                            homeRetryDone = true
+                                            directAttempt = false
+                                            searchStarted = false
+                                            pollingStarted = false
+                                            initializedOrigins.remove(origin)
+                                            view.loadUrl("$origin/")
+                                        } else if (!html.isNullOrBlank() && html.length > 500 && !blocked) {
+                                            // onPageFinished garantit ici que la réponse est complète.
+                                            // Terminer aussi quand la recherche ne contient aucun résultat,
+                                            // au lieu d'attendre inutilement l'expiration de 25 secondes.
                                             finish(html)
                                         } else {
                                             handler.postDelayed(poll, POLL_INTERVAL_MS)
@@ -1162,7 +1205,19 @@ object FlemmixSearchWebViewV16 {
                     webView = view
                     cookieManager.setAcceptThirdPartyCookies(view, true)
                     activity.addContentView(view, ViewGroup.LayoutParams(1, 1))
-                    view.loadUrl("$origin/")
+                    val hasReusableSession = initializedOrigins.contains(origin) &&
+                        !cookieManager.getCookie(origin).isNullOrBlank()
+                    if (hasReusableSession) {
+                        directAttempt = true
+                        searchStarted = true
+                        val body = "story=${URLEncoder.encode(query, "UTF-8")}".toByteArray()
+                        view.postUrl(
+                            "$origin/index.php?do=search&subaction=search",
+                            body,
+                        )
+                    } else {
+                        view.loadUrl("$origin/")
+                    }
                     handler.postDelayed(timeout, TIMEOUT_MS)
                 } catch (_: Throwable) {
                     finish(null)
