@@ -48,6 +48,8 @@ object AfterDarkProofWebView {
         val sourceInterceptStarted = AtomicBoolean(false)
         val officialPlayerMode = AtomicBoolean(false)
         val sourceFailoverInProgress = AtomicBoolean(false)
+        val preferredSourceSelectionDone = AtomicBoolean(false)
+        val playbackControlsHidden = AtomicBoolean(false)
         val verificationButtonHasAppeared = AtomicBoolean(false)
         val checkboxReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
@@ -416,6 +418,205 @@ object AfterDarkProofWebView {
                 }
             }
 
+            fun hideOfficialControlsAfterPlay() {
+                if (
+                    !officialPlayerMode.get() ||
+                    finished.get() ||
+                    !playbackControlsHidden.compareAndSet(false, true)
+                ) return
+
+                browser.post {
+                    if (finished.get() || !officialPlayerMode.get()) return@post
+
+                    browser.evaluateJavascript(
+                        """
+                        (() => {
+                          const normalize = value =>
+                            String(value || "")
+                              .replace(/\s+/g, " ")
+                              .trim()
+                              .toLocaleLowerCase("fr-FR");
+
+                          const hide = element => {
+                            if (!element) return;
+                            element.style.setProperty(
+                              "display",
+                              "none",
+                              "important"
+                            );
+                            element.setAttribute(
+                              "data-afterdark-hidden-after-play",
+                              "true"
+                            );
+                          };
+
+                          const buttons = Array.from(
+                            document.querySelectorAll("button")
+                          );
+
+                          const back = buttons.find(button =>
+                            normalize(button.getAttribute("aria-label")) ===
+                              "retour"
+                          );
+
+                          const sources = buttons.find(button =>
+                            normalize(button.textContent) === "sources"
+                          );
+
+                          // If they share the exact AfterDark toolbar wrapper,
+                          // hide the wrapper. Otherwise hide both controls.
+                          //
+                          // They remain in the DOM intentionally: the fallback
+                          // controller can still trigger Sources.click() later
+                          // if the current provider exposes "Go Back".
+                          if (
+                            back &&
+                            sources &&
+                            back.parentElement &&
+                            back.parentElement === sources.parentElement
+                          ) {
+                            hide(back.parentElement);
+                          } else {
+                            hide(back);
+                            hide(sources);
+                          }
+                        })();
+                        """.trimIndent(),
+                        null,
+                    )
+                }
+            }
+
+            fun selectPreferredOfficialSource() {
+                if (
+                    !officialPlayerMode.get() ||
+                    finished.get() ||
+                    preferredSourceSelectionDone.get()
+                ) return
+
+                browser.post {
+                    if (
+                        finished.get() ||
+                        !officialPlayerMode.get() ||
+                        preferredSourceSelectionDone.get()
+                    ) return@post
+
+                    browser.evaluateJavascript(
+                        """
+                        (() => {
+                          if (
+                            window.__afterdarkPreferredSourceSelected ||
+                            window.__afterdarkPreferredSourceLocked ||
+                            window.__afterdarkPreferredSourceObserverInstalled
+                          ) return;
+
+                          window.__afterdarkPreferredSourceObserverInstalled = true;
+
+                          const normalize = value =>
+                            String(value || "")
+                              .replace(/\s+/g, " ")
+                              .trim()
+                              .toLocaleLowerCase("fr-FR");
+
+                          const interactive = () =>
+                            Array.from(
+                              document.querySelectorAll(
+                                'button,a,[role="button"]'
+                              )
+                            );
+
+                          const findSourcesButton = () =>
+                            interactive().find(element =>
+                              normalize(element.textContent) === "sources"
+                            );
+
+                          const findVideasyButton = () =>
+                            interactive().find(element => {
+                              const text = normalize(element.textContent);
+                              return text === "videasy" ||
+                                     text.includes("videasy");
+                            });
+
+                          let sourceMenuOpened = false;
+
+                          const trySelectVideasy = () => {
+                            if (
+                              window.__afterdarkPreferredSourceSelected ||
+                              window.__afterdarkPreferredSourceLocked
+                            ) {
+                              return true;
+                            }
+
+                            if (!sourceMenuOpened) {
+                              const sources = findSourcesButton();
+                              if (!sources) return false;
+
+                              try {
+                                // The Sources control may be hidden visually by
+                                // our cleanup, but its React click handler still
+                                // opens the official AfterDark source selector.
+                                sources.click();
+                                sourceMenuOpened = true;
+                              } catch (_) {
+                                return false;
+                              }
+                            }
+
+                            const videasy = findVideasyButton();
+                            if (!videasy) return false;
+
+                            window.__afterdarkPreferredSourceSelected = true;
+                            window.__afterdarkPreferredSourceLocked = true;
+
+                            try {
+                              videasy.click();
+                            } catch (_) {
+                              window.__afterdarkPreferredSourceSelected = false;
+                              window.__afterdarkPreferredSourceLocked = false;
+                              return false;
+                            }
+
+                            try {
+                              window.AfterDarkNative.preferredSourceSelected(
+                                "videasy"
+                              );
+                            } catch (_) {}
+
+                            return true;
+                          };
+
+                          if (trySelectVideasy()) {
+                            window.__afterdarkPreferredSourceObserverInstalled = false;
+                            return;
+                          }
+
+                          const observer = new MutationObserver(() => {
+                            if (trySelectVideasy()) {
+                              try { observer.disconnect(); } catch (_) {}
+                              window.__afterdarkPreferredSourceObserverInstalled = false;
+                            }
+                          });
+
+                          observer.observe(document.documentElement, {
+                            childList: true,
+                            subtree: true,
+                            characterData: true,
+                            attributes: true,
+                            attributeFilter: [
+                              "class",
+                              "style",
+                              "aria-hidden"
+                            ]
+                          });
+
+                          window.__afterdarkPreferredSourceObserver = observer;
+                        })();
+                        """.trimIndent(),
+                        null,
+                    )
+                }
+            }
+
             fun advanceOfficialSourceAfterFailure(
                 failedHost: String?,
             ) {
@@ -434,6 +635,8 @@ object AfterDarkProofWebView {
 
                 if (!sourceFailoverInProgress.compareAndSet(false, true)) return
 
+                preferredSourceSelectionDone.set(true)
+
                 browser.post {
                     if (finished.get() || !officialPlayerMode.get()) {
                         sourceFailoverInProgress.set(false)
@@ -446,6 +649,7 @@ object AfterDarkProofWebView {
                           if (window.__afterdarkOfficialFailoverRunning) return;
                           window.__afterdarkOfficialFailoverRunning = true;
                           window.__afterdarkOfficialSourceAdvanced = false;
+                          window.__afterdarkPreferredSourceLocked = true;
 
                           const normalize = value =>
                             String(value || "")
@@ -571,6 +775,24 @@ object AfterDarkProofWebView {
                     }
 
                     @JavascriptInterface
+                    fun playClicked() {
+                        handler.post {
+                            hideOfficialControlsAfterPlay()
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun preferredSourceSelected(service: String?) {
+                        handler.post {
+                            preferredSourceSelectionDone.set(true)
+                            Log.i(
+                                TAG,
+                                "Source AfterDark préférée sélectionnée: ${service.orEmpty()}",
+                            )
+                        }
+                    }
+
+                    @JavascriptInterface
                     fun playerNotFound(host: String?) {
                         handler.post {
                             advanceOfficialSourceAfterFailure(host)
@@ -662,62 +884,18 @@ object AfterDarkProofWebView {
                               clickedPlayButtons.add(play);
                               try {
                                 play.click();
+
+                                // The Play control may live inside a cross-origin
+                                // iframe. Notify native code so it can hide the
+                                // top-level AfterDark controls immediately after
+                                // this successful click.
+                                try {
+                                  window.AfterDarkNative.playClicked();
+                                } catch (_) {}
+
                                 return true;
                               } catch (_) {
                                 return false;
-                              }
-                            };
-
-                            const hideAfterDarkControls = () => {
-                              if (
-                                !EXPECTED_AFTERDARK_HOST ||
-                                currentHost() !==
-                                  EXPECTED_AFTERDARK_HOST.toLowerCase()
-                              ) {
-                                return;
-                              }
-
-                              const buttons = Array.from(
-                                document.querySelectorAll("button")
-                              );
-
-                              const back = buttons.find(button =>
-                                normalize(button.getAttribute("aria-label")) ===
-                                  "retour"
-                              );
-
-                              const sources = buttons.find(button =>
-                                normalize(button.textContent) === "sources"
-                              );
-
-                              // Prefer hiding the exact common wrapper supplied
-                              // by AfterDark; otherwise hide the two controls.
-                              if (
-                                back &&
-                                sources &&
-                                back.parentElement &&
-                                back.parentElement === sources.parentElement
-                              ) {
-                                back.parentElement.style.setProperty(
-                                  "display",
-                                  "none",
-                                  "important"
-                                );
-                              } else {
-                                if (back) {
-                                  back.style.setProperty(
-                                    "display",
-                                    "none",
-                                    "important"
-                                  );
-                                }
-                                if (sources) {
-                                  sources.style.setProperty(
-                                    "display",
-                                    "none",
-                                    "important"
-                                  );
-                                }
                               }
                             };
 
@@ -766,7 +944,6 @@ object AfterDarkProofWebView {
                             };
 
                             const scanPlayerFrame = () => {
-                              hideAfterDarkControls();
                               detectProviderFailure();
                               findAndClickPlay();
                             };
@@ -968,6 +1145,8 @@ object AfterDarkProofWebView {
                         TAG,
                         "API sources vide : conservation de la WebView officielle AfterDark",
                     )
+
+                    selectPreferredOfficialSource()
                 }
             }
 
@@ -1158,6 +1337,8 @@ object AfterDarkProofWebView {
                             view,
                             reloadOnInteractiveCheckbox = true,
                         )
+                    } else if (!preferredSourceSelectionDone.get()) {
+                        selectPreferredOfficialSource()
                     }
                 }
 
