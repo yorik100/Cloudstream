@@ -560,21 +560,6 @@ class AfterDarkProvider : MainAPI() {
         val season = request.season ?: 1
         val episode = request.episode ?: 1
 
-        val videasyPath = if (request.type == "tv") {
-            "/tv/${request.tmdbId}/$season/$episode" +
-                "?overlay=true&color=8B5CF6" +
-                "&nextEpisode=true&episodeSelector=true&autoplayNextEpisode=true"
-        } else {
-            "/movie/${request.tmdbId}" +
-                "?overlay=true&color=8B5CF6"
-        }
-
-        // player.videasy.net currently redirects to player.videasy.to. Opening
-        // both produced the exact same WebView twice when resolution failed.
-        val videasySources = listOf(
-            "videasy" to "https://player.videasy.to$videasyPath",
-        )
-
         val peachify = if (request.type == "tv") {
             "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
                 "?dub=French&sub=French&autoNext=30"
@@ -583,12 +568,12 @@ class AfterDarkProvider : MainAPI() {
                 "?dub=French&sub=French"
         }
 
-        return (videasySources + listOf("peachify" to peachify)).map { (service, url) ->
+        return listOf(
             ParsedSource(
                 group = "Secours",
-                service = service,
+                service = "peachify",
                 provider = "AfterDark",
-                url = url,
+                url = peachify,
                 quality = null,
                 language = null,
                 type = "embed",
@@ -596,8 +581,8 @@ class AfterDarkProvider : MainAPI() {
                 referer = "$mainUrl/",
                 headers = emptyMap(),
                 subtitles = emptyList(),
-            )
-        }
+            ),
+        )
     }
 
     private fun directType(source: ParsedSource): ExtractorLinkType? {
@@ -870,10 +855,8 @@ class AfterDarkProvider : MainAPI() {
             }
 
             if (extractorEmitted) {
-                // "Secours" is a failover chain, not a list that should be
-                // resolved all at once. Once Videasy (or a later fallback)
-                // produced a real link, stop here so the next fallback does
-                // not replace it while it is still loading.
+                // Peachify is the sole browser fallback. Once it emits a real
+                // CloudStream link there is no later fallback to resolve.
                 if (source.group == "Secours") return true
                 continue
             }
@@ -898,7 +881,7 @@ class AfterDarkProvider : MainAPI() {
                     val valid = validateResolvedMedia(resolved)
 
                     if (!valid) {
-                        // Videasy dead/inaccessible => continue to Peachify.
+                        // The Peachify media URL was stale or inaccessible.
                         continue
                     }
 
