@@ -560,14 +560,23 @@ class AfterDarkProvider : MainAPI() {
         val season = request.season ?: 1
         val episode = request.episode ?: 1
 
-        val videasy = if (request.type == "tv") {
-            "https://player.videasy.to/tv/${request.tmdbId}/$season/$episode" +
+        val videasyPath = if (request.type == "tv") {
+            "/tv/${request.tmdbId}/$season/$episode" +
                 "?overlay=true&color=8B5CF6" +
                 "&nextEpisode=true&episodeSelector=true&autoplayNextEpisode=true"
         } else {
-            "https://player.videasy.to/movie/${request.tmdbId}" +
+            "/movie/${request.tmdbId}" +
                 "?overlay=true&color=8B5CF6"
         }
+
+        // Videasy currently exposes player pages through both domains and may
+        // redirect between them. Keep both explicit candidates so a failed
+        // migration/redirect cannot prevent the Peachify fallback from being
+        // reached.
+        val videasySources = listOf(
+            "https://player.videasy.net",
+            "https://player.videasy.to",
+        ).map { origin -> "videasy" to "$origin$videasyPath" }
 
         val peachify = if (request.type == "tv") {
             "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
@@ -577,10 +586,7 @@ class AfterDarkProvider : MainAPI() {
                 "?dub=French&sub=French"
         }
 
-        return listOf(
-            "videasy" to videasy,
-            "peachify" to peachify,
-        ).map { (service, url) ->
+        return (videasySources + listOf("peachify" to peachify)).map { (service, url) ->
             ParsedSource(
                 group = "Secours",
                 service = service,

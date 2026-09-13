@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.util.Log
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -24,6 +25,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 object AfterDarkEmbedWebView {
+    private const val TAG = "AfterDarkEmbedWebView"
+
     private val mediaExtensions = listOf(
         ".m3u8",
         ".mpd",
@@ -47,6 +50,12 @@ object AfterDarkEmbedWebView {
 
         fun finish(result: ResolvedWebMedia?) {
             if (!finished.compareAndSet(false, true)) return
+
+            if (result != null) {
+                Log.i(TAG, "Source $sourceName résolue : ${result.type} ${result.url}")
+            } else {
+                Log.w(TAG, "Résolution $sourceName terminée sans média")
+            }
 
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
@@ -199,6 +208,7 @@ object AfterDarkEmbedWebView {
 
                         // Only explicit rendered player/error states may end a
                         // fallback. Peachify is never stopped by elapsed time.
+                        Log.w(TAG, "Source $sourceName indisponible : ${reason.orEmpty()}")
                         finish(null)
                     }
                 }
@@ -511,7 +521,9 @@ object AfterDarkEmbedWebView {
                             const isVideasyPage = () => {
                               if (!VIDEASY_MODE) return false;
                               const host = String(location.hostname || '').toLowerCase();
-                              return host === 'player.videasy.to' ||
+                              return host === 'player.videasy.net' ||
+                                     host.endsWith('.videasy.net') ||
+                                     host === 'player.videasy.to' ||
                                      host.endsWith('.videasy.to');
                             };
 
@@ -636,26 +648,11 @@ object AfterDarkEmbedWebView {
                                 return;
                               }
 
-                              // "No player at all" is only terminal when the
-                              // application has actually rendered content and
-                              // is not presenting a loading state. This is a DOM
-                              // state check, not an elapsed-time heuristic.
-                              const root = renderedAppRoot();
-                              if (
-                                document.readyState === 'complete' &&
-                                root &&
-                                !hasLoadingState() &&
-                                !window.__afterdarkVideasyPlayerSeen
-                              ) {
-                                const text = normalizedText(root.textContent);
-                                const hasInteractiveOrMessage =
-                                  text.length > 0 ||
-                                  !!root.querySelector('a,button,[role="button"],svg,img');
-
-                                if (hasInteractiveOrMessage) {
-                                  bridge.unavailable('videasy-no-player');
-                                }
-                              }
+                              // Do not infer failure from the absence of the old
+                              // player markup. Videasy is a client-side app and
+                              // may render its shell before mounting the player.
+                              // Only an explicit error or an HTTP/navigation
+                              // failure is terminal.
                             };
 
                             const scanMedia = () => {
@@ -707,16 +704,6 @@ object AfterDarkEmbedWebView {
 
                             document.querySelectorAll('video,audio').forEach(media => {
                               try {
-                                if (
-                                  VIDEASY_MODE &&
-                                  !media.__afterdarkErrorHooked
-                                ) {
-                                  media.__afterdarkErrorHooked = true;
-                                  media.addEventListener('error', () => {
-                                    bridge.unavailable('videasy-media-error');
-                                  });
-                                }
-
                                 media.muted = true;
                                 media.autoplay = true;
                                 const p = media.play();
@@ -776,12 +763,16 @@ object AfterDarkEmbedWebView {
                         val uri = request?.url ?: return true
                         val scheme = uri.scheme?.lowercase()
 
+                        val videasyHost = uri.host.equals("player.videasy.net", ignoreCase = true) ||
+                            uri.host.equals("player.videasy.to", ignoreCase = true)
+
                         if (
                             videasyMode &&
                             request.isForMainFrame &&
-                            uri.host.equals("player.videasy.to", ignoreCase = true) &&
+                            videasyHost &&
                             (uri.path.isNullOrBlank() || uri.path == "/")
                         ) {
+                            Log.w(TAG, "Videasy a renvoyé vers sa racine : $uri")
                             finish(null)
                             return true
                         }
@@ -804,6 +795,7 @@ object AfterDarkEmbedWebView {
                             request?.isForMainFrame == true &&
                             (statusCode == 404 || statusCode == 410)
                         ) {
+                            Log.w(TAG, "Erreur HTTP Videasy $statusCode sur ${request.url}")
                             finish(null)
                         }
                     }
@@ -816,6 +808,10 @@ object AfterDarkEmbedWebView {
                         super.onReceivedError(view, request, error)
 
                         if (videasyMode && request?.isForMainFrame == true) {
+                            Log.w(
+                                TAG,
+                                "Erreur WebView Videasy ${error?.errorCode}: ${error?.description}",
+                            )
                             finish(null)
                         }
                     }
@@ -837,14 +833,13 @@ object AfterDarkEmbedWebView {
                         url: String?,
                     ) {
                         super.onPageFinished(view, url)
+                        Log.i(TAG, "Page $sourceName chargée : ${url.orEmpty()}")
                         installHooksAndNudge()
 
-                        if (!videasyMode) {
-                            handler.postDelayed({ installHooksAndNudge() }, 1_000L)
-                            handler.postDelayed({ installHooksAndNudge() }, 3_000L)
-                            handler.postDelayed({ installHooksAndNudge() }, 6_000L)
-                            handler.postDelayed({ installHooksAndNudge() }, 12_000L)
-                        }
+                        handler.postDelayed({ installHooksAndNudge() }, 1_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 3_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 6_000L)
+                        handler.postDelayed({ installHooksAndNudge() }, 12_000L)
                     }
                 }
 
