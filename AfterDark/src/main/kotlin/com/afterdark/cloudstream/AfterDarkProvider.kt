@@ -560,6 +560,12 @@ class AfterDarkProvider : MainAPI() {
         val season = request.season ?: 1
         val episode = request.episode ?: 1
 
+        // Never synthesize/open Videasy directly anymore. When the official
+        // AfterDark /api/sources response is empty, the same /watch WebView
+        // stays alive and lets AfterDark use its own cached/session player.
+        //
+        // Peachify remains only as a defensive fallback for an older or
+        // incomplete in-memory ProofSession that somehow reaches this branch.
         val peachify = if (request.type == "tv") {
             "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
                 "?dub=French&sub=French&autoNext=30"
@@ -790,8 +796,9 @@ class AfterDarkProvider : MainAPI() {
 
         val parsedSources = parseNdjson(response.second)
 
-        // AfterDark's own frontend falls back to browser embeds when the streamed
-        // /api/sources response finishes without any item.
+        // Normally an empty official /api/sources response stays inside the
+        // same /watch WebView and never reaches this branch. This is only a
+        // defensive path for an old/incomplete cached session.
         val sources = if (parsedSources.isEmpty()) {
             fallbackSources(request)
         } else {
@@ -855,16 +862,17 @@ class AfterDarkProvider : MainAPI() {
             }
 
             if (extractorEmitted) {
-                // Peachify is the sole browser fallback. Once it emits a real
-                // CloudStream link there is no later fallback to resolve.
+                // "Secours" is a failover chain, not a list that should be
+                // resolved all at once. Once Videasy (or a later fallback)
+                // produced a real link, stop here so the next fallback does
+                // not replace it while it is still loading.
                 if (source.group == "Secours") return true
                 continue
             }
 
-            // AfterDark's official fallback embeds are browser players. When
-            // CloudStream has no extractor for one of them, let the official
-            // player execute normally in an internal WebView and capture the
-            // real HLS/DASH/video request it produces.
+            // Defensive browser fallback for the remaining source(s).
+            // Videasy is intentionally absent: the official AfterDark WebView
+            // owns that path and no direct Videasy navigation is performed.
             if (isEmbed && source.group == "Secours") {
                 val resolved = runCatching {
                     AfterDarkEmbedWebView.resolve(
@@ -881,7 +889,7 @@ class AfterDarkProvider : MainAPI() {
                     val valid = validateResolvedMedia(resolved)
 
                     if (!valid) {
-                        // The Peachify media URL was stale or inaccessible.
+                        // Videasy dead/inaccessible => continue to Peachify.
                         continue
                     }
 

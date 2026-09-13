@@ -31,6 +31,7 @@ import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import org.json.JSONObject
 
 object AfterDarkProofWebView {
     private const val TAG = "AfterDarkProofWebView"
@@ -45,6 +46,8 @@ object AfterDarkProofWebView {
     ): ProofSession? = suspendCoroutine { continuation ->
         val finished = AtomicBoolean(false)
         val sourceInterceptStarted = AtomicBoolean(false)
+        val officialPlayerMode = AtomicBoolean(false)
+        val sourceFailoverInProgress = AtomicBoolean(false)
         val verificationButtonHasAppeared = AtomicBoolean(false)
         val checkboxReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
@@ -75,7 +78,11 @@ object AfterDarkProofWebView {
             continuation.resume(result)
         }
 
-        timeoutRunnable = Runnable { finish(null) }
+        timeoutRunnable = Runnable {
+            if (!officialPlayerMode.get()) {
+                finish(null)
+            }
+        }
 
         handler.post {
             try {
@@ -396,6 +403,7 @@ object AfterDarkProofWebView {
             fun reloadForInteractiveCheckbox() {
                 if (
                     finished.get() ||
+                    officialPlayerMode.get() ||
                     verificationButtonHasAppeared.get() ||
                     !checkboxReloadInProgress.compareAndSet(false, true)
                 ) return
@@ -405,6 +413,148 @@ object AfterDarkProofWebView {
                     if (!finished.get() && !verificationButtonHasAppeared.get()) {
                         browser.reload()
                     }
+                }
+            }
+
+            fun advanceOfficialSourceAfterFailure(
+                failedHost: String?,
+            ) {
+                if (!officialPlayerMode.get() || finished.get()) return
+
+                val failed = failedHost
+                    ?.trim()
+                    ?.lowercase()
+                    .orEmpty()
+
+                // Peachify was already the last allowed AfterDark fallback.
+                if (failed.contains("peachify")) {
+                    finish(null)
+                    return
+                }
+
+                if (!sourceFailoverInProgress.compareAndSet(false, true)) return
+
+                browser.post {
+                    if (finished.get() || !officialPlayerMode.get()) {
+                        sourceFailoverInProgress.set(false)
+                        return@post
+                    }
+
+                    browser.evaluateJavascript(
+                        """
+                        (() => {
+                          if (window.__afterdarkOfficialFailoverRunning) return;
+                          window.__afterdarkOfficialFailoverRunning = true;
+                          window.__afterdarkOfficialSourceAdvanced = false;
+
+                          const normalize = value =>
+                            String(value || "")
+                              .replace(/\s+/g, " ")
+                              .trim()
+                              .toLocaleLowerCase("fr-FR");
+
+                          const interactive = () =>
+                            Array.from(
+                              document.querySelectorAll(
+                                'button,a,[role="button"]'
+                              )
+                            );
+
+                          const sourcesButton = () =>
+                            interactive().find(element =>
+                              normalize(element.textContent) === "sources"
+                            );
+
+                          const peachifyButton = () =>
+                            interactive().find(element => {
+                              const text = normalize(element.textContent);
+                              return text.includes("peachify");
+                            });
+
+                          let observer = null;
+                          let menuDeadline = null;
+
+                          const cleanup = () => {
+                            if (observer) {
+                              try { observer.disconnect(); } catch (_) {}
+                              observer = null;
+                            }
+                            if (menuDeadline) {
+                              clearTimeout(menuDeadline);
+                              menuDeadline = null;
+                            }
+                            window.__afterdarkOfficialFailoverRunning = false;
+                          };
+
+                          const chooseNext = () => {
+                            const next = peachifyButton();
+                            if (!next) return false;
+
+                            window.__afterdarkOfficialSourceAdvanced = true;
+                            try { next.click(); } catch (_) {
+                              cleanup();
+                              try {
+                                window.AfterDarkNative.noNextSource();
+                              } catch (_) {}
+                              return true;
+                            }
+
+                            cleanup();
+                            try {
+                              window.AfterDarkNative.sourceAdvanced("peachify");
+                            } catch (_) {}
+                            return true;
+                          };
+
+                          const toggle = sourcesButton();
+                          if (!toggle) {
+                            cleanup();
+                            try {
+                              window.AfterDarkNative.noNextSource();
+                            } catch (_) {}
+                            return;
+                          }
+
+                          // The button may be visually hidden by our UI cleanup;
+                          // HTMLElement.click() still drives AfterDark's React
+                          // handler and therefore changes source through the
+                          // official page rather than by navigating ourselves.
+                          try { toggle.click(); } catch (_) {
+                            cleanup();
+                            try {
+                              window.AfterDarkNative.noNextSource();
+                            } catch (_) {}
+                            return;
+                          }
+
+                          if (chooseNext()) return;
+
+                          observer = new MutationObserver(() => {
+                            chooseNext();
+                          });
+
+                          observer.observe(document.documentElement, {
+                            childList: true,
+                            subtree: true,
+                            characterData: true,
+                            attributes: true,
+                            attributeFilter: ["class", "style", "aria-hidden"]
+                          });
+
+                          // This deadline is only for the AfterDark source menu
+                          // rendering. It is NOT used to decide whether a media
+                          // source is available.
+                          menuDeadline = setTimeout(() => {
+                            if (window.__afterdarkOfficialSourceAdvanced) return;
+                            cleanup();
+                            try {
+                              window.AfterDarkNative.noNextSource();
+                            } catch (_) {}
+                          }, 3000);
+                        })();
+                        """.trimIndent(),
+                        null,
+                    )
                 }
             }
 
@@ -418,6 +568,33 @@ object AfterDarkProofWebView {
                     @JavascriptInterface
                     fun interactiveCheckboxSeen() {
                         handler.post { reloadForInteractiveCheckbox() }
+                    }
+
+                    @JavascriptInterface
+                    fun playerNotFound(host: String?) {
+                        handler.post {
+                            advanceOfficialSourceAfterFailure(host)
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun sourceAdvanced(service: String?) {
+                        handler.post {
+                            sourceFailoverInProgress.set(false)
+                            Log.i(
+                                TAG,
+                                "AfterDark a sélectionné la source suivante: ${service.orEmpty()}",
+                            )
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun noNextSource() {
+                        handler.post {
+                            sourceFailoverInProgress.set(false)
+                            Log.i(TAG, "Aucune source AfterDark suivante disponible")
+                            finish(null)
+                        }
                     }
                 },
                 "AfterDarkNative",
@@ -433,39 +610,227 @@ object AfterDarkProofWebView {
                         browser,
                         """
                         (() => {
+                          const EXPECTED_AFTERDARK_HOST = '$verificationHostForJs';
+
+                          const normalize = value =>
+                            String(value || "")
+                              .replace(/\s+/g, " ")
+                              .trim()
+                              .toLocaleLowerCase("en-US");
+
+                          const currentHost = () => {
+                            try {
+                              return String(location.hostname || "").toLowerCase();
+                            } catch (_) {
+                              return "";
+                            }
+                          };
+
+                          // -------------------------------------------------
+                          // Official player automation, installed in EVERY
+                          // frame by DOCUMENT_START_SCRIPT.
+                          // -------------------------------------------------
+                          if (!window.__afterdarkPlayerFrameAutomation) {
+                            window.__afterdarkPlayerFrameAutomation = true;
+
+                            const clickedPlayButtons =
+                              window.__afterdarkClickedPlayButtons || new WeakSet();
+                            window.__afterdarkClickedPlayButtons =
+                              clickedPlayButtons;
+
+                            const findAndClickPlay = () => {
+                              const buttons = Array.from(
+                                document.querySelectorAll("button")
+                              );
+
+                              const play = buttons.find(button => {
+                                try {
+                                  return Boolean(
+                                    button.querySelector(
+                                      'svg path[d="M8 5v14l11-7z"]'
+                                    )
+                                  );
+                                } catch (_) {
+                                  return false;
+                                }
+                              });
+
+                              if (!play || clickedPlayButtons.has(play)) {
+                                return false;
+                              }
+
+                              clickedPlayButtons.add(play);
+                              try {
+                                play.click();
+                                return true;
+                              } catch (_) {
+                                return false;
+                              }
+                            };
+
+                            const hideAfterDarkControls = () => {
+                              if (
+                                !EXPECTED_AFTERDARK_HOST ||
+                                currentHost() !==
+                                  EXPECTED_AFTERDARK_HOST.toLowerCase()
+                              ) {
+                                return;
+                              }
+
+                              const buttons = Array.from(
+                                document.querySelectorAll("button")
+                              );
+
+                              const back = buttons.find(button =>
+                                normalize(button.getAttribute("aria-label")) ===
+                                  "retour"
+                              );
+
+                              const sources = buttons.find(button =>
+                                normalize(button.textContent) === "sources"
+                              );
+
+                              // Prefer hiding the exact common wrapper supplied
+                              // by AfterDark; otherwise hide the two controls.
+                              if (
+                                back &&
+                                sources &&
+                                back.parentElement &&
+                                back.parentElement === sources.parentElement
+                              ) {
+                                back.parentElement.style.setProperty(
+                                  "display",
+                                  "none",
+                                  "important"
+                                );
+                              } else {
+                                if (back) {
+                                  back.style.setProperty(
+                                    "display",
+                                    "none",
+                                    "important"
+                                  );
+                                }
+                                if (sources) {
+                                  sources.style.setProperty(
+                                    "display",
+                                    "none",
+                                    "important"
+                                  );
+                                }
+                              }
+                            };
+
+                            const detectProviderFailure = () => {
+                              if (window.__afterdarkNotFoundReported) return true;
+
+                              // The ONLY provider-failure signal we accept is
+                              // the explicit "Go Back" control shown by the
+                              // player when no provider has the requested media.
+                              //
+                              // Do not inspect loading duration, headings,
+                              // paragraphs, HTTP wording, or any other text.
+                              const goBack = Array.from(
+                                document.querySelectorAll(
+                                  'a,button,[role="button"]'
+                                )
+                              ).find(element => {
+                                const label = normalize(element.textContent);
+                                if (label !== "go back") return false;
+
+                                // The supplied error UI uses <a href="/">Go Back</a>.
+                                // For anchors, require that exact destination so
+                                // an unrelated "Go Back" action cannot trigger
+                                // source failover.
+                                if (
+                                  element.tagName &&
+                                  element.tagName.toLowerCase() === "a"
+                                ) {
+                                  const href =
+                                    element.getAttribute("href") || "";
+                                  return href === "/";
+                                }
+
+                                return true;
+                              });
+
+                              if (!goBack) return false;
+
+                              window.__afterdarkNotFoundReported = true;
+                              try {
+                                window.AfterDarkNative.playerNotFound(
+                                  currentHost()
+                                );
+                              } catch (_) {}
+                              return true;
+                            };
+
+                            const scanPlayerFrame = () => {
+                              hideAfterDarkControls();
+                              detectProviderFailure();
+                              findAndClickPlay();
+                            };
+
+                            const startPlayerAutomation = () => {
+                              scanPlayerFrame();
+
+                              const observer = new MutationObserver(() => {
+                                scanPlayerFrame();
+                              });
+
+                              observer.observe(document.documentElement, {
+                                childList: true,
+                                subtree: true,
+                                characterData: true,
+                                attributes: true,
+                                attributeFilter: [
+                                  "class",
+                                  "style",
+                                  "src",
+                                  "aria-label"
+                                ]
+                              });
+
+                              window.__afterdarkPlayerAutomationObserver = observer;
+                            };
+
+                            if (document.readyState === "loading") {
+                              document.addEventListener(
+                                "DOMContentLoaded",
+                                startPlayerAutomation,
+                                { once: true }
+                              );
+                            } else {
+                              startPlayerAutomation();
+                            }
+                          }
+
+                          // -------------------------------------------------
+                          // Existing Cloudflare Turnstile detector.
+                          // -------------------------------------------------
                           if (window.__afterdarkCheckboxFrameDetector) return;
                           window.__afterdarkCheckboxFrameDetector = true;
 
                           const isCloudflareFrame = () => {
-                            try {
-                              const host = String(location.hostname || "").toLowerCase();
-                              return host === "challenges.cloudflare.com" ||
-                                host.endsWith(".challenges.cloudflare.com");
-                            } catch (_) {
-                              return false;
-                            }
+                            const host = currentHost();
+                            return host === "challenges.cloudflare.com" ||
+                              host.endsWith(".challenges.cloudflare.com");
                           };
 
                           if (!isCloudflareFrame()) return;
 
                           const roots = new Set([document]);
 
-                          // Le widget Turnstile place son input dans un ShadowRoot
-                          // fermé. Un script document-start peut conserver la racine
-                          // au moment exact où Cloudflare la crée, même si shadowRoot
-                          // retourne ensuite null pour le code JavaScript ordinaire.
                           try {
                             const nativeAttachShadow = Element.prototype.attachShadow;
                             Element.prototype.attachShadow = function() {
-                              const shadowRoot = nativeAttachShadow.apply(this, arguments);
+                              const shadowRoot =
+                                nativeAttachShadow.apply(this, arguments);
                               roots.add(shadowRoot);
                               return shadowRoot;
                             };
                           } catch (_) {}
 
-                          // Turnstile masque l'input natif et dessine la case autour.
-                          // Sa présence dans l'iframe Cloudflare suffit donc : contrôler
-                          // ses dimensions ou sa visibilité rejetterait la vraie case.
                           const isInteractiveCheckbox = element =>
                             Boolean(element) && !element.disabled;
 
@@ -481,6 +846,7 @@ object AfterDarkProofWebView {
                                 'input[type="checkbox"], [role="checkbox"]'
                               )))
                               .find(isInteractiveCheckbox);
+
                             if (!checkbox) return false;
 
                             try {
@@ -491,12 +857,13 @@ object AfterDarkProofWebView {
                             }
                           };
 
-                          const start = () => {
+                          const startCheckboxDetector = () => {
                             if (report()) return;
 
                             const observer = new MutationObserver(() => {
                               if (report()) observer.disconnect();
                             });
+
                             observer.observe(document.documentElement, {
                               childList: true,
                               subtree: true,
@@ -518,11 +885,11 @@ object AfterDarkProofWebView {
                           if (document.readyState === "loading") {
                             document.addEventListener(
                               "DOMContentLoaded",
-                              start,
+                              startCheckboxDetector,
                               { once: true }
                             );
                           } else {
-                            start();
+                            startCheckboxDetector();
                           }
                         })();
                         """.trimIndent(),
@@ -546,7 +913,7 @@ object AfterDarkProofWebView {
             // checkbox is still exposed through WebView's accessibility tree.
             checkboxWatcher = object : Runnable {
                 override fun run() {
-                    if (finished.get()) return
+                    if (finished.get() || officialPlayerMode.get()) return
 
                     if (
                         !verificationButtonHasAppeared.get() &&
@@ -563,8 +930,61 @@ object AfterDarkProofWebView {
             }
             handler.post(checkboxWatcher!!)
 
+            fun officialBodyHasItems(body: String): Boolean =
+                body.lineSequence().any { rawLine ->
+                    val line = rawLine.trim()
+                    if (line.isEmpty()) {
+                        false
+                    } else {
+                        runCatching {
+                            val root = JSONObject(line)
+                            val items = root.optJSONArray("items")
+                            items != null && items.length() > 0
+                        }.getOrDefault(false)
+                    }
+                }
+
+            fun enterOfficialPlayerMode() {
+                if (!officialPlayerMode.compareAndSet(false, true)) return
+
+                // The official /watch page now owns playback. Keep this exact
+                // WebView/session alive instead of opening the source URL.
+                handler.removeCallbacks(timeoutRunnable)
+                checkboxWatcher?.let(handler::removeCallbacks)
+                verificationButtonHasAppeared.set(true)
+                checkboxReloadInProgress.set(false)
+
+                handler.post {
+                    if (finished.get()) return@post
+
+                    info.visibility = android.view.View.GONE
+                    controls.visibility = android.view.View.GONE
+
+                    browser.settings.mediaPlaybackRequiresUserGesture = false
+                    browser.requestFocus()
+                    browser.requestFocusFromTouch()
+
+                    Log.i(
+                        TAG,
+                        "API sources vide : conservation de la WebView officielle AfterDark",
+                    )
+                }
+            }
+
             fun finishWithCapturedResponse(captured: CapturedSourceResponse) {
-                // shouldInterceptRequest() is not a UI-thread callback.
+                val officialSourcesEmpty =
+                    captured.statusCode in 200..299 &&
+                        !officialBodyHasItems(captured.body)
+
+                if (officialSourcesEmpty) {
+                    // Return the empty response to AfterDark, but do not close
+                    // this WebView. Its own React page will render the fallback
+                    // player inside the already-established /watch session.
+                    enterOfficialPlayerMode()
+                    return
+                }
+
+                // Normal non-empty response: hand it back to the provider.
                 handler.post {
                     if (finished.get()) return@post
 
@@ -720,7 +1140,9 @@ object AfterDarkProofWebView {
                     url: String?,
                     favicon: android.graphics.Bitmap?,
                 ) {
-                    checkboxReloadInProgress.set(true)
+                    if (!officialPlayerMode.get()) {
+                        checkboxReloadInProgress.set(true)
+                    }
                     super.onPageStarted(view, url, favicon)
                 }
 
@@ -730,10 +1152,13 @@ object AfterDarkProofWebView {
                 ) {
                     super.onPageFinished(view, url)
                     checkboxReloadInProgress.set(false)
-                    installAutoOpenAndPlay(
-                        view,
-                        reloadOnInteractiveCheckbox = true,
-                    )
+
+                    if (!officialPlayerMode.get()) {
+                        installAutoOpenAndPlay(
+                            view,
+                            reloadOnInteractiveCheckbox = true,
+                        )
+                    }
                 }
 
                 override fun shouldOverrideUrlLoading(
