@@ -1269,12 +1269,10 @@ object AfterDarkProofWebView {
                             const detectProviderFailure = () => {
                               if (window.__afterdarkNotFoundReported) return true;
 
-                              // The ONLY provider-failure signal we accept is
-                              // the explicit "Go Back" control shown by the
-                              // player when no provider has the requested media.
-                              //
-                              // Do not inspect loading duration, headings,
-                              // paragraphs, HTTP wording, or any other text.
+                              const host = currentHost();
+
+                              // Videasy failure signal:
+                              // ONLY the explicit "Go Back" control.
                               const goBack = Array.from(
                                 document.querySelectorAll(
                                   'a,button,[role="button"]'
@@ -1283,10 +1281,8 @@ object AfterDarkProofWebView {
                                 const label = normalize(element.textContent);
                                 if (label !== "go back") return false;
 
-                                // The supplied error UI uses <a href="/">Go Back</a>.
-                                // For anchors, require that exact destination so
-                                // an unrelated "Go Back" action cannot trigger
-                                // source failover.
+                                // The supplied error UI uses
+                                // <a href="/">Go Back</a>.
                                 if (
                                   element.tagName &&
                                   element.tagName.toLowerCase() === "a"
@@ -1299,13 +1295,41 @@ object AfterDarkProofWebView {
                                 return true;
                               });
 
-                              if (!goBack) return false;
+                              if (goBack) {
+                                window.__afterdarkNotFoundReported = true;
+                                try {
+                                  window.AfterDarkNative.playerNotFound(host);
+                                } catch (_) {}
+                                return true;
+                              }
+
+                              // Peachify failure signal:
+                              // ONLY the exact Reload button supplied by the
+                              // player:
+                              //
+                              // <button type="button"
+                              //   class="glass-btn-accent">Reload</button>
+                              //
+                              // Never interpret Reload outside a Peachify frame.
+                              const isPeachify =
+                                host === "peachify.top" ||
+                                host.endsWith(".peachify.top");
+
+                              if (!isPeachify) return false;
+
+                              const peachifyReload = Array.from(
+                                document.querySelectorAll(
+                                  'button[type="button"].glass-btn-accent'
+                                )
+                              ).find(button =>
+                                normalize(button.textContent) === "reload"
+                              );
+
+                              if (!peachifyReload) return false;
 
                               window.__afterdarkNotFoundReported = true;
                               try {
-                                window.AfterDarkNative.playerNotFound(
-                                  currentHost()
-                                );
+                                window.AfterDarkNative.playerNotFound(host);
                               } catch (_) {}
                               return true;
                             };
