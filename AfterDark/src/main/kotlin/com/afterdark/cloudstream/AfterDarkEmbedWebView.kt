@@ -20,12 +20,19 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
 object AfterDarkEmbedWebView {
     private const val TAG = "AfterDarkEmbedWebView"
+    private const val VIDEASY_DESKTOP_USER_AGENT =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/142.0.0.0 Safari/537.36"
 
     private val mediaExtensions = listOf(
         ".m3u8",
@@ -47,6 +54,7 @@ object AfterDarkEmbedWebView {
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
+        val loggedVideasyRequests = AtomicInteger(0)
 
         fun finish(result: ResolvedWebMedia?) {
             if (!finished.compareAndSet(false, true)) return
@@ -113,10 +121,22 @@ object AfterDarkEmbedWebView {
                     setAcceptThirdPartyCookies(browser, true)
                 }
 
-                val browserUserAgent = browser.settings.userAgentString
+                val platformUserAgent = browser.settings.userAgentString
                     ?.takeIf { it.isNotBlank() }
                     ?: "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 " +
                         "(KHTML, like Gecko) Chrome/149.0 Mobile Safari/537.36"
+                val browserUserAgent = if (videasyMode) {
+                    VIDEASY_DESKTOP_USER_AGENT
+                } else {
+                    platformUserAgent
+                }
+
+                if (videasyMode) {
+                    browser.settings.userAgentString = browserUserAgent
+                    browser.settings.useWideViewPort = true
+                    browser.settings.loadWithOverviewMode = true
+                    Log.i(TAG, "Videasy utilise le profil Chrome bureau")
+                }
 
                 val initialHeaders = mapOf(
                     "Referer" to referer,
@@ -136,6 +156,7 @@ object AfterDarkEmbedWebView {
                     url: String?,
                     contentType: String?,
                     pageUrl: String?,
+                    mediaReferer: String?,
                 ): ResolvedWebMedia? {
                     val value = url?.trim().orEmpty()
                     if (value.isBlank()) return null
@@ -170,18 +191,22 @@ object AfterDarkEmbedWebView {
                         ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
                         ?: embedUrl
 
+                    val effectiveReferer = mediaReferer
+                        ?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                        ?: effectivePage
+
                     val headers = linkedMapOf(
                         "User-Agent" to browserUserAgent,
-                        "Referer" to effectivePage,
+                        "Referer" to effectiveReferer,
                     )
 
-                    originOf(effectivePage)?.let { origin ->
+                    originOf(effectiveReferer)?.let { origin ->
                         headers["Origin"] = origin
                     }
 
                     return ResolvedWebMedia(
                         url = value,
-                        referer = effectivePage,
+                        referer = effectiveReferer,
                         headers = headers,
                         type = type,
                     )
@@ -193,8 +218,14 @@ object AfterDarkEmbedWebView {
                         url: String?,
                         contentType: String?,
                         pageUrl: String?,
+                        mediaReferer: String?,
                     ) {
-                        val resolved = mediaFromJavascript(url, contentType, pageUrl)
+                        val resolved = mediaFromJavascript(
+                            url,
+                            contentType,
+                            pageUrl,
+                            mediaReferer,
+                        )
                             ?: return
                         finish(resolved)
                     }
@@ -217,6 +248,99 @@ object AfterDarkEmbedWebView {
                     bridge,
                     "__AfterDarkMediaBridge",
                 )
+
+                if (
+                    videasyMode &&
+                    WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+                ) {
+                    runCatching {
+                        WebViewCompat.addDocumentStartJavaScript(
+                            browser,
+                            """
+                            (() => {
+                              if (window.__afterdarkEarlyVideasyJsonHook) return;
+                              window.__afterdarkEarlyVideasyJsonHook = true;
+
+                              const bridge = window.__AfterDarkMediaBridge;
+                              if (!bridge || !window.JSON || !JSON.parse) return;
+
+                              const typeHint = value => {
+                                const type = String(value || '').toLowerCase();
+                                if (type.includes('hls') || type.includes('m3u8')) {
+                                  return 'application/vnd.apple.mpegurl';
+                                }
+                                if (type.includes('dash') || type.includes('mpd')) {
+                                  return 'application/dash+xml';
+                                }
+                                if (type.includes('mp4') || type.includes('video')) {
+                                  return 'video/mp4';
+                                }
+                                return '';
+                              };
+
+                              const looksLikeMedia = value =>
+                                /\.m3u8|\.mpd|\.mp4|\.mkv|\.webm/i.test(
+                                  String(value || '')
+                                );
+
+                              const scan = (value, seen = new WeakSet(), depth = 0) => {
+                                if (depth > 10 || value == null) return;
+                                if (typeof value === 'string') {
+                                  if (looksLikeMedia(value)) {
+                                    bridge.media(value, '', location.href, '');
+                                  }
+                                  return;
+                                }
+                                if (typeof value !== 'object' || seen.has(value)) return;
+                                seen.add(value);
+
+                                try {
+                                  const hint = typeHint(
+                                    value.type || value.format || value.mimeType
+                                  );
+                                  const candidate =
+                                    value.file ||
+                                    value.stream ||
+                                    value.playlist ||
+                                    value.manifest ||
+                                    value.src ||
+                                    value.url;
+                                  const referer =
+                                    value.referer || value.referrer || '';
+
+                                  if (
+                                    typeof candidate === 'string' &&
+                                    (looksLikeMedia(candidate) || hint)
+                                  ) {
+                                    bridge.media(
+                                      candidate,
+                                      hint,
+                                      location.href,
+                                      String(referer)
+                                    );
+                                  }
+
+                                  Object.values(value).forEach(child =>
+                                    scan(child, seen, depth + 1)
+                                  );
+                                } catch (_) {}
+                              };
+
+                              const originalParse = JSON.parse.bind(JSON);
+                              JSON.parse = (...args) => {
+                                const result = originalParse(...args);
+                                try { scan(result); } catch (_) {}
+                                return result;
+                              };
+                            })();
+                            """.trimIndent(),
+                            setOf("*"),
+                        )
+                        Log.i(TAG, "Capture JSON Videasy installée au démarrage du document")
+                    }.onFailure { error ->
+                        Log.w(TAG, "Capture JSON Videasy document-start indisponible", error)
+                    }
+                }
 
                 fun captureMedia(webRequest: WebResourceRequest?): ResolvedWebMedia? {
                     if (webRequest == null) return null
@@ -297,10 +421,15 @@ object AfterDarkEmbedWebView {
                             const VIDEASY_MODE = ${if (videasyMode) "true" else "false"};
                             const PEACHIFY_MODE = ${if (peachifyMode) "true" else "false"};
 
-                            const report = (url, contentType = '') => {
+                            const report = (url, contentType = '', mediaReferer = '') => {
                               try {
                                 if (!url) return;
-                                bridge.media(String(url), String(contentType || ''), location.href);
+                                bridge.media(
+                                  String(url),
+                                  String(contentType || ''),
+                                  location.href,
+                                  String(mediaReferer || '')
+                                );
                               } catch (_) {}
                             };
 
@@ -312,6 +441,73 @@ object AfterDarkEmbedWebView {
                                      value.includes('.mkv') ||
                                      value.includes('.webm');
                             };
+
+                            const mediaTypeHint = value => {
+                              const type = String(value || '').toLowerCase();
+                              if (type.includes('hls') || type.includes('m3u8')) {
+                                return 'application/vnd.apple.mpegurl';
+                              }
+                              if (type.includes('dash') || type.includes('mpd')) {
+                                return 'application/dash+xml';
+                              }
+                              if (type.includes('mp4') || type.includes('video')) {
+                                return 'video/mp4';
+                              }
+                              return '';
+                            };
+
+                            const scanStructuredMedia = (
+                              value,
+                              seen = new WeakSet(),
+                              depth = 0
+                            ) => {
+                              if (depth > 10 || value == null) return;
+
+                              if (typeof value === 'string') {
+                                if (isInterestingUrl(value)) report(value, '');
+                                return;
+                              }
+
+                              if (typeof value !== 'object') return;
+                              if (seen.has(value)) return;
+                              seen.add(value);
+
+                              try {
+                                const hint = mediaTypeHint(
+                                  value.type || value.format || value.mimeType
+                                );
+                                const candidate =
+                                  value.file ||
+                                  value.stream ||
+                                  value.playlist ||
+                                  value.manifest ||
+                                  value.src ||
+                                  value.url;
+                                const candidateReferer =
+                                  value.referer || value.referrer || '';
+
+                                if (
+                                  typeof candidate === 'string' &&
+                                  (isInterestingUrl(candidate) || hint)
+                                ) {
+                                  report(candidate, hint, candidateReferer);
+                                }
+
+                                Object.values(value).forEach(child =>
+                                  scanStructuredMedia(child, seen, depth + 1)
+                                );
+                              } catch (_) {}
+                            };
+
+                            if (!window.__afterdarkJsonParseHooked && window.JSON) {
+                              window.__afterdarkJsonParseHooked = true;
+                              const originalJsonParse = JSON.parse.bind(JSON);
+                              JSON.parse = (...args) => {
+                                const result = originalJsonParse(...args);
+                                try { scanStructuredMedia(result); } catch (_) {}
+                                return result;
+                              };
+                            }
 
                             if (!window.__afterdarkFetchHooked && window.fetch) {
                               window.__afterdarkFetchHooked = true;
@@ -340,6 +536,13 @@ object AfterDarkEmbedWebView {
                                   ) {
                                     report(url, contentType);
                                   }
+
+                                  const clone = response.clone();
+                                  clone.text().then(text => {
+                                    try {
+                                      scanStructuredMedia(JSON.parse(text));
+                                    } catch (_) {}
+                                  }).catch(() => {});
                                 } catch (_) {}
 
                                 return response;
@@ -820,6 +1023,25 @@ object AfterDarkEmbedWebView {
                         view: WebView?,
                         request: WebResourceRequest?,
                     ): android.webkit.WebResourceResponse? {
+                        if (videasyMode && request != null) {
+                            val requestUrl = request.url.toString()
+                            val lower = requestUrl.lowercase()
+                            val diagnostic =
+                                "api.videasy" in lower ||
+                                    "speedracelight" in lower ||
+                                    "source" in lower ||
+                                    "stream" in lower ||
+                                    "playlist" in lower ||
+                                    "manifest" in lower
+
+                            if (diagnostic && loggedVideasyRequests.getAndIncrement() < 40) {
+                                Log.i(
+                                    TAG,
+                                    "Requête Videasy ${request.method}: ${requestUrl.take(700)}",
+                                )
+                            }
+                        }
+
                         val media = captureMedia(request)
                         if (media != null) {
                             finish(media)
@@ -840,6 +1062,37 @@ object AfterDarkEmbedWebView {
                         handler.postDelayed({ installHooksAndNudge() }, 3_000L)
                         handler.postDelayed({ installHooksAndNudge() }, 6_000L)
                         handler.postDelayed({ installHooksAndNudge() }, 12_000L)
+
+                        if (videasyMode) {
+                            handler.postDelayed(
+                                {
+                                    if (!finished.get()) {
+                                        Log.w(
+                                            TAG,
+                                            "Videasy sans média après 20 s, passage à la source suivante",
+                                        )
+                                        finish(null)
+                                    }
+                                },
+                                20_000L,
+                            )
+                        }
+                    }
+
+                    override fun onPageStarted(
+                        view: WebView?,
+                        url: String?,
+                        favicon: android.graphics.Bitmap?,
+                    ) {
+                        super.onPageStarted(view, url, favicon)
+
+                        // Install the network/JSON hooks before the client-side
+                        // application finishes booting. onPageFinished alone is
+                        // too late for Videasy's initial source request.
+                        handler.post { installHooksAndNudge() }
+                        handler.postDelayed({ installHooksAndNudge() }, 100L)
+                        handler.postDelayed({ installHooksAndNudge() }, 300L)
+                        handler.postDelayed({ installHooksAndNudge() }, 700L)
                     }
                 }
 

@@ -603,6 +603,172 @@ class AfterDarkProvider : MainAPI() {
         }
     }
 
+    private suspend fun resolveVideasyApi(request: PlaybackRequest): List<ParsedSource> {
+        val season = request.season ?: 1
+        val episode = request.episode ?: 1
+        val query = listOf(
+            "mediaType" to request.type,
+            "episodeId" to episode.toString(),
+            "seasonId" to season.toString(),
+            "tmdbId" to request.tmdbId.toString(),
+        ).joinToString("&") { (key, value) ->
+            "${encode(key)}=${encode(value)}"
+        }
+        // The active browser player currently ends on player.videasy.to. Use
+        // that origin for the API request and for media hosts which enforce
+        // the player's Referer.
+        val playerReferer = "https://player.videasy.to/"
+        val apiRequestHeaders = mapOf(
+            "Accept" to "*/*",
+            "Origin" to "https://player.videasy.to",
+            "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+        )
+        val mediaHeaders = mapOf(
+            "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+        )
+
+        for ((sourceName, sourceKey) in VIDEASY_API_SOURCES) {
+            Log.i(PROVIDER_TAG, "API Videasy : essai $sourceName")
+            val endpoint = "https://api.videasy.net/$sourceKey/sources-with-title?$query"
+            val encrypted = runCatching {
+                app.get(
+                    url = endpoint,
+                    headers = apiRequestHeaders,
+                    referer = playerReferer,
+                    cacheTime = 0,
+                    timeout = 10L,
+                )
+            }.onFailure { error ->
+                Log.w(PROVIDER_TAG, "API Videasy $sourceName inaccessible", error)
+            }.getOrNull() ?: continue
+
+            if (encrypted.okhttpResponse.code !in 200..299 || encrypted.text.isBlank()) {
+                Log.w(
+                    PROVIDER_TAG,
+                    "API Videasy $sourceName HTTP ${encrypted.okhttpResponse.code}",
+                )
+                continue
+            }
+
+            val decryptedResponse = runCatching {
+                app.post(
+                    url = "https://enc-dec.app/api/dec-videasy",
+                    json = mapOf(
+                        "text" to encrypted.text,
+                        "id" to request.tmdbId.toString(),
+                    ),
+                    headers = mapOf(
+                        "Accept" to "application/json",
+                        "Content-Type" to "application/json",
+                        "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+                    ),
+                    cacheTime = 0,
+                    timeout = 10L,
+                )
+            }.onFailure { error ->
+                Log.w(PROVIDER_TAG, "Déchiffrement Videasy $sourceName impossible", error)
+            }.getOrNull() ?: continue
+
+            if (decryptedResponse.okhttpResponse.code !in 200..299) {
+                Log.w(
+                    PROVIDER_TAG,
+                    "Déchiffrement Videasy $sourceName HTTP " +
+                        decryptedResponse.okhttpResponse.code,
+                )
+                continue
+            }
+
+            val data = runCatching {
+                val root = JSONObject(decryptedResponse.text)
+                when (val result = root.opt("result")) {
+                    is JSONObject -> result
+                    is String -> JSONObject(result)
+                    else -> null
+                }
+            }.onFailure { error ->
+                Log.w(PROVIDER_TAG, "Réponse Videasy $sourceName illisible", error)
+            }.getOrNull()
+
+            if (data == null) {
+                Log.w(PROVIDER_TAG, "Réponse Videasy $sourceName sans résultat exploitable")
+                continue
+            }
+
+            val subtitleHeaders = mapOf(
+                "Referer" to playerReferer,
+                "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+            )
+            val subtitles = data.optJSONArray("subtitles")?.let { items ->
+                buildList {
+                    for (index in 0 until items.length()) {
+                        val item = items.optJSONObject(index) ?: continue
+                        val url = item.stringOrNull("url") ?: continue
+                        add(
+                            ParsedSubtitle(
+                                language = item.stringOrNull("language") ?: "Sous-titre",
+                                url = url,
+                                headers = subtitleHeaders,
+                            ),
+                        )
+                    }
+                }
+            }.orEmpty()
+
+            val sources = data.optJSONArray("sources")?.let { items ->
+                buildList {
+                    for (index in 0 until items.length()) {
+                        val item = items.optJSONObject(index) ?: continue
+                        val url = item.stringOrNull("url") ?: continue
+                        add(
+                            ParsedSource(
+                                group = "Secours",
+                                service = "videasy",
+                                provider = "Videasy $sourceName",
+                                url = url,
+                                quality = item.stringOrNull("quality"),
+                                language = null,
+                                type = "m3u8",
+                                proxied = false,
+                                referer = playerReferer,
+                                headers = mediaHeaders,
+                                subtitles = subtitles,
+                            ),
+                        )
+                    }
+                }
+            }.orEmpty()
+
+            val validSources = sources.filter { source ->
+                validateResolvedMedia(
+                    ResolvedWebMedia(
+                        url = source.url,
+                        referer = source.referer,
+                        headers = source.headers,
+                        type = "m3u8",
+                    ),
+                )
+            }
+
+            if (validSources.isNotEmpty()) {
+                Log.i(
+                    PROVIDER_TAG,
+                    "API Videasy $sourceName résolue : ${validSources.size} source(s) valide(s)",
+                )
+                return validSources
+            }
+
+            if (sources.isNotEmpty()) {
+                Log.w(
+                    PROVIDER_TAG,
+                    "API Videasy $sourceName : ${sources.size} flux reçu(s), aucun valide",
+                )
+            }
+        }
+
+        Log.w(PROVIDER_TAG, "API Videasy : aucune source directe")
+        return emptyList()
+    }
+
     private fun directType(source: ParsedSource): ExtractorLinkType? {
         val declared = source.type?.lowercase()
 
@@ -818,6 +984,7 @@ class AfterDarkProvider : MainAPI() {
 
         var emitted = false
         val seen = HashSet<String>()
+        var videasyApiAttempted = false
 
         for (source in sources) {
             for (subtitle in source.subtitles) {
@@ -831,6 +998,45 @@ class AfterDarkProvider : MainAPI() {
             }
 
             if (!seen.add(source.url)) continue
+
+            if (
+                source.group == "Secours" &&
+                source.service.equals("videasy", ignoreCase = true) &&
+                !videasyApiAttempted
+            ) {
+                videasyApiAttempted = true
+                val directSources = resolveVideasyApi(request)
+                var videasyEmitted = false
+
+                for (direct in directSources) {
+                    if (!seen.add(direct.url)) continue
+
+                    direct.subtitles.forEach { subtitle ->
+                        subtitleCallback(
+                            newSubtitleFile(subtitle.language, subtitle.url) {
+                                headers = subtitle.headers
+                            },
+                        )
+                    }
+
+                    callback(
+                        newExtractorLink(
+                            source = direct.service,
+                            name = displayName(direct),
+                            url = direct.url,
+                            type = ExtractorLinkType.M3U8,
+                        ) {
+                            referer = direct.referer.orEmpty()
+                            quality = getQualityFromName(direct.quality)
+                            headers = direct.headers
+                        },
+                    )
+                    emitted = true
+                    videasyEmitted = true
+                }
+
+                if (videasyEmitted) return true
+            }
 
             val type = directType(source)
             val isEmbed = source.type.equals("embed", ignoreCase = true)
@@ -956,5 +1162,21 @@ class AfterDarkProvider : MainAPI() {
 
     private companion object {
         const val PROVIDER_TAG = "AfterDarkProvider"
+        const val VIDEASY_DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/142.0.0.0 Safari/537.36"
+
+        val VIDEASY_API_SOURCES = listOf(
+            "Neon" to "mb-flix",
+            "Yoru" to "cdn",
+            "Cypher" to "downloader2",
+            "Sage" to "1movies",
+            "Breach" to "m4uhd",
+            "Vyse" to "hdmovie",
+            "Killjoy" to "meine",
+            "Omen" to "lamovie",
+            "Raze" to "superflix",
+        )
     }
 }
