@@ -29,6 +29,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import org.json.JSONObject
@@ -50,6 +51,9 @@ object AfterDarkProofWebView {
         val sourceFailoverInProgress = AtomicBoolean(false)
         val preferredSourceSelectionDone = AtomicBoolean(false)
         val playbackControlsHidden = AtomicBoolean(false)
+        val mediaCaptureArmed = AtomicBoolean(false)
+        val currentFallbackService = AtomicReference<String?>(null)
+        val emptyOfficialResponse = AtomicReference<CapturedSourceResponse?>(null)
         val verificationButtonHasAppeared = AtomicBoolean(false)
         val checkboxReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
@@ -418,6 +422,194 @@ object AfterDarkProofWebView {
                 }
             }
 
+            fun mediaType(
+                url: String,
+                contentType: String = "",
+            ): String? {
+                val lowerUrl = url.lowercase()
+                val cleanPath = lowerUrl.substringBefore("?").substringBefore("#")
+                val lowerType = contentType.lowercase()
+
+                if (
+                    cleanPath.endsWith(".ts") ||
+                    cleanPath.endsWith(".m4s") ||
+                    cleanPath.endsWith(".aac") ||
+                    cleanPath.endsWith(".vtt") ||
+                    cleanPath.endsWith(".srt")
+                ) return null
+
+                return when {
+                    cleanPath.endsWith(".m3u8") ||
+                        "mpegurl" in lowerType -> "m3u8"
+
+                    cleanPath.endsWith(".mpd") ||
+                        "dash+xml" in lowerType -> "mpd"
+
+                    cleanPath.endsWith(".mp4") ||
+                        cleanPath.endsWith(".mkv") ||
+                        cleanPath.endsWith(".webm") ||
+                        lowerType.startsWith("video/") ||
+                        lowerType == "application/octet-stream" -> "video"
+
+                    else -> null
+                }
+            }
+
+            fun finishWithResolvedMedia(
+                media: ResolvedWebMedia,
+            ) {
+                if (
+                    !officialPlayerMode.get() ||
+                    !mediaCaptureArmed.compareAndSet(true, false) ||
+                    finished.get()
+                ) return
+
+                val captured = emptyOfficialResponse.get() ?: run {
+                    mediaCaptureArmed.set(true)
+                    return
+                }
+
+                handler.post {
+                    if (finished.get()) return@post
+
+                    val headers = LinkedHashMap<String, String>(media.headers)
+
+                    if (
+                        headers.keys.none {
+                            it.equals("User-Agent", ignoreCase = true)
+                        }
+                    ) {
+                        headers["User-Agent"] = browserUserAgent
+                    }
+
+                    val mediaCookie = runCatching {
+                        CookieManager.getInstance().getCookie(media.url)
+                    }.getOrNull()
+
+                    if (
+                        !mediaCookie.isNullOrBlank() &&
+                        headers.keys.none {
+                            it.equals("Cookie", ignoreCase = true)
+                        }
+                    ) {
+                        headers["Cookie"] = mediaCookie
+                    }
+
+                    val resolved = media.copy(headers = headers)
+
+                    Log.i(
+                        TAG,
+                        "Flux média officiel capturé: ${resolved.type} ${resolved.url}",
+                    )
+
+                    finish(
+                        ProofSession(
+                            proof = captured.proof,
+                            cookie = runCatching {
+                                CookieManager.getInstance().getCookie(mainUrl)
+                            }.getOrNull(),
+                            userAgent = browserUserAgent,
+                            sourceRequestUrl = captured.url,
+                            sourceRequestHeaders = captured.headers,
+                            sourceReferer = captured.referer,
+                            sourceResponseStatus = captured.statusCode,
+                            sourceResponseBody = captured.body,
+                            resolvedMedia = resolved,
+                            resolvedService =
+                                currentFallbackService.get() ?: "AfterDark",
+                        ),
+                    )
+                }
+            }
+
+            fun captureOfficialPlayerMedia(
+                webRequest: WebResourceRequest?,
+            ): ResolvedWebMedia? {
+                if (
+                    !officialPlayerMode.get() ||
+                    !mediaCaptureArmed.get() ||
+                    webRequest == null ||
+                    !webRequest.method.equals("GET", ignoreCase = true)
+                ) return null
+
+                val url = webRequest.url.toString()
+                if (
+                    !url.startsWith("http://", ignoreCase = true) &&
+                    !url.startsWith("https://", ignoreCase = true)
+                ) return null
+
+                val headers = LinkedHashMap<String, String>()
+                webRequest.requestHeaders.forEach { (key, value) ->
+                    if (key.isNotBlank() && value.isNotBlank()) {
+                        headers[key] = value
+                    }
+                }
+
+                val accept = headers.entries
+                    .firstOrNull { (key, _) ->
+                        key.equals("Accept", ignoreCase = true)
+                    }
+                    ?.value
+                    .orEmpty()
+
+                val type = mediaType(url, accept) ?: return null
+
+                val referer = headers.entries
+                    .firstOrNull { (key, _) ->
+                        key.equals("Referer", ignoreCase = true)
+                    }
+                    ?.value
+                    ?.takeIf { it.isNotBlank() }
+
+                return ResolvedWebMedia(
+                    url = url,
+                    referer = referer,
+                    headers = headers,
+                    type = type,
+                )
+            }
+
+            fun reportMediaFromJavaScript(
+                url: String?,
+                contentType: String?,
+                pageUrl: String?,
+            ) {
+                if (
+                    !officialPlayerMode.get() ||
+                    !mediaCaptureArmed.get() ||
+                    finished.get()
+                ) return
+
+                val mediaUrl = url
+                    ?.trim()
+                    ?.takeIf {
+                        it.startsWith("http://", ignoreCase = true) ||
+                            it.startsWith("https://", ignoreCase = true)
+                    }
+                    ?: return
+
+                val type = mediaType(
+                    url = mediaUrl,
+                    contentType = contentType.orEmpty(),
+                ) ?: return
+
+                val referer = pageUrl
+                    ?.trim()
+                    ?.takeIf {
+                        it.startsWith("http://", ignoreCase = true) ||
+                            it.startsWith("https://", ignoreCase = true)
+                    }
+
+                finishWithResolvedMedia(
+                    ResolvedWebMedia(
+                        url = mediaUrl,
+                        referer = referer,
+                        headers = emptyMap(),
+                        type = type,
+                    ),
+                )
+            }
+
             fun hideOfficialControlsAfterPlay() {
                 if (
                     !officialPlayerMode.get() ||
@@ -636,6 +828,7 @@ object AfterDarkProofWebView {
                 if (!sourceFailoverInProgress.compareAndSet(false, true)) return
 
                 preferredSourceSelectionDone.set(true)
+                mediaCaptureArmed.set(false)
 
                 browser.post {
                     if (finished.get() || !officialPlayerMode.get()) {
@@ -782,9 +975,26 @@ object AfterDarkProofWebView {
                     }
 
                     @JavascriptInterface
+                    fun mediaDetected(
+                        url: String?,
+                        contentType: String?,
+                        pageUrl: String?,
+                    ) {
+                        reportMediaFromJavaScript(
+                            url = url,
+                            contentType = contentType,
+                            pageUrl = pageUrl,
+                        )
+                    }
+
+                    @JavascriptInterface
                     fun preferredSourceSelected(service: String?) {
                         handler.post {
                             preferredSourceSelectionDone.set(true)
+                            currentFallbackService.set(
+                                service?.takeIf { it.isNotBlank() } ?: "videasy",
+                            )
+                            mediaCaptureArmed.set(true)
                             Log.i(
                                 TAG,
                                 "Source AfterDark préférée sélectionnée: ${service.orEmpty()}",
@@ -803,6 +1013,10 @@ object AfterDarkProofWebView {
                     fun sourceAdvanced(service: String?) {
                         handler.post {
                             sourceFailoverInProgress.set(false)
+                            currentFallbackService.set(
+                                service?.takeIf { it.isNotBlank() } ?: "AfterDark",
+                            )
+                            mediaCaptureArmed.set(true)
                             Log.i(
                                 TAG,
                                 "AfterDark a sélectionné la source suivante: ${service.orEmpty()}",
@@ -847,6 +1061,159 @@ object AfterDarkProofWebView {
                               return "";
                             }
                           };
+
+                          const reportMedia = (url, contentType = "") => {
+                            try {
+                              const value = String(url || "");
+                              if (!/^https?:\/\//i.test(value)) return;
+
+                              window.AfterDarkNative.mediaDetected(
+                                value,
+                                String(contentType || ""),
+                                String(location.href || "")
+                              );
+                            } catch (_) {}
+                          };
+
+                          const looksLikeMediaUrl = url => {
+                            const value = String(url || "")
+                              .toLowerCase()
+                              .split("?")[0]
+                              .split("#")[0];
+
+                            return value.endsWith(".m3u8") ||
+                              value.endsWith(".mpd") ||
+                              value.endsWith(".mp4") ||
+                              value.endsWith(".mkv") ||
+                              value.endsWith(".webm");
+                          };
+
+                          if (!window.__afterdarkMediaCaptureInstalled) {
+                            window.__afterdarkMediaCaptureInstalled = true;
+
+                            if (window.fetch) {
+                              const originalFetch = window.fetch.bind(window);
+                              window.fetch = async (...args) => {
+                                const response = await originalFetch(...args);
+
+                                try {
+                                  const requestUrl =
+                                    response.url ||
+                                    (typeof args[0] === "string"
+                                      ? args[0]
+                                      : args[0] && args[0].url) ||
+                                    "";
+
+                                  const contentType =
+                                    response.headers && response.headers.get
+                                      ? response.headers.get("content-type") || ""
+                                      : "";
+
+                                  if (
+                                    looksLikeMediaUrl(requestUrl) ||
+                                    /mpegurl|dash\+xml|^video\/|octet-stream/i
+                                      .test(contentType)
+                                  ) {
+                                    reportMedia(requestUrl, contentType);
+                                  }
+                                } catch (_) {}
+
+                                return response;
+                              };
+                            }
+
+                            if (window.XMLHttpRequest) {
+                              const nativeOpen =
+                                XMLHttpRequest.prototype.open;
+                              const nativeSend =
+                                XMLHttpRequest.prototype.send;
+
+                              XMLHttpRequest.prototype.open =
+                                function(method, url) {
+                                  this.__afterdarkMediaUrl = String(url || "");
+                                  return nativeOpen.apply(this, arguments);
+                                };
+
+                              XMLHttpRequest.prototype.send = function() {
+                                this.addEventListener("readystatechange", () => {
+                                  try {
+                                    if (this.readyState < 2) return;
+
+                                    const requestUrl =
+                                      this.responseURL ||
+                                      this.__afterdarkMediaUrl ||
+                                      "";
+
+                                    const contentType =
+                                      this.getResponseHeader("content-type") || "";
+
+                                    if (
+                                      looksLikeMediaUrl(requestUrl) ||
+                                      /mpegurl|dash\+xml|^video\/|octet-stream/i
+                                        .test(contentType)
+                                    ) {
+                                      reportMedia(requestUrl, contentType);
+                                    }
+                                  } catch (_) {}
+                                });
+
+                                return nativeSend.apply(this, arguments);
+                              };
+                            }
+
+                            const scanMedia = () => {
+                              try {
+                                document
+                                  .querySelectorAll("video,audio,source")
+                                  .forEach(media => {
+                                    const candidate =
+                                      media.currentSrc ||
+                                      media.src ||
+                                      media.getAttribute("src") ||
+                                      "";
+
+                                    if (looksLikeMediaUrl(candidate)) {
+                                      reportMedia(candidate, "");
+                                    }
+                                  });
+
+                                if (
+                                  performance &&
+                                  performance.getEntriesByType
+                                ) {
+                                  performance
+                                    .getEntriesByType("resource")
+                                    .forEach(entry => {
+                                      if (looksLikeMediaUrl(entry.name)) {
+                                        reportMedia(entry.name, "");
+                                      }
+                                    });
+                                }
+                              } catch (_) {}
+                            };
+
+                            const mediaObserver = new MutationObserver(scanMedia);
+
+                            const startMediaCapture = () => {
+                              scanMedia();
+                              mediaObserver.observe(document.documentElement, {
+                                childList: true,
+                                subtree: true,
+                                attributes: true,
+                                attributeFilter: ["src"]
+                              });
+                            };
+
+                            if (document.readyState === "loading") {
+                              document.addEventListener(
+                                "DOMContentLoaded",
+                                startMediaCapture,
+                                { once: true }
+                              );
+                            } else {
+                              startMediaCapture();
+                            }
+                          }
 
                           // -------------------------------------------------
                           // Official player automation, installed in EVERY
@@ -1156,6 +1523,8 @@ object AfterDarkProofWebView {
                         !officialBodyHasItems(captured.body)
 
                 if (officialSourcesEmpty) {
+                    emptyOfficialResponse.set(captured)
+
                     // Return the empty response to AfterDark, but do not close
                     // this WebView. Its own React page will render the fallback
                     // player inside the already-established /watch session.
@@ -1298,8 +1667,14 @@ object AfterDarkProofWebView {
                             view: WebView?,
                             webRequest: WebResourceRequest?,
                         ): WebResourceResponse? {
-                            return interceptOfficialSources(webRequest)
-                                ?: super.shouldInterceptRequest(view, webRequest)
+                            val sourceResponse = interceptOfficialSources(webRequest)
+                            if (sourceResponse != null) return sourceResponse
+
+                            captureOfficialPlayerMedia(webRequest)?.let {
+                                finishWithResolvedMedia(it)
+                            }
+
+                            return super.shouldInterceptRequest(view, webRequest)
                         }
                     }
 
@@ -1368,8 +1743,14 @@ object AfterDarkProofWebView {
                     view: WebView?,
                     webRequest: WebResourceRequest?,
                 ): WebResourceResponse? {
-                    return interceptOfficialSources(webRequest)
-                        ?: super.shouldInterceptRequest(view, webRequest)
+                    val sourceResponse = interceptOfficialSources(webRequest)
+                    if (sourceResponse != null) return sourceResponse
+
+                    captureOfficialPlayerMedia(webRequest)?.let {
+                        finishWithResolvedMedia(it)
+                    }
+
+                    return super.shouldInterceptRequest(view, webRequest)
                 }
             }
 

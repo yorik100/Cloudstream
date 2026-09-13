@@ -95,6 +95,8 @@ data class ProofSession(
     val sourceReferer: String? = null,
     val sourceResponseStatus: Int? = null,
     val sourceResponseBody: String? = null,
+    val resolvedMedia: ResolvedWebMedia? = null,
+    val resolvedService: String? = null,
 )
 
 data class ParsedSubtitle(

@@ -476,7 +476,9 @@ class AfterDarkProvider : MainAPI() {
             null
         } ?: return null
 
-        proofCache[request.sessionKey] = session
+        if (session.resolvedMedia == null) {
+            proofCache[request.sessionKey] = session
+        }
         return session
     }
 
@@ -783,6 +785,33 @@ class AfterDarkProvider : MainAPI() {
             ?: throw ErrorLoadingException("Données AfterDark invalides")
 
         var session = obtainSession(request) ?: return false
+
+        session.resolvedMedia?.let { resolved ->
+            val resolvedType = when (resolved.type) {
+                "m3u8" -> ExtractorLinkType.M3U8
+                "mpd" -> ExtractorLinkType.DASH
+                else -> ExtractorLinkType.VIDEO
+            }
+
+            val service = session.resolvedService
+                ?.takeIf { it.isNotBlank() }
+                ?: "AfterDark"
+
+            callback(
+                newExtractorLink(
+                    source = service,
+                    name = "AfterDark · $service",
+                    url = resolved.url,
+                    type = resolvedType,
+                ) {
+                    referer = resolved.referer.orEmpty()
+                    headers = resolved.headers
+                },
+            )
+
+            return true
+        }
+
         var response = fetchSources(request, session)
 
         // Proofs are temporary. Retry once through the official WebView flow.
