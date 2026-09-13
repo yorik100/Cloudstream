@@ -22,13 +22,19 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import com.lagradost.cloudstream3.app
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 object AfterDarkEmbedWebView {
     private const val TAG = "AfterDarkEmbedWebView"
+    private const val MAX_VIDEASY_ENCRYPTED_CHARS = 4_000_000
     private const val VIDEASY_DESKTOP_USER_AGENT =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
             "AppleWebKit/537.36 (KHTML, like Gecko) " +
@@ -41,6 +47,16 @@ object AfterDarkEmbedWebView {
         ".mkv",
         ".webm",
     )
+
+    private fun videasyTmdbId(url: String): String? =
+        runCatching {
+            Uri.parse(url).pathSegments
+                .let { parts ->
+                    val typeIndex = parts.indexOfFirst { it == "tv" || it == "movie" }
+                    parts.getOrNull(typeIndex + 1)
+                }
+                ?.takeIf { value -> value.all { character -> character.isDigit() } }
+        }.getOrNull()
 
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun resolve(
@@ -231,6 +247,89 @@ object AfterDarkEmbedWebView {
                     }
 
                     @JavascriptInterface
+                    fun videasyEncrypted(payload: String?, sourceKey: String?) {
+                        if (!videasyMode || finished.get()) return
+                        val encrypted = payload?.takeIf {
+                            it.isNotBlank() && it.length <= MAX_VIDEASY_ENCRYPTED_CHARS
+                        } ?: return
+                        val provider = sourceKey.orEmpty()
+                        Log.i(TAG, "Réponse Videasy reçue par Chromium ($provider)")
+
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val response = runCatching {
+                                app.post(
+                                    url = "https://enc-dec.app/api/dec-videasy",
+                                    json = mapOf(
+                                        "text" to encrypted,
+                                        "id" to videasyTmdbId(embedUrl).orEmpty(),
+                                    ),
+                                    headers = mapOf(
+                                        "Accept" to "application/json",
+                                        "Content-Type" to "application/json",
+                                        "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+                                    ),
+                                    cacheTime = 0,
+                                )
+                            }.onFailure { error ->
+                                Log.w(
+                                    TAG,
+                                    "Déchiffrement Chromium impossible ($provider) : " +
+                                        "${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                                )
+                            }.getOrNull()
+
+                            val mediaUrl: String? = response
+                                ?.takeIf { it.okhttpResponse.code in 200..299 }
+                                ?.let { decrypted ->
+                                    runCatching {
+                                        val root = JSONObject(decrypted.text)
+                                        val result = when (val value = root.opt("result")) {
+                                            is JSONObject -> value
+                                            is String -> JSONObject(value)
+                                            else -> null
+                                        } ?: return@runCatching null
+
+                                        val sources = result.optJSONArray("sources")
+                                            ?: return@runCatching null
+                                        for (index in 0 until sources.length()) {
+                                            val candidate = sources.optJSONObject(index)
+                                                ?.optString("url", "")
+                                                ?.trim()
+                                                .orEmpty()
+                                            if (
+                                                candidate.startsWith("https://") ||
+                                                candidate.startsWith("http://")
+                                            ) return@runCatching candidate
+                                        }
+                                        null
+                                    }.onFailure { error ->
+                                        Log.w(
+                                            TAG,
+                                            "Réponse Chromium $provider illisible",
+                                            error,
+                                        )
+                                    }.getOrNull()
+                                }
+
+                            if (mediaUrl == null) {
+                                Log.w(TAG, "Provider Videasy $provider sans flux")
+                                return@launch
+                            }
+
+                            finish(
+                                ResolvedWebMedia(
+                                    url = mediaUrl,
+                                    referer = "https://player.videasy.to/",
+                                    headers = mapOf(
+                                        "User-Agent" to VIDEASY_DESKTOP_USER_AGENT,
+                                    ),
+                                    type = "m3u8",
+                                ),
+                            )
+                        }
+                    }
+
+                    @JavascriptInterface
                     fun activity() = Unit
 
                     @JavascriptInterface
@@ -263,6 +362,74 @@ object AfterDarkEmbedWebView {
 
                               const bridge = window.__AfterDarkMediaBridge;
                               if (!bridge || !window.JSON || !JSON.parse) return;
+
+                              if (!window.__afterdarkEarlyFetchHooked && window.fetch) {
+                                window.__afterdarkEarlyFetchHooked = true;
+                                const originalFetch = window.fetch.bind(window);
+                                window.fetch = async (...args) => {
+                                  const response = await originalFetch(...args);
+                                  try {
+                                    const requestedUrl =
+                                      typeof args[0] === 'string'
+                                        ? args[0]
+                                        : args[0] && args[0].url
+                                          ? args[0].url
+                                          : '';
+                                    const responseUrl = response.url || requestedUrl || '';
+                                    if (/api\.videasy\.[^/]+\/.*sources-with-title/i.test(responseUrl)) {
+                                      response.clone().text().then(payload => {
+                                        if (payload) {
+                                          const match = responseUrl.match(
+                                            /api\.videasy\.[^/]+\/([^/?]+)\//i
+                                          );
+                                          bridge.videasyEncrypted(
+                                            payload,
+                                            match ? match[1] : ''
+                                          );
+                                        }
+                                      }).catch(() => {});
+                                    }
+                                  } catch (_) {}
+                                  return response;
+                                };
+                              }
+
+                              if (
+                                !window.__afterdarkEarlyXhrHooked &&
+                                window.XMLHttpRequest
+                              ) {
+                                window.__afterdarkEarlyXhrHooked = true;
+                                const originalOpen = XMLHttpRequest.prototype.open;
+                                const originalSend = XMLHttpRequest.prototype.send;
+
+                                XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                                  this.__afterdarkVideasyUrl = String(url || '');
+                                  return originalOpen.call(this, method, url, ...rest);
+                                };
+
+                                XMLHttpRequest.prototype.send = function(...args) {
+                                  this.addEventListener('load', () => {
+                                    try {
+                                      const responseUrl =
+                                        this.responseURL || this.__afterdarkVideasyUrl || '';
+                                      if (
+                                        /api\.videasy\.[^/]+\/.*sources-with-title/i.test(responseUrl) &&
+                                        typeof this.responseText === 'string' &&
+                                        this.responseText
+                                      ) {
+                                        const match = responseUrl.match(
+                                          /api\.videasy\.[^/]+\/([^/?]+)\//i
+                                        );
+                                        bridge.videasyEncrypted(
+                                          this.responseText,
+                                          match ? match[1] : ''
+                                        );
+                                      }
+                                    } catch (_) {}
+                                  });
+                                  return originalSend.apply(this, args);
+                                };
+                              }
 
                               const typeHint = value => {
                                 const type = String(value || '').toLowerCase();
@@ -1057,26 +1224,6 @@ object AfterDarkEmbedWebView {
                         super.onPageFinished(view, url)
                         Log.i(TAG, "Page $sourceName chargée : ${url.orEmpty()}")
                         installHooksAndNudge()
-
-                        handler.postDelayed({ installHooksAndNudge() }, 1_000L)
-                        handler.postDelayed({ installHooksAndNudge() }, 3_000L)
-                        handler.postDelayed({ installHooksAndNudge() }, 6_000L)
-                        handler.postDelayed({ installHooksAndNudge() }, 12_000L)
-
-                        if (videasyMode) {
-                            handler.postDelayed(
-                                {
-                                    if (!finished.get()) {
-                                        Log.w(
-                                            TAG,
-                                            "Videasy sans média après 20 s, passage à la source suivante",
-                                        )
-                                        finish(null)
-                                    }
-                                },
-                                20_000L,
-                            )
-                        }
                     }
 
                     override fun onPageStarted(
@@ -1090,9 +1237,6 @@ object AfterDarkEmbedWebView {
                         // application finishes booting. onPageFinished alone is
                         // too late for Videasy's initial source request.
                         handler.post { installHooksAndNudge() }
-                        handler.postDelayed({ installHooksAndNudge() }, 100L)
-                        handler.postDelayed({ installHooksAndNudge() }, 300L)
-                        handler.postDelayed({ installHooksAndNudge() }, 700L)
                     }
                 }
 
