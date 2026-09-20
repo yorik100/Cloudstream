@@ -7,8 +7,11 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -54,6 +57,7 @@ object AfterDarkProofWebView {
         val emptyOfficialResponse = AtomicReference<CapturedSourceResponse?>(null)
         val verificationButtonHasAppeared = AtomicBoolean(false)
         val cloudflareErrorReloadInProgress = AtomicBoolean(false)
+        val turnstileNativeTapInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
@@ -259,6 +263,148 @@ object AfterDarkProofWebView {
                     """.trimIndent(),
                     null,
                 )
+            }
+
+            fun dispatchTurnstileNativeTap(
+                cssX: Double,
+                cssY: Double,
+                viewportWidth: Double,
+                viewportHeight: Double,
+                sourceHref: String?,
+            ) {
+                if (
+                    finished.get() ||
+                    officialPlayerMode.get() ||
+                    cloudflareErrorReloadInProgress.get() ||
+                    !turnstileNativeTapInProgress.compareAndSet(false, true)
+                ) return
+
+                val href = sourceHref.orEmpty()
+                if (
+                    !href.startsWith(
+                        "https://challenges.cloudflare.com/",
+                        ignoreCase = true,
+                    )
+                ) {
+                    turnstileNativeTapInProgress.set(false)
+                    Log.w(
+                        TAG,
+                        "Tap Turnstile ignoré: frame non Cloudflare: $href",
+                    )
+                    return
+                }
+
+                browser.post {
+                    if (
+                        finished.get() ||
+                        officialPlayerMode.get() ||
+                        browser.width <= 0 ||
+                        browser.height <= 0
+                    ) {
+                        turnstileNativeTapInProgress.set(false)
+                        return@post
+                    }
+
+                    val viewportW = viewportWidth
+                        .takeIf { it.isFinite() && it > 0.0 }
+                        ?: browser.width.toDouble()
+
+                    val viewportH = viewportHeight
+                        .takeIf { it.isFinite() && it > 0.0 }
+                        ?: browser.height.toDouble()
+
+                    val localX = (
+                        cssX * browser.width.toDouble() / viewportW
+                    ).toFloat()
+
+                    val localY = (
+                        cssY * browser.height.toDouble() / viewportH
+                    ).toFloat()
+
+                    if (
+                        !localX.isFinite() ||
+                        !localY.isFinite() ||
+                        localX < 0f ||
+                        localY < 0f ||
+                        localX > browser.width.toFloat() ||
+                        localY > browser.height.toFloat()
+                    ) {
+                        turnstileNativeTapInProgress.set(false)
+                        Log.w(
+                            TAG,
+                            "Coordonnées Turnstile hors WebView: " +
+                                "css=($cssX,$cssY) " +
+                                "viewport=($viewportW,$viewportH) " +
+                                "view=${browser.width}x${browser.height} " +
+                                "local=($localX,$localY)",
+                        )
+                        return@post
+                    }
+
+                    browser.requestFocus()
+
+                    val downTime = SystemClock.uptimeMillis()
+
+                    val down = MotionEvent.obtain(
+                        downTime,
+                        downTime,
+                        MotionEvent.ACTION_DOWN,
+                        localX,
+                        localY,
+                        0,
+                    ).apply {
+                        source = InputDevice.SOURCE_TOUCHSCREEN
+                    }
+
+                    val downHandled = runCatching {
+                        browser.dispatchTouchEvent(down)
+                    }.getOrDefault(false)
+
+                    down.recycle()
+
+                    // The successful desktop trace had ~46 ms between
+                    // trusted pointerdown and pointerup.
+                    browser.postDelayed(
+                        {
+                            val upTime = SystemClock.uptimeMillis()
+
+                            val up = MotionEvent.obtain(
+                                downTime,
+                                upTime,
+                                MotionEvent.ACTION_UP,
+                                localX,
+                                localY,
+                                0,
+                            ).apply {
+                                source = InputDevice.SOURCE_TOUCHSCREEN
+                            }
+
+                            val upHandled = runCatching {
+                                browser.dispatchTouchEvent(up)
+                            }.getOrDefault(false)
+
+                            up.recycle()
+
+                            Log.i(
+                                TAG,
+                                "Tap Turnstile natif envoyé: " +
+                                    "css=($cssX,$cssY) " +
+                                    "viewport=($viewportW,$viewportH) " +
+                                    "local=($localX,$localY) " +
+                                    "DOWN=$downHandled UP=$upHandled " +
+                                    "frame=$href",
+                            )
+
+                            browser.postDelayed(
+                                {
+                                    turnstileNativeTapInProgress.set(false)
+                                },
+                                650L,
+                            )
+                        },
+                        46L,
+                    )
+                }
             }
 
             fun reloadForCloudflareError(
@@ -837,6 +983,25 @@ object AfterDarkProofWebView {
                     }
 
                     @JavascriptInterface
+                    fun turnstileNativeTap(
+                        cssX: Double,
+                        cssY: Double,
+                        viewportWidth: Double,
+                        viewportHeight: Double,
+                        sourceHref: String?,
+                    ) {
+                        handler.post {
+                            dispatchTurnstileNativeTap(
+                                cssX = cssX,
+                                cssY = cssY,
+                                viewportWidth = viewportWidth,
+                                viewportHeight = viewportHeight,
+                                sourceHref = sourceHref,
+                            )
+                        }
+                    }
+
+                    @JavascriptInterface
                     fun cloudflareError(
                         code: String?,
                         source: String?,
@@ -1403,19 +1568,23 @@ object AfterDarkProofWebView {
                           }
 
                           // -------------------------------------------------
-                          // Deep Turnstile scanner + clicker.
+                          // Deep Turnstile locator + native trusted-input relay.
                           //
-                          // Port of the user's desktop Tampermonkey test that
-                          // actually clicks the verification control.
-                          //
-                          // IMPORTANT: this intentionally runs in EVERY frame,
-                          // not only challenges.cloudflare.com.
+                          // JavaScript does NOT click the control here.
+                          // It only finds the control and translates its
+                          // coordinates through every iframe up to the top page.
+                          // Android then taps the WebView at that exact point,
+                          // letting Chromium generate the DOM input events.
                           // -------------------------------------------------
-                          if (!window.__afterdarkDeepTurnstileClicker) {
-                            window.__afterdarkDeepTurnstileClicker = true;
+                          if (!window.__afterdarkTrustedTurnstileLocator) {
+                            window.__afterdarkTrustedTurnstileLocator = true;
+
+                            const TURNSTILE_TAP_MESSAGE =
+                              "__afterdarkTurnstileNativeTap";
 
                             const turnstileRoots = new Set();
-                            const turnstileClicked = new WeakSet();
+                            const turnstileLastRequest =
+                              new WeakMap();
 
                             turnstileRoots.add(document);
 
@@ -1427,14 +1596,86 @@ object AfterDarkProofWebView {
                               } catch (_) {}
                             };
 
+                            const currentTurnstileHost = () => {
+                              try {
+                                return String(
+                                  location.hostname || ""
+                                ).toLowerCase();
+                              } catch (_) {
+                                return "";
+                              }
+                            };
+
+                            const isCloudflareTurnstileFrame = () =>
+                              currentTurnstileHost() ===
+                                "challenges.cloudflare.com";
+
                             turnstileDebug(
-                              "SCRIPT CHARGE frame=" +
+                              "LOCATOR CHARGE frame=" +
                               String(location.href || "")
                             );
 
                             /*
-                             * Capture even closed Shadow DOM roots created
-                             * after document-start.
+                             * Log the actual events Chromium creates.
+                             * This is diagnostic only and does not cancel,
+                             * alter or synthesize anything.
+                             */
+                            if (isCloudflareTurnstileFrame()) {
+                              for (
+                                const eventName of [
+                                  "pointerdown",
+                                  "pointerup",
+                                  "mousedown",
+                                  "mouseup",
+                                  "click"
+                                ]
+                              ) {
+                                window.addEventListener(
+                                  eventName,
+                                  event => {
+                                    if (!event) return;
+
+                                    const target =
+                                      event.target || null;
+
+                                    turnstileDebug(
+                                      "EVENT " +
+                                      eventName +
+                                      " isTrusted=" +
+                                      String(
+                                        event.isTrusted === true
+                                      ) +
+                                      " target=" +
+                                      String(
+                                        target &&
+                                        target.tagName || ""
+                                      ) +
+                                      " x=" +
+                                      String(
+                                        Math.round(
+                                          Number(
+                                            event.clientX || 0
+                                          ) * 100
+                                        ) / 100
+                                      ) +
+                                      " y=" +
+                                      String(
+                                        Math.round(
+                                          Number(
+                                            event.clientY || 0
+                                          ) * 100
+                                        ) / 100
+                                      )
+                                    );
+                                  },
+                                  true
+                                );
+                              }
+                            }
+
+                            /*
+                             * Capture even CLOSED shadow roots created after
+                             * document-start.
                              */
                             try {
                               const originalAttachShadow =
@@ -1443,12 +1684,15 @@ object AfterDarkProofWebView {
                               Element.prototype.attachShadow =
                                 function(init) {
                                   const shadow =
-                                    originalAttachShadow.call(this, init);
+                                    originalAttachShadow.call(
+                                      this,
+                                      init
+                                    );
 
                                   turnstileRoots.add(shadow);
 
                                   turnstileDebug(
-                                    "SHADOW ROOT CAPTURE mode=" +
+                                    "SHADOW CAPTURE mode=" +
                                     String(
                                       init && init.mode
                                         ? init.mode
@@ -1466,31 +1710,33 @@ object AfterDarkProofWebView {
                               );
                             } catch (error) {
                               turnstileDebug(
-                                "ERREUR attachShadow " +
+                                "attachShadow erreur " +
                                 String(error || "")
                               );
                             }
 
-                            const visibleTurnstileElement = element => {
-                              if (!element) return false;
+                            const visibleTurnstileElement =
+                              element => {
+                                if (!element) return false;
 
-                              try {
-                                const rect =
-                                  element.getBoundingClientRect();
-                                const style =
-                                  getComputedStyle(element);
+                                try {
+                                  const rect =
+                                    element.getBoundingClientRect();
+                                  const style =
+                                    getComputedStyle(element);
 
-                                return (
-                                  rect.width > 0 &&
-                                  rect.height > 0 &&
-                                  style.display !== "none" &&
-                                  style.visibility !== "hidden" &&
-                                  style.opacity !== "0"
-                                );
-                              } catch (_) {
-                                return false;
-                              }
-                            };
+                                  return (
+                                    rect.width > 0 &&
+                                    rect.height > 0 &&
+                                    style.display !== "none" &&
+                                    style.visibility !==
+                                      "hidden" &&
+                                    style.opacity !== "0"
+                                  );
+                                } catch (_) {
+                                  return false;
+                                }
+                              };
 
                             const collectTurnstileRoots = () => {
                               const queue =
@@ -1500,7 +1746,10 @@ object AfterDarkProofWebView {
                               while (queue.length) {
                                 const root = queue.shift();
 
-                                if (!root || seen.has(root)) {
+                                if (
+                                  !root ||
+                                  seen.has(root)
+                                ) {
                                   continue;
                                 }
 
@@ -1538,6 +1787,42 @@ object AfterDarkProofWebView {
                               );
                             };
 
+                            const turnstilePriority = element => {
+                              try {
+                                if (
+                                  element.matches(
+                                    'input[type="checkbox"]'
+                                  )
+                                ) return 0;
+
+                                if (
+                                  element.getAttribute(
+                                    "role"
+                                  ) === "checkbox"
+                                ) return 1;
+
+                                if (
+                                  String(
+                                    element.tagName || ""
+                                  ).toLowerCase() === "label"
+                                ) return 2;
+
+                                if (
+                                  String(
+                                    element.tagName || ""
+                                  ).toLowerCase() === "button"
+                                ) return 3;
+
+                                if (
+                                  element.getAttribute(
+                                    "role"
+                                  ) === "button"
+                                ) return 4;
+                              } catch (_) {}
+
+                              return 10;
+                            };
+
                             const findTurnstileCandidates = () => {
                               const result = [];
 
@@ -1553,9 +1838,9 @@ object AfterDarkProofWebView {
                                       [
                                         'input[type="checkbox"]',
                                         '[role="checkbox"]',
+                                        "label",
                                         "button",
-                                        '[role="button"]',
-                                        "label"
+                                        '[role="button"]'
                                       ].join(",")
                                     );
                                 } catch (_) {}
@@ -1619,151 +1904,385 @@ object AfterDarkProofWebView {
                                 }
                               }
 
-                              return Array.from(
-                                new Set(result)
-                              );
+                              return Array.from(new Set(result))
+                                .sort((a, b) => {
+                                  const priority =
+                                    turnstilePriority(a) -
+                                    turnstilePriority(b);
+
+                                  if (priority !== 0) {
+                                    return priority;
+                                  }
+
+                                  try {
+                                    const aRect =
+                                      a.getBoundingClientRect();
+                                    const bRect =
+                                      b.getBoundingClientRect();
+
+                                    return (
+                                      aRect.width *
+                                        aRect.height -
+                                      bRect.width *
+                                        bRect.height
+                                    );
+                                  } catch (_) {
+                                    return 0;
+                                  }
+                                });
                             };
 
-                            const describeTurnstile = element => {
-                              try {
-                                const rect =
-                                  element.getBoundingClientRect();
-
-                                return (
-                                  "tag=" +
-                                  String(element.tagName || "") +
-                                  " type=" +
-                                  String(
-                                    element.getAttribute &&
-                                    element.getAttribute(
-                                      "type"
-                                    ) || ""
-                                  ) +
-                                  " role=" +
-                                  String(
-                                    element.getAttribute &&
-                                    element.getAttribute(
-                                      "role"
-                                    ) || ""
-                                  ) +
-                                  " text=" +
-                                  String(
-                                    element.textContent || ""
-                                  )
-                                    .replace(/\s+/g, " ")
-                                    .trim()
-                                    .slice(0, 160) +
-                                  " rect=" +
-                                  [
-                                    Math.round(rect.x),
-                                    Math.round(rect.y),
-                                    Math.round(rect.width),
-                                    Math.round(rect.height)
-                                  ].join(",")
-                                );
-                              } catch (_) {
-                                return "description-error";
-                              }
-                            };
-
-                            const clickTurnstileCandidate =
+                            const describeTurnstile =
                               element => {
-                                if (
-                                  !element ||
-                                  turnstileClicked.has(element)
-                                ) {
-                                  return false;
-                                }
-
-                                turnstileClicked.add(element);
-
-                                turnstileDebug(
-                                  "CANDIDAT TROUVE " +
-                                  describeTurnstile(element)
-                                );
-
-                                try {
-                                  element.scrollIntoView({
-                                    block: "center",
-                                    inline: "center"
-                                  });
-                                } catch (_) {}
-
-                                try {
-                                  element.focus();
-                                } catch (_) {}
-
-                                /*
-                                 * First method from the successful
-                                 * Tampermonkey test.
-                                 */
-                                try {
-                                  element.click();
-
-                                  turnstileDebug(
-                                    "element.click envoye"
-                                  );
-                                } catch (error) {
-                                  turnstileDebug(
-                                    "element.click erreur " +
-                                    String(error || "")
-                                  );
-                                }
-
-                                /*
-                                 * Second method from the same test:
-                                 * pointer/mouse sequence at the
-                                 * candidate center.
-                                 */
                                 try {
                                   const rect =
                                     element.getBoundingClientRect();
 
-                                  const options = {
-                                    bubbles: true,
-                                    cancelable: true,
-                                    composed: true,
-                                    clientX:
-                                      rect.left +
-                                      rect.width / 2,
-                                    clientY:
-                                      rect.top +
-                                      rect.height / 2,
-                                    button: 0
-                                  };
+                                  return (
+                                    "tag=" +
+                                    String(
+                                      element.tagName || ""
+                                    ) +
+                                    " role=" +
+                                    String(
+                                      element.getAttribute &&
+                                      element.getAttribute(
+                                        "role"
+                                      ) || ""
+                                    ) +
+                                    " type=" +
+                                    String(
+                                      element.getAttribute &&
+                                      element.getAttribute(
+                                        "type"
+                                      ) || ""
+                                    ) +
+                                    " rect=" +
+                                    [
+                                      Math.round(
+                                        rect.x * 100
+                                      ) / 100,
+                                      Math.round(
+                                        rect.y * 100
+                                      ) / 100,
+                                      Math.round(
+                                        rect.width * 100
+                                      ) / 100,
+                                      Math.round(
+                                        rect.height * 100
+                                      ) / 100
+                                    ].join(",")
+                                  );
+                                } catch (_) {
+                                  return "description-error";
+                                }
+                              };
 
-                                  for (
-                                    const type of [
-                                      "pointerdown",
-                                      "mousedown",
-                                      "pointerup",
-                                      "mouseup",
-                                      "click"
-                                    ]
-                                  ) {
-                                    const Constructor =
-                                      type.startsWith(
-                                        "pointer"
-                                      )
-                                        ? PointerEvent
-                                        : MouseEvent;
+                            /*
+                             * Relay child-frame coordinates to the top frame.
+                             *
+                             * At each iframe boundary, map child CSS viewport
+                             * coordinates into the parent's CSS viewport using
+                             * the iframe's rendered rectangle. This also handles
+                             * iframe scaling.
+                             */
+                            const relayTurnstileTap = data => {
+                              if (!data) return;
 
-                                    element.dispatchEvent(
-                                      new Constructor(
-                                        type,
-                                        options
+                              const x = Number(data.x);
+                              const y = Number(data.y);
+                              const childViewportWidth =
+                                Number(
+                                  data.viewportWidth
+                                );
+                              const childViewportHeight =
+                                Number(
+                                  data.viewportHeight
+                                );
+
+                              if (
+                                !Number.isFinite(x) ||
+                                !Number.isFinite(y) ||
+                                !Number.isFinite(
+                                  childViewportWidth
+                                ) ||
+                                !Number.isFinite(
+                                  childViewportHeight
+                                ) ||
+                                childViewportWidth <= 0 ||
+                                childViewportHeight <= 0
+                              ) {
+                                return;
+                              }
+
+                              if (window === window.top) {
+                                turnstileDebug(
+                                  "TOP TAP css=" +
+                                  x.toFixed(2) +
+                                  "," +
+                                  y.toFixed(2) +
+                                  " viewport=" +
+                                  String(
+                                    window.innerWidth
+                                  ) +
+                                  "x" +
+                                  String(
+                                    window.innerHeight
+                                  )
+                                );
+
+                                try {
+                                  window.AfterDarkNative
+                                    .turnstileNativeTap(
+                                      x,
+                                      y,
+                                      Number(
+                                        window.innerWidth
+                                      ),
+                                      Number(
+                                        window.innerHeight
+                                      ),
+                                      String(
+                                        data.sourceHref || ""
                                       )
                                     );
-                                  }
-
-                                  turnstileDebug(
-                                    "sequence pointer/mouse envoyee"
-                                  );
                                 } catch (error) {
                                   turnstileDebug(
-                                    "sequence pointer erreur " +
+                                    "native tap bridge error " +
                                     String(error || "")
                                   );
+                                }
+
+                                return;
+                              }
+
+                              try {
+                                window.parent.postMessage(
+                                  {
+                                    [TURNSTILE_TAP_MESSAGE]:
+                                      true,
+                                    x,
+                                    y,
+                                    viewportWidth:
+                                      childViewportWidth,
+                                    viewportHeight:
+                                      childViewportHeight,
+                                    sourceHref:
+                                      String(
+                                        data.sourceHref || ""
+                                      )
+                                  },
+                                  "*"
+                                );
+                              } catch (_) {}
+                            };
+
+                            window.addEventListener(
+                              "message",
+                              event => {
+                                const data = event.data;
+
+                                if (
+                                  !data ||
+                                  data[
+                                    TURNSTILE_TAP_MESSAGE
+                                  ] !== true
+                                ) {
+                                  return;
+                                }
+
+                                let childFrame = null;
+
+                                try {
+                                  childFrame = Array.from(
+                                    document.querySelectorAll(
+                                      "iframe,frame"
+                                    )
+                                  ).find(frame => {
+                                    try {
+                                      return (
+                                        frame.contentWindow ===
+                                        event.source
+                                      );
+                                    } catch (_) {
+                                      return false;
+                                    }
+                                  }) || null;
+                                } catch (_) {}
+
+                                if (!childFrame) {
+                                  turnstileDebug(
+                                    "relay iframe introuvable"
+                                  );
+                                  return;
+                                }
+
+                                try {
+                                  const frameRect =
+                                    childFrame
+                                      .getBoundingClientRect();
+
+                                  const childW =
+                                    Number(
+                                      data.viewportWidth
+                                    );
+                                  const childH =
+                                    Number(
+                                      data.viewportHeight
+                                    );
+
+                                  if (
+                                    childW <= 0 ||
+                                    childH <= 0
+                                  ) {
+                                    return;
+                                  }
+
+                                  const mappedX =
+                                    frameRect.left +
+                                    (
+                                      Number(data.x) *
+                                      frameRect.width /
+                                      childW
+                                    );
+
+                                  const mappedY =
+                                    frameRect.top +
+                                    (
+                                      Number(data.y) *
+                                      frameRect.height /
+                                      childH
+                                    );
+
+                                  const nextData = {
+                                    [TURNSTILE_TAP_MESSAGE]:
+                                      true,
+                                    x: mappedX,
+                                    y: mappedY,
+                                    viewportWidth:
+                                      Number(
+                                        window.innerWidth
+                                      ),
+                                    viewportHeight:
+                                      Number(
+                                        window.innerHeight
+                                      ),
+                                    sourceHref:
+                                      String(
+                                        data.sourceHref || ""
+                                      )
+                                  };
+
+                                  if (
+                                    window === window.top
+                                  ) {
+                                    relayTurnstileTap(
+                                      nextData
+                                    );
+                                  } else {
+                                    window.parent.postMessage(
+                                      nextData,
+                                      "*"
+                                    );
+                                  }
+                                } catch (error) {
+                                  turnstileDebug(
+                                    "relay erreur " +
+                                    String(error || "")
+                                  );
+                                }
+                              },
+                              false
+                            );
+
+                            const requestTurnstileNativeTap =
+                              element => {
+                                if (
+                                  !element ||
+                                  !isCloudflareTurnstileFrame()
+                                ) {
+                                  return false;
+                                }
+
+                                const now = Date.now();
+                                const lastRequest =
+                                  turnstileLastRequest.get(
+                                    element
+                                  ) || 0;
+
+                                // If the widget remains unchanged, retry
+                                // occasionally. A successful Turnstile normally
+                                // replaces/removes it immediately.
+                                if (
+                                  now - lastRequest < 1800
+                                ) {
+                                  return false;
+                                }
+
+                                turnstileLastRequest.set(
+                                  element,
+                                  now
+                                );
+
+                                let rect;
+
+                                try {
+                                  rect =
+                                    element.getBoundingClientRect();
+                                } catch (_) {
+                                  return false;
+                                }
+
+                                const x =
+                                  rect.left +
+                                  rect.width / 2;
+                                const y =
+                                  rect.top +
+                                  rect.height / 2;
+
+                                turnstileDebug(
+                                  "CANDIDAT " +
+                                  describeTurnstile(
+                                    element
+                                  ) +
+                                  " tap=" +
+                                  x.toFixed(2) +
+                                  "," +
+                                  y.toFixed(2)
+                                );
+
+                                const tapData = {
+                                  [TURNSTILE_TAP_MESSAGE]:
+                                    true,
+                                  x,
+                                  y,
+                                  viewportWidth:
+                                    Number(
+                                      window.innerWidth
+                                    ),
+                                  viewportHeight:
+                                    Number(
+                                      window.innerHeight
+                                    ),
+                                  sourceHref:
+                                    String(
+                                      location.href || ""
+                                    )
+                                };
+
+                                if (
+                                  window === window.top
+                                ) {
+                                  relayTurnstileTap(
+                                    tapData
+                                  );
+                                } else {
+                                  try {
+                                    window.parent.postMessage(
+                                      tapData,
+                                      "*"
+                                    );
+                                  } catch (_) {}
                                 }
 
                                 return true;
@@ -1772,7 +2291,14 @@ object AfterDarkProofWebView {
                             let lastTurnstileSummary = "";
 
                             const scanTurnstile = () => {
-                              collectTurnstileRoots();
+                              // The real Turnstile control is hosted by
+                              // challenges.cloudflare.com. Parent frames only
+                              // need the relay listener above.
+                              if (
+                                !isCloudflareTurnstileFrame()
+                              ) {
+                                return;
+                              }
 
                               const candidates =
                                 findTurnstileCandidates();
@@ -1814,9 +2340,13 @@ object AfterDarkProofWebView {
                                 checkboxes +
                                 " candidates=" +
                                 candidates.length +
-                                " host=" +
+                                " viewport=" +
                                 String(
-                                  location.hostname || ""
+                                  window.innerWidth
+                                ) +
+                                "x" +
+                                String(
+                                  window.innerHeight
                                 );
 
                               if (
@@ -1825,13 +2355,15 @@ object AfterDarkProofWebView {
                               ) {
                                 lastTurnstileSummary =
                                   summary;
+
                                 turnstileDebug(summary);
                               }
 
-                              for (
-                                const candidate of candidates
-                              ) {
-                                clickTurnstileCandidate(
+                              const candidate =
+                                candidates[0] || null;
+
+                              if (candidate) {
+                                requestTurnstileNativeTap(
                                   candidate
                                 );
                               }
