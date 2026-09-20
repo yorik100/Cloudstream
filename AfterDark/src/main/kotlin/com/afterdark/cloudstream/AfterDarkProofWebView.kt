@@ -3,12 +3,16 @@ package com.afterdark.cloudstream
 import android.annotation.SuppressLint
 import android.app.Dialog
 import android.graphics.Color
+import android.graphics.Rect
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.CookieManager
@@ -321,8 +325,8 @@ object AfterDarkProofWebView {
                         window.__afterdarkCheckboxReported = true;
                         stopCheckboxWatcher();
 
-                        // Do not reload. Ask native code to perform a real
-                        // accessibility ACTION_CLICK on the rendered control.
+                        // Do not reload. Ask native code to tap the rendered
+                        // control through Android's WebView input pipeline.
                         try {
                           window.AfterDarkNative.interactiveCheckboxSeen();
                         } catch (_) {}
@@ -400,7 +404,7 @@ object AfterDarkProofWebView {
                         ) {
                             found = true
 
-                            // Click only on the transition "not present" ->
+                            // Tap only on the transition "not present" ->
                             // "present". If Cloudflare replaces the control,
                             // it disappears first and the watcher re-arms.
                             if (
@@ -409,21 +413,116 @@ object AfterDarkProofWebView {
                                     true,
                                 )
                             ) {
-                                runCatching {
-                                    node.performAction(
-                                        AccessibilityNodeInfo.ACTION_FOCUS,
+                                val nodeBounds = Rect()
+                                node.getBoundsInScreen(nodeBounds)
+
+                                val webViewLocation = IntArray(2)
+                                target.getLocationOnScreen(webViewLocation)
+
+                                val rawX =
+                                    nodeBounds.exactCenterX() - webViewLocation[0]
+                                val rawY =
+                                    nodeBounds.exactCenterY() - webViewLocation[1]
+
+                                val width = target.width.toFloat()
+                                val height = target.height.toFloat()
+
+                                val localX =
+                                    if (width > 2f) {
+                                        rawX.coerceIn(1f, width - 1f)
+                                    } else {
+                                        rawX
+                                    }
+
+                                val localY =
+                                    if (height > 2f) {
+                                        rawY.coerceIn(1f, height - 1f)
+                                    } else {
+                                        rawY
+                                    }
+
+                                val boundsUsable =
+                                    !nodeBounds.isEmpty &&
+                                    target.width > 0 &&
+                                    target.height > 0 &&
+                                    rawX >= 0f &&
+                                    rawY >= 0f &&
+                                    rawX <= width &&
+                                    rawY <= height
+
+                                if (boundsUsable) {
+                                    target.requestFocus()
+
+                                    val downTime = SystemClock.uptimeMillis()
+                                    val downEvent = MotionEvent.obtain(
+                                        downTime,
+                                        downTime,
+                                        MotionEvent.ACTION_DOWN,
+                                        localX,
+                                        localY,
+                                        0,
+                                    ).apply {
+                                        source = InputDevice.SOURCE_TOUCHSCREEN
+                                    }
+
+                                    val downHandled = runCatching {
+                                        target.dispatchTouchEvent(downEvent)
+                                    }.getOrDefault(false)
+                                    downEvent.recycle()
+
+                                    target.postDelayed(
+                                        {
+                                            if (
+                                                finished.get() ||
+                                                officialPlayerMode.get()
+                                            ) {
+                                                return@postDelayed
+                                            }
+
+                                            val upTime =
+                                                SystemClock.uptimeMillis()
+                                            val upEvent = MotionEvent.obtain(
+                                                downTime,
+                                                upTime,
+                                                MotionEvent.ACTION_UP,
+                                                localX,
+                                                localY,
+                                                0,
+                                            ).apply {
+                                                source =
+                                                    InputDevice.SOURCE_TOUCHSCREEN
+                                            }
+
+                                            val upHandled = runCatching {
+                                                target.dispatchTouchEvent(
+                                                    upEvent,
+                                                )
+                                            }.getOrDefault(false)
+                                            upEvent.recycle()
+
+                                            Log.i(
+                                                TAG,
+                                                "Tap natif Turnstile " +
+                                                    "x=$localX y=$localY " +
+                                                    "DOWN=$downHandled " +
+                                                    "UP=$upHandled " +
+                                                    "bounds=$nodeBounds",
+                                            )
+                                        },
+                                        85L,
+                                    )
+                                } else {
+                                    // Let the next scan retry if the
+                                    // accessibility node had unusable bounds.
+                                    verificationCheckboxPresent.set(false)
+
+                                    Log.w(
+                                        TAG,
+                                        "Turnstile détecté mais coordonnées " +
+                                            "inutilisables: bounds=$nodeBounds " +
+                                            "webView=${target.width}x${target.height}",
                                     )
                                 }
-                                val clicked = runCatching {
-                                    node.performAction(
-                                        AccessibilityNodeInfo.ACTION_CLICK,
-                                    )
-                                }.getOrDefault(false)
-
-                                Log.i(
-                                    TAG,
-                                    "Contrôle Turnstile détecté, ACTION_CLICK=$clicked",
-                                )
                             }
 
                             runCatching { node.recycle() }
@@ -1600,8 +1699,8 @@ object AfterDarkProofWebView {
 
                           // -------------------------------------------------
                           // Cloudflare Turnstile verification-control detector.
-                          // It reports the control so native accessibility can
-                          // click it. It never requests a reload itself.
+                          // It reports the control so native Android input can
+                          // tap it. It never requests a reload itself.
                           // -------------------------------------------------
                           if (window.__afterdarkCheckboxFrameDetector) return;
                           window.__afterdarkCheckboxFrameDetector = true;
