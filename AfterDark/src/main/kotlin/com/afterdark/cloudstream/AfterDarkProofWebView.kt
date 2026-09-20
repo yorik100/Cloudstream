@@ -449,20 +449,11 @@ object AfterDarkProofWebView {
 
                     down.recycle()
 
-                    // Random native press duration in the requested
-                    // 50..70 ms range, inclusive.
-                    val nativePressDurationMs =
-                        kotlin.random.Random.nextLong(
-                            from = 50L,
-                            until = 71L,
-                        )
-
-                    Log.i(
-                        TAG,
-                        "Durée tap Turnstile DOWN→UP=" +
-                            "${nativePressDurationMs}ms",
-                    )
-
+                    // Keep the native press duration inside the
+                    // 45-60 ms compatibility window used by different
+                    // Android WebView/browser input stacks.
+                    val pressDurationMs =
+                        kotlin.random.Random.nextLong(45L, 61L)
                     browser.postDelayed(
                         {
                             val upTime = SystemClock.uptimeMillis()
@@ -491,6 +482,7 @@ object AfterDarkProofWebView {
                                     "viewport=($viewportW,$viewportH) " +
                                     "local=($localX,$localY) " +
                                     "DOWN=$downHandled UP=$upHandled " +
+                                    "press=${pressDurationMs}ms " +
                                     "frame=$href",
                             )
 
@@ -501,7 +493,7 @@ object AfterDarkProofWebView {
                                 650L,
                             )
                         },
-                        nativePressDurationMs,
+                        pressDurationMs,
                     )
                 }
             }
@@ -2363,390 +2355,6 @@ object AfterDarkProofWebView {
                                 };
                             }
 
-                            const plausibleVisualCheckboxRect =
-                              rect => {
-                                if (!rect) return false;
-
-                                const width =
-                                  Number(rect.width || 0);
-                                const height =
-                                  Number(rect.height || 0);
-
-                                if (
-                                  !Number.isFinite(width) ||
-                                  !Number.isFinite(height) ||
-                                  width < 8 ||
-                                  height < 8 ||
-                                  width > 64 ||
-                                  height > 64
-                                ) {
-                                  return false;
-                                }
-
-                                const smaller =
-                                  Math.min(width, height);
-                                const larger =
-                                  Math.max(width, height);
-
-                                // A visual checkbox should be roughly square.
-                                return (
-                                  smaller > 0 &&
-                                  larger / smaller <= 1.8
-                                );
-                              };
-
-                            const rectObject = (
-                              left,
-                              top,
-                              width,
-                              height
-                            ) => ({
-                              left,
-                              top,
-                              width,
-                              height,
-                              right: left + width,
-                              bottom: top + height,
-                              x: left,
-                              y: top
-                            });
-
-                            const resolveVisualCheckboxBox =
-                              element => {
-                                if (!element) return null;
-
-                                let semanticCheckbox = null;
-
-                                try {
-                                  semanticCheckbox =
-                                    (
-                                      element.matches &&
-                                      element.matches(
-                                        'input[type="checkbox"],' +
-                                        '[role="checkbox"]'
-                                      )
-                                    )
-                                      ? element
-                                      : (
-                                          element.querySelector &&
-                                          element.querySelector(
-                                            'input[type="checkbox"],' +
-                                            '[role="checkbox"]'
-                                          )
-                                        );
-                                } catch (_) {}
-
-                                if (!semanticCheckbox) {
-                                  return null;
-                                }
-
-                                let hostRect = null;
-
-                                try {
-                                  hostRect =
-                                    element.getBoundingClientRect();
-                                } catch (_) {}
-
-                                // 1) Semantic checkbox itself.
-                                try {
-                                  const ownRect =
-                                    semanticCheckbox
-                                      .getBoundingClientRect();
-
-                                  if (
-                                    plausibleVisualCheckboxRect(
-                                      ownRect
-                                    )
-                                  ) {
-                                    return {
-                                      rect: ownRect,
-                                      strategy:
-                                        "semantic-checkbox"
-                                    };
-                                  }
-                                } catch (_) {}
-
-                                /*
-                                 * 2) Small square DOM descendants.
-                                 *
-                                 * Some Turnstile builds put role=checkbox on a
-                                 * wide LABEL/container while a child SPAN/DIV
-                                 * is the actual drawn square.
-                                 */
-                                const descendantCandidates = [];
-
-                                const collectSmallDescendants =
-                                  root => {
-                                    if (!root) return;
-
-                                    let descendants = [];
-
-                                    try {
-                                      descendants =
-                                        root.querySelectorAll("*");
-                                    } catch (_) {}
-
-                                    for (
-                                      const descendant of descendants
-                                    ) {
-                                      if (
-                                        !visibleTurnstileElement(
-                                          descendant
-                                        )
-                                      ) {
-                                        continue;
-                                      }
-
-                                      let descendantRect;
-
-                                      try {
-                                        descendantRect =
-                                          descendant
-                                            .getBoundingClientRect();
-                                      } catch (_) {
-                                        continue;
-                                      }
-
-                                      if (
-                                        !plausibleVisualCheckboxRect(
-                                          descendantRect
-                                        )
-                                      ) {
-                                        continue;
-                                      }
-
-                                      if (hostRect) {
-                                        const centerX =
-                                          descendantRect.left +
-                                          descendantRect.width / 2;
-                                        const centerY =
-                                          descendantRect.top +
-                                          descendantRect.height / 2;
-
-                                        const insideHost =
-                                          centerX >=
-                                            hostRect.left - 2 &&
-                                          centerX <=
-                                            hostRect.right + 2 &&
-                                          centerY >=
-                                            hostRect.top - 2 &&
-                                          centerY <=
-                                            hostRect.bottom + 2;
-
-                                        if (!insideHost) {
-                                          continue;
-                                        }
-                                      }
-
-                                      const squarePenalty =
-                                        Math.abs(
-                                          descendantRect.width -
-                                          descendantRect.height
-                                        );
-
-                                      const leftPenalty =
-                                        hostRect
-                                          ? Math.abs(
-                                              descendantRect.left -
-                                              hostRect.left
-                                            )
-                                          : 0;
-
-                                      const sizePenalty =
-                                        Math.abs(
-                                          Math.max(
-                                            descendantRect.width,
-                                            descendantRect.height
-                                          ) - 24
-                                        );
-
-                                      descendantCandidates.push({
-                                        rect:
-                                          descendantRect,
-                                        strategy:
-                                          "small-descendant",
-                                        score:
-                                          leftPenalty * 3 +
-                                          squarePenalty * 2 +
-                                          sizePenalty
-                                      });
-                                    }
-                                  };
-
-                                collectSmallDescendants(
-                                  semanticCheckbox
-                                );
-
-                                if (
-                                  element !== semanticCheckbox
-                                ) {
-                                  collectSmallDescendants(
-                                    element
-                                  );
-                                }
-
-                                if (
-                                  descendantCandidates.length
-                                ) {
-                                  descendantCandidates.sort(
-                                    (a, b) =>
-                                      a.score - b.score
-                                  );
-
-                                  return (
-                                    descendantCandidates[0]
-                                  );
-                                }
-
-                                /*
-                                 * 3) ::before / ::after pseudo-element.
-                                 *
-                                 * Turnstile can draw the square through CSS on
-                                 * a wide semantic checkbox/label. We only accept
-                                 * a pseudo-element whose declared dimensions
-                                 * look like a checkbox.
-                                 */
-                                const pseudoHosts = [];
-
-                                if (semanticCheckbox) {
-                                  pseudoHosts.push(
-                                    semanticCheckbox
-                                  );
-                                }
-
-                                if (
-                                  element &&
-                                  element !== semanticCheckbox
-                                ) {
-                                  pseudoHosts.push(element);
-                                }
-
-                                for (const host of pseudoHosts) {
-                                  let hostBox;
-
-                                  try {
-                                    hostBox =
-                                      host
-                                        .getBoundingClientRect();
-                                  } catch (_) {
-                                    continue;
-                                  }
-
-                                  for (
-                                    const pseudo of [
-                                      "::before",
-                                      "::after"
-                                    ]
-                                  ) {
-                                    let style;
-
-                                    try {
-                                      style =
-                                        getComputedStyle(
-                                          host,
-                                          pseudo
-                                        );
-                                    } catch (_) {
-                                      continue;
-                                    }
-
-                                    if (!style) continue;
-
-                                    const pseudoWidth =
-                                      parseFloat(
-                                        style.width
-                                      );
-                                    const pseudoHeight =
-                                      parseFloat(
-                                        style.height
-                                      );
-
-                                    if (
-                                      !Number.isFinite(
-                                        pseudoWidth
-                                      ) ||
-                                      !Number.isFinite(
-                                        pseudoHeight
-                                      )
-                                    ) {
-                                      continue;
-                                    }
-
-                                    const pseudoRectCandidate =
-                                      rectObject(
-                                        0,
-                                        0,
-                                        pseudoWidth,
-                                        pseudoHeight
-                                      );
-
-                                    if (
-                                      !plausibleVisualCheckboxRect(
-                                        pseudoRectCandidate
-                                      )
-                                    ) {
-                                      continue;
-                                    }
-
-                                    const parsedLeft =
-                                      parseFloat(
-                                        style.left
-                                      );
-                                    const parsedTop =
-                                      parseFloat(
-                                        style.top
-                                      );
-
-                                    const left =
-                                      hostBox.left +
-                                      (
-                                        Number.isFinite(
-                                          parsedLeft
-                                        )
-                                          ? parsedLeft
-                                          : 0
-                                      );
-
-                                    const top =
-                                      Number.isFinite(
-                                        parsedTop
-                                      )
-                                        ? hostBox.top +
-                                          parsedTop
-                                        : hostBox.top +
-                                          (
-                                            hostBox.height -
-                                            pseudoHeight
-                                          ) / 2;
-
-                                    const resolvedRect =
-                                      rectObject(
-                                        left,
-                                        top,
-                                        pseudoWidth,
-                                        pseudoHeight
-                                      );
-
-                                    if (
-                                      plausibleVisualCheckboxRect(
-                                        resolvedRect
-                                      )
-                                    ) {
-                                      return {
-                                        rect:
-                                          resolvedRect,
-                                        strategy:
-                                          pseudo === "::before"
-                                            ? "pseudo-before"
-                                            : "pseudo-after"
-                                      };
-                                    }
-                                  }
-                                }
-
-                                return null;
-                              };
-
                             const requestTurnstileNativeTap =
                               element => {
                                 if (
@@ -2782,157 +2390,222 @@ object AfterDarkProofWebView {
                                   return false;
                                 }
 
-                                const visualBoxNow =
-                                  resolveVisualCheckboxBox(
-                                    element
-                                  );
+                                let x =
+                                  rect.left +
+                                  rect.width / 2;
+                                let y =
+                                  rect.top +
+                                  rect.height / 2;
+                                let tapStrategy =
+                                  "element-center";
+                                let forceLeftZone = false;
 
-                                if (!visualBoxNow) {
-                                  turnstileDebug(
-                                    "CANDIDAT sans boite visuelle checkbox: " +
-                                    "aucun clic"
-                                  );
-                                  return false;
-                                }
+                                const elementTag =
+                                  String(
+                                    element.tagName || ""
+                                  ).toLowerCase();
 
-                                turnstileDebug(
-                                  "CHECKBOX VISUELLE detectee " +
-                                  "strategy=" +
-                                  visualBoxNow.strategy +
-                                  " rect=" +
-                                  [
-                                    visualBoxNow.rect.left,
-                                    visualBoxNow.rect.top,
-                                    visualBoxNow.rect.width,
-                                    visualBoxNow.rect.height
-                                  ]
-                                    .map(value =>
-                                      Number(value)
-                                        .toFixed(3)
-                                    )
-                                    .join(",")
-                                );
-
-                                const dispatchDelayMs =
-                                  100 +
-                                  Math.floor(
-                                    Math.random() * 51
-                                  );
-
-                                turnstileDebug(
-                                  "CANDIDAT delai avant tap=" +
-                                  String(dispatchDelayMs) +
-                                  "ms"
-                                );
-
-                                setTimeout(
-                                  () => {
-                                    if (
-                                      !element ||
-                                      !element.isConnected ||
-                                      !visibleTurnstileElement(
-                                        element
+                                /*
+                                 * Trust a checkbox rectangle only when it
+                                 * actually resembles a checkbox.
+                                 *
+                                 * Cloudflare can expose a checkbox/role whose
+                                 * bounding box is really the entire LABEL.
+                                 * Example seen in Logcat:
+                                 *   8.67,20.50,221.72,24.00
+                                 *
+                                 * That must NOT cancel the click. It explicitly
+                                 * falls back to the left checkbox zone.
+                                 */
+                                try {
+                                  const checkbox =
+                                    (
+                                      element.matches &&
+                                      element.matches(
+                                        'input[type="checkbox"],' +
+                                        '[role="checkbox"]'
                                       )
-                                    ) {
-                                      turnstileDebug(
-                                        "CANDIDAT annule apres delai: " +
-                                        "controle disparu"
-                                      );
-                                      return;
-                                    }
-
-                                    /*
-                                     * Re-resolve after the random wait. If the
-                                     * widget has shifted/re-rendered, click the
-                                     * CURRENT visual checkbox center, not stale
-                                     * coordinates.
-                                     */
-                                    const visualBox =
-                                      resolveVisualCheckboxBox(
-                                        element
-                                      );
-
-                                    if (!visualBox) {
-                                      turnstileDebug(
-                                        "CANDIDAT annule apres delai: " +
-                                        "plus de boite visuelle checkbox"
-                                      );
-                                      return;
-                                    }
-
-                                    const centerX =
-                                      visualBox.rect.left +
-                                      visualBox.rect.width / 2;
-                                    const centerY =
-                                      visualBox.rect.top +
-                                      visualBox.rect.height / 2;
-
-                                    // Independent FLOAT jitter in [-2, +2].
-                                    const jitterX =
-                                      Math.random() * 4 - 2;
-                                    const jitterY =
-                                      Math.random() * 4 - 2;
-
-                                    const x =
-                                      centerX + jitterX;
-                                    const y =
-                                      centerY + jitterY;
-
-                                    turnstileDebug(
-                                      "CANDIDAT " +
-                                      describeTurnstile(
-                                        element
-                                      ) +
-                                      " strategy=" +
-                                      visualBox.strategy +
-                                      "-center-jitter " +
-                                      "checkboxCenter=" +
-                                      centerX.toFixed(3) +
-                                      "," +
-                                      centerY.toFixed(3) +
-                                      " jitter=" +
-                                      jitterX.toFixed(3) +
-                                      "," +
-                                      jitterY.toFixed(3) +
-                                      " tap=" +
-                                      x.toFixed(3) +
-                                      "," +
-                                      y.toFixed(3)
-                                    );
-
-                                    try {
-                                      window.AfterDarkNative
-                                        .turnstileFrameCandidate(
-                                          x,
-                                          y,
-                                          Number(
-                                            window.innerWidth
-                                          ),
-                                          Number(
-                                            window.innerHeight
-                                          ),
-                                          String(
-                                            location.href || ""
+                                    )
+                                      ? element
+                                      : (
+                                          element.querySelector &&
+                                          element.querySelector(
+                                            'input[type="checkbox"],' +
+                                            '[role="checkbox"]'
                                           )
                                         );
 
+                                  if (checkbox) {
+                                    const checkboxRect =
+                                      checkbox
+                                        .getBoundingClientRect();
+
+                                    const plausibleCheckbox =
+                                      checkboxRect.width >= 8 &&
+                                      checkboxRect.height >= 8 &&
+                                      checkboxRect.width <= 64 &&
+                                      checkboxRect.height <= 64;
+
+                                    if (plausibleCheckbox) {
+                                      x =
+                                        checkboxRect.left +
+                                        checkboxRect.width / 2;
+                                      y =
+                                        checkboxRect.top +
+                                        checkboxRect.height / 2;
+                                      tapStrategy =
+                                        "real-checkbox-center";
+                                    } else {
+                                      forceLeftZone = true;
+
                                       turnstileDebug(
-                                        "CANDIDAT envoye au bridge Android " +
-                                        "apres " +
-                                        String(dispatchDelayMs) +
-                                        "ms"
-                                      );
-                                    } catch (error) {
-                                      turnstileDebug(
-                                        "bridge candidat erreur " +
-                                        String(error || "")
+                                        "Checkbox rectangle non plausible: " +
+                                        [
+                                          checkboxRect.x,
+                                          checkboxRect.y,
+                                          checkboxRect.width,
+                                          checkboxRect.height
+                                        ]
+                                          .map(value =>
+                                            Number(value)
+                                              .toFixed(2)
+                                          )
+                                          .join(",") +
+                                        " -> fallback zone gauche"
                                       );
                                     }
-                                  },
-                                  dispatchDelayMs
+                                  }
+                                } catch (error) {
+                                  forceLeftZone = true;
+
+                                  turnstileDebug(
+                                    "Checkbox geometry erreur -> " +
+                                    "fallback zone gauche: " +
+                                    String(error || "")
+                                  );
+                                }
+
+                                /*
+                                 * When the candidate is a LABEL, or when the
+                                 * checkbox geometry was rejected, target the
+                                 * left-side checkbox zone instead of the wide
+                                 * label center.
+                                 */
+                                if (
+                                  tapStrategy ===
+                                    "element-center" &&
+                                  (
+                                    elementTag === "label" ||
+                                    forceLeftZone
+                                  )
+                                ) {
+                                  let targetRect = rect;
+
+                                  // Prefer an enclosing label when the candidate
+                                  // itself is a large checkbox/role element.
+                                  if (
+                                    elementTag !== "label" &&
+                                    element.closest
+                                  ) {
+                                    try {
+                                      const label =
+                                        element.closest("label");
+
+                                      if (label) {
+                                        const labelRect =
+                                          label
+                                            .getBoundingClientRect();
+
+                                        if (
+                                          labelRect.width > 0 &&
+                                          labelRect.height > 0
+                                        ) {
+                                          targetRect =
+                                            labelRect;
+                                        }
+                                      }
+                                    } catch (_) {}
+                                  }
+
+                                  /*
+                                   * Runtime example:
+                                   * label rect = 8.67,20.5,221.72,24
+                                   *
+                                   * This gives approximately:
+                                   * x = 21.87
+                                   * y = 34.42
+                                   */
+                                  const leftInset =
+                                    Math.max(
+                                      10,
+                                      Math.min(
+                                        18,
+                                        targetRect.height *
+                                          0.55
+                                      )
+                                    );
+
+                                  x =
+                                    targetRect.left +
+                                    Math.min(
+                                      leftInset,
+                                      Math.max(
+                                        1,
+                                        targetRect.width - 1
+                                      )
+                                    );
+
+                                  y =
+                                    targetRect.top +
+                                    targetRect.height * 0.58;
+
+                                  tapStrategy =
+                                    forceLeftZone
+                                      ? "rejected-checkbox-left-zone"
+                                      : "label-checkbox-zone";
+                                }
+
+                                turnstileDebug(
+                                  "CANDIDAT " +
+                                  describeTurnstile(
+                                    element
+                                  ) +
+                                  " strategy=" +
+                                  tapStrategy +
+                                  " tap=" +
+                                  x.toFixed(2) +
+                                  "," +
+                                  y.toFixed(2)
                                 );
 
-                                return true;
+                                try {
+                                  window.AfterDarkNative
+                                    .turnstileFrameCandidate(
+                                      x,
+                                      y,
+                                      Number(
+                                        window.innerWidth
+                                      ),
+                                      Number(
+                                        window.innerHeight
+                                      ),
+                                      String(
+                                        location.href || ""
+                                      )
+                                    );
+
+                                  turnstileDebug(
+                                    "CANDIDAT envoye au bridge Android"
+                                  );
+
+                                  return true;
+                                } catch (error) {
+                                  turnstileDebug(
+                                    "bridge candidat erreur " +
+                                    String(error || "")
+                                  );
+                                  return false;
+                                }
                               };
 
                             let lastTurnstileSummary = "";
