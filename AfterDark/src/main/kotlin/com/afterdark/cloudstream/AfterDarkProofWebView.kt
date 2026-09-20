@@ -499,6 +499,20 @@ object AfterDarkProofWebView {
                 source: String?,
                 details: String?,
             ) {
+                val normalizedCode = code.orEmpty().trim()
+
+                // Strict policy: only Cloudflare/Turnstile error 600010 is
+                // allowed to reload the verification page.
+                if (normalizedCode != "600010") {
+                    Log.i(
+                        TAG,
+                        "Signal Cloudflare ignoré (pas de reload): " +
+                            "code=$normalizedCode source=${source.orEmpty()} " +
+                            "details=${details.orEmpty().take(500)}",
+                    )
+                    return
+                }
+
                 if (
                     finished.get() ||
                     officialPlayerMode.get() ||
@@ -507,8 +521,8 @@ object AfterDarkProofWebView {
 
                 Log.w(
                     TAG,
-                    "Erreur Cloudflare détectée, reload: " +
-                        "code=${code.orEmpty()} source=${source.orEmpty()} " +
+                    "Erreur Cloudflare 600010 détectée, reload: " +
+                        "source=${source.orEmpty()} " +
                         "details=${details.orEmpty().take(500)}",
                 )
 
@@ -1565,20 +1579,38 @@ object AfterDarkProofWebView {
                               source,
                               details
                             ) => {
-                              try {
-                                let serialized = "";
-                                if (typeof details === "string") {
-                                  serialized = details;
-                                } else {
-                                  try {
-                                    serialized = JSON.stringify(details);
-                                  } catch (_) {
-                                    serialized = String(details || "");
-                                  }
-                                }
+                              const normalizedCode =
+                                String(code || "").trim();
 
+                              let serialized = "";
+                              if (typeof details === "string") {
+                                serialized = details;
+                              } else {
+                                try {
+                                  serialized = JSON.stringify(details);
+                                } catch (_) {
+                                  serialized = String(details || "");
+                                }
+                              }
+
+                              // Strict reload policy: only exact error 600010.
+                              if (normalizedCode !== "600010") {
+                                try {
+                                  window.AfterDarkNative.turnstileDebug(
+                                    "Signal Cloudflare ignore code=" +
+                                    normalizedCode +
+                                    " source=" +
+                                    String(source || "") +
+                                    " details=" +
+                                    serialized.slice(0, 500)
+                                  );
+                                } catch (_) {}
+                                return;
+                              }
+
+                              try {
                                 window.AfterDarkNative.cloudflareError(
-                                  String(code || ""),
+                                  "600010",
                                   String(source || ""),
                                   serialized.slice(0, 2000)
                                 );
@@ -1599,7 +1631,10 @@ object AfterDarkProofWebView {
 
                                 const code = extractCloudflareCode(text);
 
-                                if (looksLikeTurnstile && code) {
+                                if (
+                                  looksLikeTurnstile &&
+                                  code === "600010"
+                                ) {
                                   reportCloudflareError(
                                     code,
                                     "window.error",
@@ -1618,11 +1653,12 @@ object AfterDarkProofWebView {
                                 typeof src === "string" &&
                                 src.includes("challenges.cloudflare.com")
                               ) {
-                                reportCloudflareError(
-                                  "RESOURCE_LOAD_ERROR",
-                                  "resource-error",
-                                  src
-                                );
+                                try {
+                                  window.AfterDarkNative.turnstileDebug(
+                                    "Resource Cloudflare en erreur ignoree: " +
+                                    src.slice(0, 500)
+                                  );
+                                } catch (_) {}
                               }
                             }, true);
 
@@ -1640,7 +1676,7 @@ object AfterDarkProofWebView {
                                 const code = extractCloudflareCode(text);
 
                                 if (
-                                  code &&
+                                  code === "600010" &&
                                   /cloudflare|turnstile/i.test(text)
                                 ) {
                                   reportCloudflareError(
@@ -1663,7 +1699,7 @@ object AfterDarkProofWebView {
                               const code =
                                 extractCloudflareCode(event.data);
 
-                              if (code) {
+                              if (code === "600010") {
                                 reportCloudflareError(
                                   code,
                                   "cloudflare-postMessage",
