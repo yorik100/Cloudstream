@@ -2398,7 +2398,6 @@ object AfterDarkProofWebView {
                                   rect.height / 2;
                                 let tapStrategy =
                                   "element-center";
-                                let forceLeftZone = false;
 
                                 const elementTag =
                                   String(
@@ -2406,163 +2405,299 @@ object AfterDarkProofWebView {
                                   ).toLowerCase();
 
                                 /*
-                                 * Trust a checkbox rectangle only when it
-                                 * actually resembles a checkbox.
+                                 * Fully geometry-driven checkbox targeting.
                                  *
-                                 * Cloudflare can expose a checkbox/role whose
-                                 * bounding box is really the entire LABEL.
-                                 * Example seen in Logcat:
-                                 *   8.67,20.50,221.72,24.00
+                                 * No fixed X/Y coordinate and no absolute
+                                 * checkbox size threshold is used.
                                  *
-                                 * That must NOT cancel the click. It explicitly
-                                 * falls back to the left checkbox zone.
+                                 * We first resolve the label rectangle, then
+                                 * search its descendants for the visual box
+                                 * whose geometry best matches a checkbox:
+                                 * - square-ish
+                                 * - close to the label height
+                                 * - vertically centered
+                                 * - towards the left edge
+                                 *
+                                 * All scores are dimensionless ratios, so the
+                                 * result scales with CSS zoom, screen density,
+                                 * emulator resolution and iframe resizing.
                                  */
+                                let labelElement = null;
+
                                 try {
-                                  const checkbox =
-                                    (
-                                      element.matches &&
-                                      element.matches(
-                                        'input[type="checkbox"],' +
-                                        '[role="checkbox"]'
-                                      )
-                                    )
-                                      ? element
-                                      : (
-                                          element.querySelector &&
-                                          element.querySelector(
-                                            'input[type="checkbox"],' +
-                                            '[role="checkbox"]'
-                                          )
-                                        );
+                                  if (elementTag === "label") {
+                                    labelElement = element;
+                                  } else if (element.closest) {
+                                    labelElement =
+                                      element.closest("label");
+                                  }
+                                } catch (_) {}
 
-                                  if (checkbox) {
-                                    const checkboxRect =
-                                      checkbox
-                                        .getBoundingClientRect();
+                                const labelRect = (() => {
+                                  try {
+                                    if (labelElement) {
+                                      const value =
+                                        labelElement
+                                          .getBoundingClientRect();
 
-                                    const plausibleCheckbox =
-                                      checkboxRect.width >= 8 &&
-                                      checkboxRect.height >= 8 &&
-                                      checkboxRect.width <= 64 &&
-                                      checkboxRect.height <= 64;
+                                      if (
+                                        value.width > 0 &&
+                                        value.height > 0
+                                      ) {
+                                        return value;
+                                      }
+                                    }
+                                  } catch (_) {}
 
-                                    if (plausibleCheckbox) {
-                                      x =
-                                        checkboxRect.left +
-                                        checkboxRect.width / 2;
-                                      y =
-                                        checkboxRect.top +
-                                        checkboxRect.height / 2;
-                                      tapStrategy =
-                                        "real-checkbox-center";
-                                    } else {
-                                      forceLeftZone = true;
+                                  return rect;
+                                })();
 
-                                      turnstileDebug(
-                                        "Checkbox rectangle non plausible: " +
-                                        [
-                                          checkboxRect.x,
-                                          checkboxRect.y,
-                                          checkboxRect.width,
-                                          checkboxRect.height
-                                        ]
-                                          .map(value =>
-                                            Number(value)
-                                              .toFixed(2)
-                                          )
-                                          .join(",") +
-                                        " -> fallback zone gauche"
+                                const labelWidth =
+                                  Math.max(
+                                    Number.EPSILON,
+                                    labelRect.width
+                                  );
+                                const labelHeight =
+                                  Math.max(
+                                    Number.EPSILON,
+                                    labelRect.height
+                                  );
+                                const labelCenterY =
+                                  labelRect.top +
+                                  labelRect.height / 2;
+
+                                let bestVisualBox = null;
+                                let bestVisualScore =
+                                  Number.POSITIVE_INFINITY;
+
+                                try {
+                                  const geometryCandidates = [];
+
+                                  if (labelElement) {
+                                    geometryCandidates.push(
+                                      labelElement
+                                    );
+
+                                    for (
+                                      const child of
+                                        labelElement
+                                          .querySelectorAll("*")
+                                    ) {
+                                      geometryCandidates.push(
+                                        child
                                       );
+                                    }
+                                  } else {
+                                    geometryCandidates.push(
+                                      element
+                                    );
+
+                                    if (element.querySelectorAll) {
+                                      for (
+                                        const child of
+                                          element
+                                            .querySelectorAll("*")
+                                      ) {
+                                        geometryCandidates.push(
+                                          child
+                                        );
+                                      }
+                                    }
+                                  }
+
+                                  for (
+                                    const candidateBox of
+                                      geometryCandidates
+                                  ) {
+                                    let candidateRect;
+
+                                    try {
+                                      candidateRect =
+                                        candidateBox
+                                          .getBoundingClientRect();
+                                    } catch (_) {
+                                      continue;
+                                    }
+
+                                    if (
+                                      candidateRect.width <= 0 ||
+                                      candidateRect.height <= 0
+                                    ) {
+                                      continue;
+                                    }
+
+                                    /*
+                                     * Ignore anything whose box is effectively
+                                     * the whole label. Comparison is relative,
+                                     * not pixel-based.
+                                     */
+                                    const widthFraction =
+                                      candidateRect.width /
+                                      labelWidth;
+                                    const heightFraction =
+                                      candidateRect.height /
+                                      labelHeight;
+
+                                    if (
+                                      widthFraction > 0.8 &&
+                                      heightFraction > 0.8
+                                    ) {
+                                      continue;
+                                    }
+
+                                    const centerX =
+                                      candidateRect.left +
+                                      candidateRect.width / 2;
+                                    const centerY =
+                                      candidateRect.top +
+                                      candidateRect.height / 2;
+
+                                    /*
+                                     * Dimensionless score:
+                                     *
+                                     * squareError:
+                                     *   0 when width == height
+                                     *
+                                     * sizeError:
+                                     *   0 when box height == label height
+                                     *
+                                     * verticalError:
+                                     *   0 when vertically centered
+                                     *
+                                     * leftError:
+                                     *   0 at label's left edge
+                                     */
+                                    const squareError =
+                                      Math.abs(
+                                        Math.log(
+                                          candidateRect.width /
+                                          candidateRect.height
+                                        )
+                                      );
+
+                                    const sizeError =
+                                      Math.abs(
+                                        Math.log(
+                                          candidateRect.height /
+                                          labelHeight
+                                        )
+                                      );
+
+                                    const verticalError =
+                                      Math.abs(
+                                        centerY -
+                                        labelCenterY
+                                      ) /
+                                      labelHeight;
+
+                                    const leftError =
+                                      Math.max(
+                                        0,
+                                        centerX -
+                                        labelRect.left
+                                      ) /
+                                      labelWidth;
+
+                                    const score =
+                                      squareError * 2 +
+                                      sizeError +
+                                      verticalError +
+                                      leftError;
+
+                                    if (
+                                      Number.isFinite(score) &&
+                                      score <
+                                        bestVisualScore
+                                    ) {
+                                      bestVisualScore = score;
+                                      bestVisualBox =
+                                        candidateRect;
                                     }
                                   }
                                 } catch (error) {
-                                  forceLeftZone = true;
-
                                   turnstileDebug(
-                                    "Checkbox geometry erreur -> " +
-                                    "fallback zone gauche: " +
+                                    "Recherche geometry dynamique erreur: " +
                                     String(error || "")
                                   );
                                 }
 
-                                /*
-                                 * When the candidate is a LABEL, or when the
-                                 * checkbox geometry was rejected, target the
-                                 * left-side checkbox zone instead of the wide
-                                 * label center.
-                                 */
-                                if (
-                                  tapStrategy ===
-                                    "element-center" &&
-                                  (
-                                    elementTag === "label" ||
-                                    forceLeftZone
-                                  )
-                                ) {
-                                  let targetRect = rect;
+                                if (bestVisualBox) {
+                                  x =
+                                    bestVisualBox.left +
+                                    bestVisualBox.width / 2;
+                                  y =
+                                    bestVisualBox.top +
+                                    bestVisualBox.height / 2;
+                                  tapStrategy =
+                                    "dynamic-visual-box-center";
 
-                                  // Prefer an enclosing label when the candidate
-                                  // itself is a large checkbox/role element.
-                                  if (
-                                    elementTag !== "label" &&
-                                    element.closest
-                                  ) {
-                                    try {
-                                      const label =
-                                        element.closest("label");
-
-                                      if (label) {
-                                        const labelRect =
-                                          label
-                                            .getBoundingClientRect();
-
-                                        if (
-                                          labelRect.width > 0 &&
-                                          labelRect.height > 0
-                                        ) {
-                                          targetRect =
-                                            labelRect;
-                                        }
-                                      }
-                                    } catch (_) {}
-                                  }
-
-                                  /*
-                                   * Runtime example:
-                                   * label rect = 8.67,20.5,221.72,24
-                                   *
-                                   * This gives approximately:
-                                   * x = 21.87
-                                   * y = 34.42
-                                   */
-                                  const leftInset =
-                                    Math.max(
-                                      10,
-                                      Math.min(
-                                        18,
-                                        targetRect.height *
-                                          0.55
+                                  turnstileDebug(
+                                    "Case visuelle dynamique: " +
+                                    [
+                                      bestVisualBox.x,
+                                      bestVisualBox.y,
+                                      bestVisualBox.width,
+                                      bestVisualBox.height
+                                    ]
+                                      .map(value =>
+                                        Number(value)
+                                          .toFixed(2)
                                       )
+                                      .join(",") +
+                                    " score=" +
+                                    bestVisualScore.toFixed(4)
+                                  );
+                                } else if (
+                                  labelRect.width > 0 &&
+                                  labelRect.height > 0
+                                ) {
+                                  /*
+                                   * Pure layout fallback.
+                                   *
+                                   * The checkbox region is inferred as a square
+                                   * whose side is the current label height.
+                                   * Its center therefore depends only on the
+                                   * measured layout:
+                                   *
+                                   * x = label.left + label.height / 2
+                                   * y = label.top  + label.height / 2
+                                   *
+                                   * No pixel coordinate is hardcoded.
+                                   */
+                                  const inferredSide =
+                                    Math.min(
+                                      labelRect.height,
+                                      labelRect.width
                                     );
 
                                   x =
-                                    targetRect.left +
-                                    Math.min(
-                                      leftInset,
-                                      Math.max(
-                                        1,
-                                        targetRect.width - 1
-                                      )
-                                    );
+                                    labelRect.left +
+                                    inferredSide / 2;
 
                                   y =
-                                    targetRect.top +
-                                    targetRect.height * 0.58;
+                                    labelRect.top +
+                                    labelRect.height / 2;
 
                                   tapStrategy =
-                                    forceLeftZone
-                                      ? "rejected-checkbox-left-zone"
-                                      : "label-checkbox-zone";
+                                    "dynamic-label-square-center";
+
+                                  turnstileDebug(
+                                    "Case déduite dynamiquement du label: " +
+                                    "label=" +
+                                    [
+                                      labelRect.x,
+                                      labelRect.y,
+                                      labelRect.width,
+                                      labelRect.height
+                                    ]
+                                      .map(value =>
+                                        Number(value)
+                                          .toFixed(2)
+                                      )
+                                      .join(",") +
+                                    " inferredSide=" +
+                                    inferredSide.toFixed(2)
+                                  );
                                 }
 
                                 turnstileDebug(
