@@ -51,7 +51,6 @@ object AfterDarkProofWebView {
         val officialPlayerMode = AtomicBoolean(false)
         val sourceFailoverInProgress = AtomicBoolean(false)
         val preferredSourceSelectionDone = AtomicBoolean(false)
-        val playbackControlsHidden = AtomicBoolean(false)
         val mediaCaptureArmed = AtomicBoolean(false)
         val currentFallbackService = AtomicReference<String?>(null)
         val emptyOfficialResponse = AtomicReference<CapturedSourceResponse?>(null)
@@ -713,15 +712,11 @@ object AfterDarkProofWebView {
                 )
             }
 
-            fun hideOfficialControlsAfterPlay() {
-                if (
-                    !officialPlayerMode.get() ||
-                    finished.get() ||
-                    !playbackControlsHidden.compareAndSet(false, true)
-                ) return
+            fun hideOfficialPeachifyControls() {
+                if (finished.get()) return
 
                 browser.post {
-                    if (finished.get() || !officialPlayerMode.get()) return@post
+                    if (finished.get()) return@post
 
                     browser.evaluateJavascript(
                         """
@@ -733,47 +728,87 @@ object AfterDarkProofWebView {
                               .toLocaleLowerCase("fr-FR");
 
                           const hide = element => {
-                            if (!element) return;
+                            if (!element) return false;
+
                             element.style.setProperty(
                               "display",
                               "none",
                               "important"
                             );
                             element.setAttribute(
-                              "data-afterdark-hidden-after-play",
+                              "data-afterdark-hidden-peachify",
                               "true"
                             );
+                            return true;
                           };
 
-                          const buttons = Array.from(
-                            document.querySelectorAll("button")
-                          );
+                          const hideControls = () => {
+                            let changed = false;
 
-                          const back = buttons.find(button =>
-                            normalize(button.getAttribute("aria-label")) ===
-                              "retour"
-                          );
+                            const interactive = Array.from(
+                              document.querySelectorAll(
+                                'button,a,[role="button"]'
+                              )
+                            );
 
-                          const sources = buttons.find(button =>
-                            normalize(button.textContent) === "sources"
-                          );
+                            for (const element of interactive) {
+                              const text = normalize(
+                                element.textContent
+                              );
+                              const aria = normalize(
+                                element.getAttribute("aria-label")
+                              );
 
-                          // If they share the exact AfterDark toolbar wrapper,
-                          // hide the wrapper. Otherwise hide both controls.
-                          //
-                          // They remain in the DOM intentionally: the fallback
-                          // controller can still trigger Sources.click() later
-                          // if the current provider exposes "Go Back".
+                              const isSources =
+                                text === "sources" ||
+                                aria === "sources";
+
+                              const isBack =
+                                text === "back" ||
+                                text === "retour" ||
+                                aria === "back" ||
+                                aria === "retour";
+
+                              if (isSources || isBack) {
+                                changed =
+                                  hide(element) ||
+                                  changed;
+                              }
+                            }
+
+                            return changed;
+                          };
+
+                          // Peachify cleanup is unconditional:
+                          // hide now, then keep the controls hidden if React
+                          // recreates them.
+                          hideControls();
+
                           if (
-                            back &&
-                            sources &&
-                            back.parentElement &&
-                            back.parentElement === sources.parentElement
+                            !window.__afterdarkPeachifyControlsObserver
                           ) {
-                            hide(back.parentElement);
-                          } else {
-                            hide(back);
-                            hide(sources);
+                            const observer =
+                              new MutationObserver(() => {
+                                hideControls();
+                              });
+
+                            observer.observe(
+                              document.documentElement,
+                              {
+                                childList: true,
+                                subtree: true,
+                                characterData: true,
+                                attributes: true,
+                                attributeFilter: [
+                                  "class",
+                                  "style",
+                                  "aria-label"
+                                ]
+                              }
+                            );
+
+                            window.__afterdarkPeachifyControlsObserver =
+                              observer;
                           }
                         })();
                         """.trimIndent(),
@@ -1129,7 +1164,7 @@ object AfterDarkProofWebView {
                     @JavascriptInterface
                     fun playClicked() {
                         handler.post {
-                            hideOfficialControlsAfterPlay()
+                            hideOfficialPeachifyControls()
                         }
                     }
 
@@ -1158,6 +1193,13 @@ object AfterDarkProofWebView {
                                 TAG,
                                 "Source AfterDark préférée sélectionnée: ${service.orEmpty()}",
                             )
+
+                            if (
+                                service.isNullOrBlank() ||
+                                service.equals("peachify", ignoreCase = true)
+                            ) {
+                                hideOfficialPeachifyControls()
+                            }
                         }
                     }
 
@@ -1180,6 +1222,10 @@ object AfterDarkProofWebView {
                                 TAG,
                                 "AfterDark a sélectionné la source suivante: ${service.orEmpty()}",
                             )
+
+                            if (service.equals("peachify", ignoreCase = true)) {
+                                hideOfficialPeachifyControls()
+                            }
                         }
                     }
 
