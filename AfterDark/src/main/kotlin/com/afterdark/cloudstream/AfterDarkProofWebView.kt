@@ -449,8 +449,20 @@ object AfterDarkProofWebView {
 
                     down.recycle()
 
-                    // The successful desktop trace had ~46 ms between
-                    // trusted pointerdown and pointerup.
+                    // Random native press duration in the requested
+                    // 50..70 ms range, inclusive.
+                    val nativePressDurationMs =
+                        kotlin.random.Random.nextLong(
+                            from = 50L,
+                            until = 71L,
+                        )
+
+                    Log.i(
+                        TAG,
+                        "Durée tap Turnstile DOWN→UP=" +
+                            "${nativePressDurationMs}ms",
+                    )
+
                     browser.postDelayed(
                         {
                             val upTime = SystemClock.uptimeMillis()
@@ -489,7 +501,7 @@ object AfterDarkProofWebView {
                                 650L,
                             )
                         },
-                        46L,
+                        nativePressDurationMs,
                     )
                 }
             }
@@ -2386,24 +2398,10 @@ object AfterDarkProofWebView {
                                   return false;
                                 }
 
-                                let x =
-                                  rect.left +
-                                  rect.width / 2;
-                                let y =
-                                  rect.top +
-                                  rect.height / 2;
-                                let tapStrategy =
-                                  "element-center";
+                                let checkbox = null;
 
-                                /*
-                                 * Use a real checkbox rectangle only when it
-                                 * actually looks like a checkbox. v82 logged a
-                                 * descendant checkbox whose rect covered the
-                                 * whole 221 px label, so blindly trusting it
-                                 * still targeted x=119.
-                                 */
                                 try {
-                                  const checkbox =
+                                  checkbox =
                                     (
                                       element.matches &&
                                       element.matches(
@@ -2419,116 +2417,151 @@ object AfterDarkProofWebView {
                                             '[role="checkbox"]'
                                           )
                                         );
-
-                                  if (checkbox) {
-                                    const checkboxRect =
-                                      checkbox
-                                        .getBoundingClientRect();
-
-                                    const plausibleCheckbox =
-                                      checkboxRect.width >= 8 &&
-                                      checkboxRect.height >= 8 &&
-                                      checkboxRect.width <= 64 &&
-                                      checkboxRect.height <= 64;
-
-                                    if (plausibleCheckbox) {
-                                      x =
-                                        checkboxRect.left +
-                                        checkboxRect.width / 2;
-                                      y =
-                                        checkboxRect.top +
-                                        checkboxRect.height / 2;
-                                      tapStrategy =
-                                        "real-checkbox-center";
-                                    }
-                                  }
                                 } catch (_) {}
 
-                                if (
-                                  tapStrategy ===
-                                    "element-center" &&
-                                  String(
-                                    element.tagName || ""
-                                  ).toLowerCase() === "label"
-                                ) {
-                                  /*
-                                   * Runtime log:
-                                   * label rect = 8.67,20.5,221.72,24
-                                   *
-                                   * Successful desktop trusted click:
-                                   * x ~= 22.4, y ~= 34.4
-                                   *
-                                   * For that exact geometry this produces:
-                                   * x ~= 21.87, y ~= 34.42
-                                   */
-                                  const leftInset =
-                                    Math.max(
-                                      10,
-                                      Math.min(
-                                        18,
-                                        rect.height * 0.55
-                                      )
-                                    );
-
-                                  x =
-                                    rect.left +
-                                    Math.min(
-                                      leftInset,
-                                      Math.max(
-                                        1,
-                                        rect.width - 1
-                                      )
-                                    );
-
-                                  y =
-                                    rect.top +
-                                    rect.height * 0.58;
-
-                                  tapStrategy =
-                                    "label-checkbox-zone";
+                                if (!checkbox) {
+                                  turnstileDebug(
+                                    "CANDIDAT sans vraie checkbox: aucun clic"
+                                  );
+                                  return false;
                                 }
+
+                                let checkboxRect;
+
+                                try {
+                                  checkboxRect =
+                                    checkbox.getBoundingClientRect();
+                                } catch (_) {
+                                  turnstileDebug(
+                                    "Checkbox sans rectangle exploitable: aucun clic"
+                                  );
+                                  return false;
+                                }
+
+                                const plausibleCheckbox =
+                                  checkboxRect.width >= 8 &&
+                                  checkboxRect.height >= 8 &&
+                                  checkboxRect.width <= 64 &&
+                                  checkboxRect.height <= 64;
+
+                                if (!plausibleCheckbox) {
+                                  turnstileDebug(
+                                    "Checkbox rectangle non plausible: " +
+                                    [
+                                      checkboxRect.x,
+                                      checkboxRect.y,
+                                      checkboxRect.width,
+                                      checkboxRect.height
+                                    ]
+                                      .map(value =>
+                                        Number(value)
+                                          .toFixed(2)
+                                      )
+                                      .join(",") +
+                                    " -> aucun clic"
+                                  );
+                                  return false;
+                                }
+
+                                const centerX =
+                                  checkboxRect.left +
+                                  checkboxRect.width / 2;
+                                const centerY =
+                                  checkboxRect.top +
+                                  checkboxRect.height / 2;
+
+                                // Independent FLOAT jitter in [-2, +2].
+                                const jitterX =
+                                  Math.random() * 4 - 2;
+                                const jitterY =
+                                  Math.random() * 4 - 2;
+
+                                const x =
+                                  centerX + jitterX;
+                                const y =
+                                  centerY + jitterY;
 
                                 turnstileDebug(
                                   "CANDIDAT " +
                                   describeTurnstile(
                                     element
                                   ) +
-                                  " strategy=" +
-                                  tapStrategy +
-                                  " tap=" +
-                                  x.toFixed(2) +
+                                  " strategy=checkbox-center-jitter " +
+                                  "checkboxCenter=" +
+                                  centerX.toFixed(3) +
                                   "," +
-                                  y.toFixed(2)
+                                  centerY.toFixed(3) +
+                                  " jitter=" +
+                                  jitterX.toFixed(3) +
+                                  "," +
+                                  jitterY.toFixed(3) +
+                                  " tap=" +
+                                  x.toFixed(3) +
+                                  "," +
+                                  y.toFixed(3)
                                 );
 
-                                try {
-                                  window.AfterDarkNative
-                                    .turnstileFrameCandidate(
-                                      x,
-                                      y,
-                                      Number(
-                                        window.innerWidth
-                                      ),
-                                      Number(
-                                        window.innerHeight
-                                      ),
-                                      String(
-                                        location.href || ""
+                                const dispatchDelayMs =
+                                  100 +
+                                  Math.floor(
+                                    Math.random() * 51
+                                  );
+
+                                turnstileDebug(
+                                  "CANDIDAT delai avant tap=" +
+                                  String(dispatchDelayMs) +
+                                  "ms"
+                                );
+
+                                setTimeout(
+                                  () => {
+                                    if (
+                                      !element ||
+                                      !element.isConnected ||
+                                      !visibleTurnstileElement(
+                                        element
                                       )
-                                    );
+                                    ) {
+                                      turnstileDebug(
+                                        "CANDIDAT annule apres delai: " +
+                                        "controle disparu"
+                                      );
+                                      return;
+                                    }
 
-                                  turnstileDebug(
-                                    "CANDIDAT envoye au bridge Android"
-                                  );
+                                    try {
+                                      window.AfterDarkNative
+                                        .turnstileFrameCandidate(
+                                          x,
+                                          y,
+                                          Number(
+                                            window.innerWidth
+                                          ),
+                                          Number(
+                                            window.innerHeight
+                                          ),
+                                          String(
+                                            location.href || ""
+                                          )
+                                        );
 
-                                  return true;
-                                } catch (error) {
-                                  turnstileDebug(
-                                    "bridge candidat erreur " +
-                                    String(error || "")
-                                  );
-                                  return false;
-                                }
+                                      turnstileDebug(
+                                        "CANDIDAT envoye au bridge Android " +
+                                        "apres " +
+                                        String(dispatchDelayMs) +
+                                        "ms"
+                                      );
+                                    } catch (error) {
+                                      turnstileDebug(
+                                        "bridge candidat erreur " +
+                                        String(error || "")
+                                      );
+                                    }
+                                  },
+                                  dispatchDelayMs
+                                );
+
+                                return true;
                               };
 
                             let lastTurnstileSummary = "";
