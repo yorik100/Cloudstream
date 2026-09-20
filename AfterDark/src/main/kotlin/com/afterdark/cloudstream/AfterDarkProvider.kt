@@ -538,11 +538,21 @@ class AfterDarkProvider : MainAPI() {
             for (index in 0 until items.length()) {
                 val item = items.optJSONObject(index) ?: continue
                 val sourceUrl = item.stringOrNull("url") ?: continue
+                val service = item.stringOrNull("service") ?: "AfterDark"
+                val provider = item.stringOrNull("provider") ?: groupName
+
+                // Videasy is no longer an AfterDark-compatible reader.
+                // Ignore it even if the official endpoint still advertises it.
+                if (
+                    service.contains("videasy", ignoreCase = true) ||
+                    provider.contains("videasy", ignoreCase = true) ||
+                    groupName.contains("videasy", ignoreCase = true)
+                ) continue
 
                 sources += ParsedSource(
                     group = groupName,
-                    service = item.stringOrNull("service") ?: "AfterDark",
-                    provider = item.stringOrNull("provider") ?: groupName,
+                    service = service,
+                    provider = provider,
                     url = sourceUrl,
                     quality = item.stringOrNull("quality"),
                     language = item.stringOrNull("language"),
@@ -892,16 +902,14 @@ class AfterDarkProvider : MainAPI() {
 
             if (extractorEmitted) {
                 // "Secours" is a failover chain, not a list that should be
-                // resolved all at once. Once Videasy (or a later fallback)
-                // produced a real link, stop here so the next fallback does
-                // not replace it while it is still loading.
+                // resolved all at once. Once an allowed fallback produced a
+                // real link, stop here so another fallback cannot replace it.
                 if (source.group == "Secours") return true
                 continue
             }
 
-            // Defensive browser fallback for the remaining source(s).
-            // Videasy is intentionally absent: the official AfterDark WebView
-            // owns that path and no direct Videasy navigation is performed.
+            // Defensive browser fallback for the remaining allowed
+            // AfterDark source(s). Videasy is not part of this compatible set.
             if (isEmbed && source.group == "Secours") {
                 val resolved = runCatching {
                     AfterDarkEmbedWebView.resolve(
@@ -918,7 +926,6 @@ class AfterDarkProvider : MainAPI() {
                     val valid = validateResolvedMedia(resolved)
 
                     if (!valid) {
-                        // Videasy dead/inaccessible => continue to Peachify.
                         continue
                     }
 

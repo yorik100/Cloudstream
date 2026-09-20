@@ -825,16 +825,16 @@ object AfterDarkProofWebView {
                               normalize(element.textContent) === "sources"
                             );
 
-                          const findVideasyButton = () =>
+                          const findPeachifyButton = () =>
                             interactive().find(element => {
                               const text = normalize(element.textContent);
-                              return text === "videasy" ||
-                                     text.includes("videasy");
+                              return text === "peachify" ||
+                                     text.includes("peachify");
                             });
 
                           let sourceMenuOpened = false;
 
-                          const trySelectVideasy = () => {
+                          const trySelectPeachify = () => {
                             if (
                               window.__afterdarkPreferredSourceSelected ||
                               window.__afterdarkPreferredSourceLocked
@@ -857,14 +857,14 @@ object AfterDarkProofWebView {
                               }
                             }
 
-                            const videasy = findVideasyButton();
-                            if (!videasy) return false;
+                            const peachify = findPeachifyButton();
+                            if (!peachify) return false;
 
                             window.__afterdarkPreferredSourceSelected = true;
                             window.__afterdarkPreferredSourceLocked = true;
 
                             try {
-                              videasy.click();
+                              peachify.click();
                             } catch (_) {
                               window.__afterdarkPreferredSourceSelected = false;
                               window.__afterdarkPreferredSourceLocked = false;
@@ -873,20 +873,20 @@ object AfterDarkProofWebView {
 
                             try {
                               window.AfterDarkNative.preferredSourceSelected(
-                                "videasy"
+                                "peachify"
                               );
                             } catch (_) {}
 
                             return true;
                           };
 
-                          if (trySelectVideasy()) {
+                          if (trySelectPeachify()) {
                             window.__afterdarkPreferredSourceObserverInstalled = false;
                             return;
                           }
 
                           const observer = new MutationObserver(() => {
-                            if (trySelectVideasy()) {
+                            if (trySelectPeachify()) {
                               try { observer.disconnect(); } catch (_) {}
                               window.__afterdarkPreferredSourceObserverInstalled = false;
                             }
@@ -1151,7 +1151,7 @@ object AfterDarkProofWebView {
                         handler.post {
                             preferredSourceSelectionDone.set(true)
                             currentFallbackService.set(
-                                service?.takeIf { it.isNotBlank() } ?: "videasy",
+                                service?.takeIf { it.isNotBlank() } ?: "peachify",
                             )
                             mediaCaptureArmed.set(true)
                             Log.i(
