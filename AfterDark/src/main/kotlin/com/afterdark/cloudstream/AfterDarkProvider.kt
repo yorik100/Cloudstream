@@ -541,14 +541,6 @@ class AfterDarkProvider : MainAPI() {
                 val service = item.stringOrNull("service") ?: "AfterDark"
                 val provider = item.stringOrNull("provider") ?: groupName
 
-                // Videasy is no longer an AfterDark-compatible reader.
-                // Ignore it even if the official endpoint still advertises it.
-                if (
-                    service.contains("videasy", ignoreCase = true) ||
-                    provider.contains("videasy", ignoreCase = true) ||
-                    groupName.contains("videasy", ignoreCase = true)
-                ) continue
-
                 sources += ParsedSource(
                     group = groupName,
                     service = service,
