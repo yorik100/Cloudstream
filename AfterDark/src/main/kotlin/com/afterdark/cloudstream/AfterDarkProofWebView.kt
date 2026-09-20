@@ -3,18 +3,13 @@ package com.afterdark.cloudstream
 import android.annotation.SuppressLint
 import android.app.Dialog
 import android.graphics.Color
-import android.graphics.Rect
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
-import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
-import android.view.InputDevice
-import android.view.MotionEvent
 import android.view.ViewGroup
-import android.view.accessibility.AccessibilityNodeInfo
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -31,7 +26,6 @@ import androidx.webkit.WebViewFeature
 import java.io.ByteArrayInputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
@@ -59,12 +53,10 @@ object AfterDarkProofWebView {
         val currentFallbackService = AtomicReference<String?>(null)
         val emptyOfficialResponse = AtomicReference<CapturedSourceResponse?>(null)
         val verificationButtonHasAppeared = AtomicBoolean(false)
-        val verificationCheckboxPresent = AtomicBoolean(false)
         val cloudflareErrorReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
-        var checkboxWatcher: Runnable? = null
 
         lateinit var timeoutRunnable: Runnable
 
@@ -72,7 +64,6 @@ object AfterDarkProofWebView {
             if (!finished.compareAndSet(false, true)) return
 
             handler.removeCallbacks(timeoutRunnable)
-            checkboxWatcher?.let(handler::removeCallbacks)
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
                 runCatching { dialog?.dismiss() }
@@ -175,7 +166,6 @@ object AfterDarkProofWebView {
 
             fun installAutoOpenAndPlay(
                 target: WebView?,
-                interactWithVerificationButton: Boolean,
             ) {
                 if (target == null || finished.get()) return
 
@@ -184,8 +174,6 @@ object AfterDarkProofWebView {
                     (() => {
                       const OPEN_LINK_TEXT = "ouvrir le lien";
                       const EXPECTED_HOST = '$verificationHostForJs';
-                      const INTERACT_WITH_VERIFICATION_BUTTON =
-                        ${if (interactWithVerificationButton) "true" else "false"};
                       const SEEN_KEY = "__afterdark_verification_button_seen";
 
                       if (
@@ -197,27 +185,7 @@ object AfterDarkProofWebView {
                       }
 
                       const normalize = value =>
-                        String(value || "").replace(/\\s+/g, " ").trim();
-
-                      const wasSeen = () => {
-                        if (window.__afterdarkVerificationButtonSeen === true) {
-                          return true;
-                        }
-
-                        try {
-                          return sessionStorage.getItem(SEEN_KEY) === "1";
-                        } catch (_) {
-                          return false;
-                        }
-                      };
-
-                      const stopCheckboxWatcher = () => {
-                        const timer = window.__afterdarkCheckboxWatcher;
-                        if (timer) {
-                          clearInterval(timer);
-                          window.__afterdarkCheckboxWatcher = null;
-                        }
-                      };
+                        String(value || "").replace(/\s+/g, " ").trim();
 
                       const markSeen = () => {
                         window.__afterdarkVerificationButtonSeen = true;
@@ -250,9 +218,6 @@ object AfterDarkProofWebView {
 
                         if (!button) return false;
 
-                        // Remember that AfterDark's verification/open-link
-                        // button has appeared. This does not suppress later
-                        // Turnstile interaction.
                         markSeen();
 
                         const state = buttonState(button);
@@ -260,93 +225,28 @@ object AfterDarkProofWebView {
                           window.__afterdarkAutoOpenedStates || new Set();
                         window.__afterdarkAutoOpenedStates = openedStates;
 
-                        // React can reuse the same button or replace it between
-                        // any number of intermediate steps. Each distinct text
-                        // is clicked once, regardless of the DOM element.
                         if (!state || openedStates.has(state)) return true;
 
                         openedStates.add(state);
                         button.dataset.afterdarkAutoOpenedState = state;
-                        button.click();
-                        return true;
-                      };
-
-                      const isVisibleInteractiveCheckbox = element => {
-                        if (!element || element.disabled) return false;
 
                         try {
-                          const style = element.ownerDocument.defaultView
-                            .getComputedStyle(element);
-                          if (
-                            style.display === "none" ||
-                            style.visibility === "hidden"
-                          ) return false;
-                          const bounds = element.getBoundingClientRect();
-                          if (bounds.width <= 0 || bounds.height <= 0) return false;
-                        } catch (_) {}
-
-                        return true;
-                      };
-
-                      const documentHasInteractiveCheckbox = documentRoot => {
-                        if (!documentRoot) return false;
-
-                        const candidates = Array.from(
-                          documentRoot.querySelectorAll(
-                            'input[type="checkbox"], [role="checkbox"]'
-                          )
-                        );
-                        if (candidates.some(isVisibleInteractiveCheckbox)) {
+                          button.click();
                           return true;
+                        } catch (_) {
+                          return false;
                         }
-
-                        // Same-origin frames can be inspected directly. The
-                        // native accessibility watcher handles Cloudflare's
-                        // usual cross-origin Turnstile frame.
-                        for (const frame of documentRoot.querySelectorAll("iframe")) {
-                          try {
-                            if (documentHasInteractiveCheckbox(frame.contentDocument)) {
-                              return true;
-                            }
-                          } catch (_) {}
-                        }
-
-                        return false;
-                      };
-
-                      const reportInteractiveCheckbox = () => {
-                        if (
-                          !INTERACT_WITH_VERIFICATION_BUTTON ||
-                          window.__afterdarkCheckboxReported === true
-                        ) return false;
-
-                        if (!documentHasInteractiveCheckbox(document)) return false;
-
-                        window.__afterdarkCheckboxReported = true;
-                        stopCheckboxWatcher();
-
-                        // Do not reload. Ask native code to tap the rendered
-                        // control through Android's WebView input pipeline.
-                        try {
-                          window.AfterDarkNative.interactiveCheckboxSeen();
-                        } catch (_) {}
-                        return true;
                       };
 
                       findAndClick();
-                      if (reportInteractiveCheckbox()) return;
 
                       if (window.__afterdarkAutoOpenObserver) {
-                        try { window.__afterdarkAutoOpenObserver.disconnect(); } catch (_) {}
+                        try {
+                          window.__afterdarkAutoOpenObserver.disconnect();
+                        } catch (_) {}
                       }
 
-                      const observer = new MutationObserver(() => {
-                        findAndClick();
-                        if (reportInteractiveCheckbox()) {
-                          try { observer.disconnect(); } catch (_) {}
-                          window.__afterdarkAutoOpenObserver = null;
-                        }
-                      });
+                      const observer = new MutationObserver(findAndClick);
 
                       observer.observe(document.documentElement, {
                         childList: true,
@@ -355,198 +255,10 @@ object AfterDarkProofWebView {
                       });
 
                       window.__afterdarkAutoOpenObserver = observer;
-
-                      stopCheckboxWatcher();
-                      if (INTERACT_WITH_VERIFICATION_BUTTON) {
-                        window.__afterdarkCheckboxWatcher = setInterval(() => {
-                          findAndClick();
-                          if (reportInteractiveCheckbox()) {
-                            stopCheckboxWatcher();
-                          }
-                        }, 250);
-                      }
                     })();
                     """.trimIndent(),
                     null,
                 )
-            }
-
-            fun interactWithInteractiveCheckbox(target: WebView): Boolean {
-                val rootNode = runCatching {
-                    target.createAccessibilityNodeInfo()
-                }.getOrNull() ?: run {
-                    verificationCheckboxPresent.set(false)
-                    return false
-                }
-
-                val pendingNodes = ArrayDeque<AccessibilityNodeInfo>()
-                pendingNodes.add(rootNode)
-                var visitedNodes = 0
-                var found = false
-
-                try {
-                    while (pendingNodes.isNotEmpty() && visitedNodes < 512) {
-                        val node = pendingNodes.removeFirst()
-                        visitedNodes++
-
-                        val isCheckbox = node.isCheckable ||
-                            node.className
-                                ?.toString()
-                                ?.contains("CheckBox", ignoreCase = true) == true ||
-                            node.contentDescription
-                                ?.toString()
-                                ?.contains("checkbox", ignoreCase = true) == true
-
-                        if (
-                            isCheckbox &&
-                            node.isEnabled &&
-                            node.isVisibleToUser
-                        ) {
-                            found = true
-
-                            // Tap only on the transition "not present" ->
-                            // "present". If Cloudflare replaces the control,
-                            // it disappears first and the watcher re-arms.
-                            if (
-                                verificationCheckboxPresent.compareAndSet(
-                                    false,
-                                    true,
-                                )
-                            ) {
-                                val nodeBounds = Rect()
-                                node.getBoundsInScreen(nodeBounds)
-
-                                val webViewLocation = IntArray(2)
-                                target.getLocationOnScreen(webViewLocation)
-
-                                val rawX =
-                                    nodeBounds.exactCenterX() - webViewLocation[0]
-                                val rawY =
-                                    nodeBounds.exactCenterY() - webViewLocation[1]
-
-                                val width = target.width.toFloat()
-                                val height = target.height.toFloat()
-
-                                val localX =
-                                    if (width > 2f) {
-                                        rawX.coerceIn(1f, width - 1f)
-                                    } else {
-                                        rawX
-                                    }
-
-                                val localY =
-                                    if (height > 2f) {
-                                        rawY.coerceIn(1f, height - 1f)
-                                    } else {
-                                        rawY
-                                    }
-
-                                val boundsUsable =
-                                    !nodeBounds.isEmpty &&
-                                    target.width > 0 &&
-                                    target.height > 0 &&
-                                    rawX >= 0f &&
-                                    rawY >= 0f &&
-                                    rawX <= width &&
-                                    rawY <= height
-
-                                if (boundsUsable) {
-                                    target.requestFocus()
-
-                                    val downTime = SystemClock.uptimeMillis()
-                                    val downEvent = MotionEvent.obtain(
-                                        downTime,
-                                        downTime,
-                                        MotionEvent.ACTION_DOWN,
-                                        localX,
-                                        localY,
-                                        0,
-                                    ).apply {
-                                        source = InputDevice.SOURCE_TOUCHSCREEN
-                                    }
-
-                                    val downHandled = runCatching {
-                                        target.dispatchTouchEvent(downEvent)
-                                    }.getOrDefault(false)
-                                    downEvent.recycle()
-
-                                    target.postDelayed(
-                                        {
-                                            if (
-                                                finished.get() ||
-                                                officialPlayerMode.get()
-                                            ) {
-                                                return@postDelayed
-                                            }
-
-                                            val upTime =
-                                                SystemClock.uptimeMillis()
-                                            val upEvent = MotionEvent.obtain(
-                                                downTime,
-                                                upTime,
-                                                MotionEvent.ACTION_UP,
-                                                localX,
-                                                localY,
-                                                0,
-                                            ).apply {
-                                                source =
-                                                    InputDevice.SOURCE_TOUCHSCREEN
-                                            }
-
-                                            val upHandled = runCatching {
-                                                target.dispatchTouchEvent(
-                                                    upEvent,
-                                                )
-                                            }.getOrDefault(false)
-                                            upEvent.recycle()
-
-                                            Log.i(
-                                                TAG,
-                                                "Tap natif Turnstile " +
-                                                    "x=$localX y=$localY " +
-                                                    "DOWN=$downHandled " +
-                                                    "UP=$upHandled " +
-                                                    "bounds=$nodeBounds",
-                                            )
-                                        },
-                                        85L,
-                                    )
-                                } else {
-                                    // Let the next scan retry if the
-                                    // accessibility node had unusable bounds.
-                                    verificationCheckboxPresent.set(false)
-
-                                    Log.w(
-                                        TAG,
-                                        "Turnstile détecté mais coordonnées " +
-                                            "inutilisables: bounds=$nodeBounds " +
-                                            "webView=${target.width}x${target.height}",
-                                    )
-                                }
-                            }
-
-                            runCatching { node.recycle() }
-                            break
-                        }
-
-                        for (index in 0 until node.childCount) {
-                            runCatching { node.getChild(index) }
-                                .getOrNull()
-                                ?.let(pendingNodes::addLast)
-                        }
-                        runCatching { node.recycle() }
-                    }
-                } finally {
-                    while (pendingNodes.isNotEmpty()) {
-                        runCatching { pendingNodes.removeFirst().recycle() }
-                    }
-                }
-
-                if (!found) {
-                    verificationCheckboxPresent.set(false)
-                }
-
-                return found
             }
 
             fun reloadForCloudflareError(
@@ -559,8 +271,6 @@ object AfterDarkProofWebView {
                     officialPlayerMode.get() ||
                     !cloudflareErrorReloadInProgress.compareAndSet(false, true)
                 ) return
-
-                verificationCheckboxPresent.set(false)
 
                 Log.w(
                     TAG,
@@ -1119,16 +829,11 @@ object AfterDarkProofWebView {
                     }
 
                     @JavascriptInterface
-                    fun interactiveCheckboxSeen() {
-                        handler.post {
-                            if (
-                                !finished.get() &&
-                                !officialPlayerMode.get() &&
-                                !cloudflareErrorReloadInProgress.get()
-                            ) {
-                                interactWithInteractiveCheckbox(browser)
-                            }
-                        }
+                    fun turnstileDebug(message: String?) {
+                        Log.i(
+                            TAG,
+                            "Turnstile JS: ${message.orEmpty().take(1000)}",
+                        )
                     }
 
                     @JavascriptInterface
@@ -1698,93 +1403,495 @@ object AfterDarkProofWebView {
                           }
 
                           // -------------------------------------------------
-                          // Cloudflare Turnstile verification-control detector.
-                          // It reports the control so native Android input can
-                          // tap it. It never requests a reload itself.
+                          // Deep Turnstile scanner + clicker.
+                          //
+                          // Port of the user's desktop Tampermonkey test that
+                          // actually clicks the verification control.
+                          //
+                          // IMPORTANT: this intentionally runs in EVERY frame,
+                          // not only challenges.cloudflare.com.
                           // -------------------------------------------------
-                          if (window.__afterdarkCheckboxFrameDetector) return;
-                          window.__afterdarkCheckboxFrameDetector = true;
+                          if (!window.__afterdarkDeepTurnstileClicker) {
+                            window.__afterdarkDeepTurnstileClicker = true;
 
-                          const isCloudflareFrame = () => {
-                            const host = currentHost();
-                            return host === "challenges.cloudflare.com" ||
-                              host.endsWith(".challenges.cloudflare.com");
-                          };
+                            const turnstileRoots = new Set();
+                            const turnstileClicked = new WeakSet();
 
-                          if (!isCloudflareFrame()) return;
+                            turnstileRoots.add(document);
 
-                          const roots = new Set([document]);
-
-                          try {
-                            const nativeAttachShadow = Element.prototype.attachShadow;
-                            Element.prototype.attachShadow = function() {
-                              const shadowRoot =
-                                nativeAttachShadow.apply(this, arguments);
-                              roots.add(shadowRoot);
-                              return shadowRoot;
+                            const turnstileDebug = message => {
+                              try {
+                                window.AfterDarkNative.turnstileDebug(
+                                  String(message || "")
+                                );
+                              } catch (_) {}
                             };
-                          } catch (_) {}
 
-                          const isInteractiveCheckbox = element =>
-                            Boolean(element) && !element.disabled;
-
-                          const report = () => {
-                            for (const root of Array.from(roots)) {
-                              for (const element of root.querySelectorAll("*")) {
-                                if (element.shadowRoot) roots.add(element.shadowRoot);
-                              }
-                            }
-
-                            const checkbox = Array.from(roots)
-                              .flatMap(root => Array.from(root.querySelectorAll(
-                                'input[type="checkbox"], [role="checkbox"]'
-                              )))
-                              .find(isInteractiveCheckbox);
-
-                            if (!checkbox) return false;
-
-                            try {
-                              window.AfterDarkNative.interactiveCheckboxSeen();
-                              return true;
-                            } catch (_) {
-                              return false;
-                            }
-                          };
-
-                          const startCheckboxDetector = () => {
-                            if (report()) return;
-
-                            const observer = new MutationObserver(() => {
-                              if (report()) observer.disconnect();
-                            });
-
-                            observer.observe(document.documentElement, {
-                              childList: true,
-                              subtree: true,
-                              attributes: true,
-                              attributeFilter: [
-                                "type",
-                                "role",
-                                "disabled",
-                                "style",
-                                "class"
-                              ]
-                            });
-
-                            const poller = setInterval(() => {
-                              if (report()) clearInterval(poller);
-                            }, 100);
-                          };
-
-                          if (document.readyState === "loading") {
-                            document.addEventListener(
-                              "DOMContentLoaded",
-                              startCheckboxDetector,
-                              { once: true }
+                            turnstileDebug(
+                              "SCRIPT CHARGE frame=" +
+                              String(location.href || "")
                             );
-                          } else {
-                            startCheckboxDetector();
+
+                            /*
+                             * Capture even closed Shadow DOM roots created
+                             * after document-start.
+                             */
+                            try {
+                              const originalAttachShadow =
+                                Element.prototype.attachShadow;
+
+                              Element.prototype.attachShadow =
+                                function(init) {
+                                  const shadow =
+                                    originalAttachShadow.call(this, init);
+
+                                  turnstileRoots.add(shadow);
+
+                                  turnstileDebug(
+                                    "SHADOW ROOT CAPTURE mode=" +
+                                    String(
+                                      init && init.mode
+                                        ? init.mode
+                                        : ""
+                                    ) +
+                                    " host=" +
+                                    String(this.tagName || "")
+                                  );
+
+                                  return shadow;
+                                };
+
+                              turnstileDebug(
+                                "Hook attachShadow installe"
+                              );
+                            } catch (error) {
+                              turnstileDebug(
+                                "ERREUR attachShadow " +
+                                String(error || "")
+                              );
+                            }
+
+                            const visibleTurnstileElement = element => {
+                              if (!element) return false;
+
+                              try {
+                                const rect =
+                                  element.getBoundingClientRect();
+                                const style =
+                                  getComputedStyle(element);
+
+                                return (
+                                  rect.width > 0 &&
+                                  rect.height > 0 &&
+                                  style.display !== "none" &&
+                                  style.visibility !== "hidden" &&
+                                  style.opacity !== "0"
+                                );
+                              } catch (_) {
+                                return false;
+                              }
+                            };
+
+                            const collectTurnstileRoots = () => {
+                              const queue =
+                                Array.from(turnstileRoots);
+                              const seen = new Set();
+
+                              while (queue.length) {
+                                const root = queue.shift();
+
+                                if (!root || seen.has(root)) {
+                                  continue;
+                                }
+
+                                seen.add(root);
+                                turnstileRoots.add(root);
+
+                                let elements = [];
+
+                                try {
+                                  elements =
+                                    root.querySelectorAll("*");
+                                } catch (_) {}
+
+                                for (const element of elements) {
+                                  try {
+                                    if (
+                                      element.shadowRoot &&
+                                      !seen.has(
+                                        element.shadowRoot
+                                      )
+                                    ) {
+                                      turnstileRoots.add(
+                                        element.shadowRoot
+                                      );
+                                      queue.push(
+                                        element.shadowRoot
+                                      );
+                                    }
+                                  } catch (_) {}
+                                }
+                              }
+
+                              return Array.from(
+                                turnstileRoots
+                              );
+                            };
+
+                            const findTurnstileCandidates = () => {
+                              const result = [];
+
+                              for (
+                                const root of
+                                  collectTurnstileRoots()
+                              ) {
+                                let elements = [];
+
+                                try {
+                                  elements =
+                                    root.querySelectorAll(
+                                      [
+                                        'input[type="checkbox"]',
+                                        '[role="checkbox"]',
+                                        "button",
+                                        '[role="button"]',
+                                        "label"
+                                      ].join(",")
+                                    );
+                                } catch (_) {}
+
+                                for (const element of elements) {
+                                  if (
+                                    !visibleTurnstileElement(
+                                      element
+                                    )
+                                  ) {
+                                    continue;
+                                  }
+
+                                  const text = [
+                                    element.textContent,
+                                    element.getAttribute &&
+                                      element.getAttribute(
+                                        "aria-label"
+                                      ),
+                                    element.getAttribute &&
+                                      element.getAttribute(
+                                        "title"
+                                      )
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" ")
+                                    .toLowerCase();
+
+                                  const checkbox =
+                                    (
+                                      element.matches &&
+                                      element.matches(
+                                        'input[type="checkbox"]'
+                                      )
+                                    ) ||
+                                    (
+                                      element.getAttribute &&
+                                      element.getAttribute(
+                                        "role"
+                                      ) === "checkbox"
+                                    );
+
+                                  const interesting =
+                                    checkbox ||
+                                    text.includes("verify") ||
+                                    text.includes(
+                                      "verification"
+                                    ) ||
+                                    text.includes(
+                                      "vérification"
+                                    ) ||
+                                    text.includes("human") ||
+                                    text.includes("humain") ||
+                                    text.includes(
+                                      "turnstile"
+                                    );
+
+                                  if (interesting) {
+                                    result.push(element);
+                                  }
+                                }
+                              }
+
+                              return Array.from(
+                                new Set(result)
+                              );
+                            };
+
+                            const describeTurnstile = element => {
+                              try {
+                                const rect =
+                                  element.getBoundingClientRect();
+
+                                return (
+                                  "tag=" +
+                                  String(element.tagName || "") +
+                                  " type=" +
+                                  String(
+                                    element.getAttribute &&
+                                    element.getAttribute(
+                                      "type"
+                                    ) || ""
+                                  ) +
+                                  " role=" +
+                                  String(
+                                    element.getAttribute &&
+                                    element.getAttribute(
+                                      "role"
+                                    ) || ""
+                                  ) +
+                                  " text=" +
+                                  String(
+                                    element.textContent || ""
+                                  )
+                                    .replace(/\s+/g, " ")
+                                    .trim()
+                                    .slice(0, 160) +
+                                  " rect=" +
+                                  [
+                                    Math.round(rect.x),
+                                    Math.round(rect.y),
+                                    Math.round(rect.width),
+                                    Math.round(rect.height)
+                                  ].join(",")
+                                );
+                              } catch (_) {
+                                return "description-error";
+                              }
+                            };
+
+                            const clickTurnstileCandidate =
+                              element => {
+                                if (
+                                  !element ||
+                                  turnstileClicked.has(element)
+                                ) {
+                                  return false;
+                                }
+
+                                turnstileClicked.add(element);
+
+                                turnstileDebug(
+                                  "CANDIDAT TROUVE " +
+                                  describeTurnstile(element)
+                                );
+
+                                try {
+                                  element.scrollIntoView({
+                                    block: "center",
+                                    inline: "center"
+                                  });
+                                } catch (_) {}
+
+                                try {
+                                  element.focus();
+                                } catch (_) {}
+
+                                /*
+                                 * First method from the successful
+                                 * Tampermonkey test.
+                                 */
+                                try {
+                                  element.click();
+
+                                  turnstileDebug(
+                                    "element.click envoye"
+                                  );
+                                } catch (error) {
+                                  turnstileDebug(
+                                    "element.click erreur " +
+                                    String(error || "")
+                                  );
+                                }
+
+                                /*
+                                 * Second method from the same test:
+                                 * pointer/mouse sequence at the
+                                 * candidate center.
+                                 */
+                                try {
+                                  const rect =
+                                    element.getBoundingClientRect();
+
+                                  const options = {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    composed: true,
+                                    clientX:
+                                      rect.left +
+                                      rect.width / 2,
+                                    clientY:
+                                      rect.top +
+                                      rect.height / 2,
+                                    button: 0
+                                  };
+
+                                  for (
+                                    const type of [
+                                      "pointerdown",
+                                      "mousedown",
+                                      "pointerup",
+                                      "mouseup",
+                                      "click"
+                                    ]
+                                  ) {
+                                    const Constructor =
+                                      type.startsWith(
+                                        "pointer"
+                                      )
+                                        ? PointerEvent
+                                        : MouseEvent;
+
+                                    element.dispatchEvent(
+                                      new Constructor(
+                                        type,
+                                        options
+                                      )
+                                    );
+                                  }
+
+                                  turnstileDebug(
+                                    "sequence pointer/mouse envoyee"
+                                  );
+                                } catch (error) {
+                                  turnstileDebug(
+                                    "sequence pointer erreur " +
+                                    String(error || "")
+                                  );
+                                }
+
+                                return true;
+                              };
+
+                            let lastTurnstileSummary = "";
+
+                            const scanTurnstile = () => {
+                              collectTurnstileRoots();
+
+                              const candidates =
+                                findTurnstileCandidates();
+
+                              let totalElements = 0;
+                              let buttons = 0;
+                              let checkboxes = 0;
+
+                              for (
+                                const root of turnstileRoots
+                              ) {
+                                try {
+                                  totalElements +=
+                                    root.querySelectorAll(
+                                      "*"
+                                    ).length;
+
+                                  buttons +=
+                                    root.querySelectorAll(
+                                      "button"
+                                    ).length;
+
+                                  checkboxes +=
+                                    root.querySelectorAll(
+                                      'input[type="checkbox"],' +
+                                      '[role="checkbox"]'
+                                    ).length;
+                                } catch (_) {}
+                              }
+
+                              const summary =
+                                "SCAN roots=" +
+                                turnstileRoots.size +
+                                " elements=" +
+                                totalElements +
+                                " buttons=" +
+                                buttons +
+                                " checkboxes=" +
+                                checkboxes +
+                                " candidates=" +
+                                candidates.length +
+                                " host=" +
+                                String(
+                                  location.hostname || ""
+                                );
+
+                              if (
+                                summary !==
+                                lastTurnstileSummary
+                              ) {
+                                lastTurnstileSummary =
+                                  summary;
+                                turnstileDebug(summary);
+                              }
+
+                              for (
+                                const candidate of candidates
+                              ) {
+                                clickTurnstileCandidate(
+                                  candidate
+                                );
+                              }
+                            };
+
+                            const startTurnstileScanner = () => {
+                              scanTurnstile();
+
+                              try {
+                                const observer =
+                                  new MutationObserver(
+                                    scanTurnstile
+                                  );
+
+                                observer.observe(
+                                  document.documentElement,
+                                  {
+                                    childList: true,
+                                    subtree: true,
+                                    attributes: true,
+                                    attributeFilter: [
+                                      "class",
+                                      "style",
+                                      "role",
+                                      "type",
+                                      "aria-label",
+                                      "disabled"
+                                    ]
+                                  }
+                                );
+
+                                window
+                                  .__afterdarkTurnstileObserver =
+                                    observer;
+                              } catch (error) {
+                                turnstileDebug(
+                                  "MutationObserver erreur " +
+                                  String(error || "")
+                                );
+                              }
+
+                              window
+                                .__afterdarkTurnstilePoller =
+                                  setInterval(
+                                    scanTurnstile,
+                                    500
+                                  );
+                            };
+
+                            if (document.documentElement) {
+                              startTurnstileScanner();
+                            } else {
+                              document.addEventListener(
+                                "DOMContentLoaded",
+                                startTurnstileScanner,
+                                { once: true }
+                              );
+                            }
                           }
+
                         })();
                         """.trimIndent(),
                         setOf("*"),
@@ -1797,28 +1904,10 @@ object AfterDarkProofWebView {
             }
 
             if (frameDetectorInstalled) {
-                Log.i(TAG, "Détecteur Turnstile installé dans toutes les frames")
+                Log.i(TAG, "Clicker Turnstile profond installé dans toutes les frames")
             } else {
-                Log.w(TAG, "Détecteur Turnstile multi-frame indisponible")
+                Log.w(TAG, "Clicker Turnstile profond multi-frame indisponible")
             }
-
-            // Cloudflare Turnstile usually lives in a cross-origin iframe,
-            // which page JavaScript cannot inspect. The rendered interactive
-            // checkbox is still exposed through WebView's accessibility tree.
-            checkboxWatcher = object : Runnable {
-                override fun run() {
-                    if (finished.get() || officialPlayerMode.get()) return
-
-                    if (!cloudflareErrorReloadInProgress.get()) {
-                        interactWithInteractiveCheckbox(browser)
-                    }
-
-                    if (!finished.get()) {
-                        handler.postDelayed(this, CHECKBOX_POLL_INTERVAL_MS)
-                    }
-                }
-            }
-            handler.post(checkboxWatcher!!)
 
             fun officialBodyHasItems(body: String): Boolean =
                 body.lineSequence().any { rawLine ->
@@ -1840,11 +1929,8 @@ object AfterDarkProofWebView {
                 // The official /watch page now owns playback. Keep this exact
                 // WebView/session alive instead of opening the source URL.
                 handler.removeCallbacks(timeoutRunnable)
-                checkboxWatcher?.let(handler::removeCallbacks)
-                verificationButtonHasAppeared.set(true)
+                    verificationButtonHasAppeared.set(true)
                 cloudflareErrorReloadInProgress.set(false)
-                verificationCheckboxPresent.set(false)
-
                 handler.post {
                     if (finished.get()) return@post
 
@@ -1976,10 +2062,7 @@ object AfterDarkProofWebView {
                             url: String?,
                         ) {
                             super.onPageFinished(view, url)
-                            installAutoOpenAndPlay(
-                                view,
-                                interactWithVerificationButton = false,
-                            )
+                            installAutoOpenAndPlay(view)
                         }
 
                         override fun shouldOverrideUrlLoading(
@@ -2036,17 +2119,6 @@ object AfterDarkProofWebView {
             }
 
             browser.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(
-                    view: WebView?,
-                    url: String?,
-                    favicon: android.graphics.Bitmap?,
-                ) {
-                    if (!officialPlayerMode.get()) {
-                        verificationCheckboxPresent.set(false)
-                    }
-                    super.onPageStarted(view, url, favicon)
-                }
-
                 override fun onPageFinished(
                     view: WebView?,
                     url: String?,
@@ -2055,10 +2127,7 @@ object AfterDarkProofWebView {
                     cloudflareErrorReloadInProgress.set(false)
 
                     if (!officialPlayerMode.get()) {
-                        installAutoOpenAndPlay(
-                            view,
-                            interactWithVerificationButton = true,
-                        )
+                        installAutoOpenAndPlay(view)
                     } else if (!preferredSourceSelectionDone.get()) {
                         selectPreferredOfficialSource()
                     }
