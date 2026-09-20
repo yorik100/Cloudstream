@@ -55,7 +55,8 @@ object AfterDarkProofWebView {
         val currentFallbackService = AtomicReference<String?>(null)
         val emptyOfficialResponse = AtomicReference<CapturedSourceResponse?>(null)
         val verificationButtonHasAppeared = AtomicBoolean(false)
-        val checkboxReloadInProgress = AtomicBoolean(false)
+        val verificationCheckboxPresent = AtomicBoolean(false)
+        val cloudflareErrorReloadInProgress = AtomicBoolean(false)
         val handler = Handler(Looper.getMainLooper())
         var dialog: Dialog? = null
         var webView: WebView? = null
@@ -170,7 +171,7 @@ object AfterDarkProofWebView {
 
             fun installAutoOpenAndPlay(
                 target: WebView?,
-                reloadOnInteractiveCheckbox: Boolean,
+                interactWithVerificationButton: Boolean,
             ) {
                 if (target == null || finished.get()) return
 
@@ -179,8 +180,8 @@ object AfterDarkProofWebView {
                     (() => {
                       const OPEN_LINK_TEXT = "ouvrir le lien";
                       const EXPECTED_HOST = '$verificationHostForJs';
-                      const RELOAD_ON_INTERACTIVE_CHECKBOX =
-                        ${if (reloadOnInteractiveCheckbox) "true" else "false"};
+                      const INTERACT_WITH_VERIFICATION_BUTTON =
+                        ${if (interactWithVerificationButton) "true" else "false"};
                       const SEEN_KEY = "__afterdark_verification_button_seen";
 
                       if (
@@ -245,8 +246,9 @@ object AfterDarkProofWebView {
 
                         if (!button) return false;
 
-                        // Once this button has appeared, a later/disappearing
-                        // checkbox must never reload this verification.
+                        // Remember that AfterDark's verification/open-link
+                        // button has appeared. This does not suppress later
+                        // Turnstile interaction.
                         markSeen();
 
                         const state = buttonState(button);
@@ -310,8 +312,7 @@ object AfterDarkProofWebView {
 
                       const reportInteractiveCheckbox = () => {
                         if (
-                          !RELOAD_ON_INTERACTIVE_CHECKBOX ||
-                          wasSeen() ||
+                          !INTERACT_WITH_VERIFICATION_BUTTON ||
                           window.__afterdarkCheckboxReported === true
                         ) return false;
 
@@ -319,6 +320,9 @@ object AfterDarkProofWebView {
 
                         window.__afterdarkCheckboxReported = true;
                         stopCheckboxWatcher();
+
+                        // Do not reload. Ask native code to perform a real
+                        // accessibility ACTION_CLICK on the rendered control.
                         try {
                           window.AfterDarkNative.interactiveCheckboxSeen();
                         } catch (_) {}
@@ -349,7 +353,7 @@ object AfterDarkProofWebView {
                       window.__afterdarkAutoOpenObserver = observer;
 
                       stopCheckboxWatcher();
-                      if (RELOAD_ON_INTERACTIVE_CHECKBOX && !wasSeen()) {
+                      if (INTERACT_WITH_VERIFICATION_BUTTON) {
                         window.__afterdarkCheckboxWatcher = setInterval(() => {
                           findAndClick();
                           if (reportInteractiveCheckbox()) {
@@ -363,13 +367,18 @@ object AfterDarkProofWebView {
                 )
             }
 
-            fun hasInteractiveCheckbox(target: WebView): Boolean {
+            fun interactWithInteractiveCheckbox(target: WebView): Boolean {
                 val rootNode = runCatching {
                     target.createAccessibilityNodeInfo()
-                }.getOrNull() ?: return false
+                }.getOrNull() ?: run {
+                    verificationCheckboxPresent.set(false)
+                    return false
+                }
+
                 val pendingNodes = ArrayDeque<AccessibilityNodeInfo>()
                 pendingNodes.add(rootNode)
                 var visitedNodes = 0
+                var found = false
 
                 try {
                     while (pendingNodes.isNotEmpty() && visitedNodes < 512) {
@@ -379,15 +388,46 @@ object AfterDarkProofWebView {
                         val isCheckbox = node.isCheckable ||
                             node.className
                                 ?.toString()
-                                ?.contains("CheckBox", ignoreCase = true) == true
+                                ?.contains("CheckBox", ignoreCase = true) == true ||
+                            node.roleDescription
+                                ?.toString()
+                                ?.contains("checkbox", ignoreCase = true) == true
 
                         if (
                             isCheckbox &&
                             node.isEnabled &&
                             node.isVisibleToUser
                         ) {
+                            found = true
+
+                            // Click only on the transition "not present" ->
+                            // "present". If Cloudflare replaces the control,
+                            // it disappears first and the watcher re-arms.
+                            if (
+                                verificationCheckboxPresent.compareAndSet(
+                                    false,
+                                    true,
+                                )
+                            ) {
+                                runCatching {
+                                    node.performAction(
+                                        AccessibilityNodeInfo.ACTION_FOCUS,
+                                    )
+                                }
+                                val clicked = runCatching {
+                                    node.performAction(
+                                        AccessibilityNodeInfo.ACTION_CLICK,
+                                    )
+                                }.getOrDefault(false)
+
+                                Log.i(
+                                    TAG,
+                                    "Contrôle Turnstile détecté, ACTION_CLICK=$clicked",
+                                )
+                            }
+
                             runCatching { node.recycle() }
-                            return true
+                            break
                         }
 
                         for (index in 0 until node.childCount) {
@@ -403,21 +443,38 @@ object AfterDarkProofWebView {
                     }
                 }
 
-                return false
+                if (!found) {
+                    verificationCheckboxPresent.set(false)
+                }
+
+                return found
             }
 
-            fun reloadForInteractiveCheckbox() {
+            fun reloadForCloudflareError(
+                code: String?,
+                source: String?,
+                details: String?,
+            ) {
                 if (
                     finished.get() ||
                     officialPlayerMode.get() ||
-                    verificationButtonHasAppeared.get() ||
-                    !checkboxReloadInProgress.compareAndSet(false, true)
+                    !cloudflareErrorReloadInProgress.compareAndSet(false, true)
                 ) return
 
-                Log.i(TAG, "Checkbox interactive détectée, rechargement de la vérification")
+                verificationCheckboxPresent.set(false)
+
+                Log.w(
+                    TAG,
+                    "Erreur Cloudflare détectée, reload: " +
+                        "code=${code.orEmpty()} source=${source.orEmpty()} " +
+                        "details=${details.orEmpty().take(500)}",
+                )
+
                 browser.post {
-                    if (!finished.get() && !verificationButtonHasAppeared.get()) {
+                    if (!finished.get() && !officialPlayerMode.get()) {
                         browser.reload()
+                    } else {
+                        cloudflareErrorReloadInProgress.set(false)
                     }
                 }
             }
@@ -964,7 +1021,30 @@ object AfterDarkProofWebView {
 
                     @JavascriptInterface
                     fun interactiveCheckboxSeen() {
-                        handler.post { reloadForInteractiveCheckbox() }
+                        handler.post {
+                            if (
+                                !finished.get() &&
+                                !officialPlayerMode.get() &&
+                                !cloudflareErrorReloadInProgress.get()
+                            ) {
+                                interactWithInteractiveCheckbox(browser)
+                            }
+                        }
+                    }
+
+                    @JavascriptInterface
+                    fun cloudflareError(
+                        code: String?,
+                        source: String?,
+                        details: String?,
+                    ) {
+                        handler.post {
+                            reloadForCloudflareError(
+                                code = code,
+                                source = source,
+                                details = details,
+                            )
+                        }
                     }
 
                     @JavascriptInterface
@@ -1374,7 +1454,149 @@ object AfterDarkProofWebView {
                           }
 
                           // -------------------------------------------------
-                          // Existing Cloudflare Turnstile detector.
+                          // Passive Cloudflare/Turnstile error watcher.
+                          //
+                          // This is the ONLY thing that can request a verification
+                          // page reload. Merely seeing a checkbox never reloads.
+                          // -------------------------------------------------
+                          if (!window.__afterdarkCloudflareErrorWatcher) {
+                            window.__afterdarkCloudflareErrorWatcher = true;
+
+                            const extractCloudflareCode = value => {
+                              if (value == null) return null;
+
+                              let text;
+                              if (value instanceof Error) {
+                                text = `${value.name} ${value.message}`;
+                              } else if (typeof value === "string") {
+                                text = value;
+                              } else {
+                                try {
+                                  text = JSON.stringify(value);
+                                } catch (_) {
+                                  text = String(value);
+                                }
+                              }
+
+                              const match = text.match(/\b(\d{6})\b/);
+                              return match ? match[1] : null;
+                            };
+
+                            const reportCloudflareError = (
+                              code,
+                              source,
+                              details
+                            ) => {
+                              try {
+                                let serialized = "";
+                                if (typeof details === "string") {
+                                  serialized = details;
+                                } else {
+                                  try {
+                                    serialized = JSON.stringify(details);
+                                  } catch (_) {
+                                    serialized = String(details || "");
+                                  }
+                                }
+
+                                window.AfterDarkNative.cloudflareError(
+                                  String(code || ""),
+                                  String(source || ""),
+                                  serialized.slice(0, 2000)
+                                );
+                              } catch (_) {}
+                            };
+
+                            window.addEventListener("error", event => {
+                              if (event instanceof ErrorEvent) {
+                                const text = [
+                                  event.message,
+                                  event.error && event.error.message,
+                                  event.filename
+                                ].filter(Boolean).join(" ");
+
+                                const looksLikeTurnstile =
+                                  /cloudflare\s*turnstile/i.test(text) ||
+                                  /challenges\.cloudflare\.com/i.test(text);
+
+                                const code = extractCloudflareCode(text);
+
+                                if (looksLikeTurnstile && code) {
+                                  reportCloudflareError(
+                                    code,
+                                    "window.error",
+                                    text
+                                  );
+                                }
+
+                                return;
+                              }
+
+                              const target = event.target;
+                              const src =
+                                (target && (target.src || target.href)) || "";
+
+                              if (
+                                typeof src === "string" &&
+                                src.includes("challenges.cloudflare.com")
+                              ) {
+                                reportCloudflareError(
+                                  "RESOURCE_LOAD_ERROR",
+                                  "resource-error",
+                                  src
+                                );
+                              }
+                            }, true);
+
+                            window.addEventListener(
+                              "unhandledrejection",
+                              event => {
+                                const reason = event.reason;
+                                const text =
+                                  reason instanceof Error
+                                    ? `${reason.name}: ${reason.message}`
+                                    : String(reason);
+
+                                const code = extractCloudflareCode(text);
+
+                                if (
+                                  code &&
+                                  /cloudflare|turnstile/i.test(text)
+                                ) {
+                                  reportCloudflareError(
+                                    code,
+                                    "unhandledrejection",
+                                    text
+                                  );
+                                }
+                              }
+                            );
+
+                            window.addEventListener("message", event => {
+                              if (
+                                event.origin !==
+                                "https://challenges.cloudflare.com"
+                              ) {
+                                return;
+                              }
+
+                              const code =
+                                extractCloudflareCode(event.data);
+
+                              if (code) {
+                                reportCloudflareError(
+                                  code,
+                                  "cloudflare-postMessage",
+                                  event.data
+                                );
+                              }
+                            });
+                          }
+
+                          // -------------------------------------------------
+                          // Cloudflare Turnstile verification-control detector.
+                          // It reports the control so native accessibility can
+                          // click it. It never requests a reload itself.
                           // -------------------------------------------------
                           if (window.__afterdarkCheckboxFrameDetector) return;
                           window.__afterdarkCheckboxFrameDetector = true;
@@ -1471,9 +1693,9 @@ object AfterDarkProofWebView {
             }
 
             if (frameDetectorInstalled) {
-                Log.i(TAG, "Détecteur checkbox installé dans toutes les frames")
+                Log.i(TAG, "Détecteur Turnstile installé dans toutes les frames")
             } else {
-                Log.w(TAG, "Détecteur multi-frame indisponible")
+                Log.w(TAG, "Détecteur Turnstile multi-frame indisponible")
             }
 
             // Cloudflare Turnstile usually lives in a cross-origin iframe,
@@ -1483,12 +1705,8 @@ object AfterDarkProofWebView {
                 override fun run() {
                     if (finished.get() || officialPlayerMode.get()) return
 
-                    if (
-                        !verificationButtonHasAppeared.get() &&
-                        !checkboxReloadInProgress.get() &&
-                        hasInteractiveCheckbox(browser)
-                    ) {
-                        reloadForInteractiveCheckbox()
+                    if (!cloudflareErrorReloadInProgress.get()) {
+                        interactWithInteractiveCheckbox(browser)
                     }
 
                     if (!finished.get()) {
@@ -1520,7 +1738,8 @@ object AfterDarkProofWebView {
                 handler.removeCallbacks(timeoutRunnable)
                 checkboxWatcher?.let(handler::removeCallbacks)
                 verificationButtonHasAppeared.set(true)
-                checkboxReloadInProgress.set(false)
+                cloudflareErrorReloadInProgress.set(false)
+                verificationCheckboxPresent.set(false)
 
                 handler.post {
                     if (finished.get()) return@post
@@ -1655,7 +1874,7 @@ object AfterDarkProofWebView {
                             super.onPageFinished(view, url)
                             installAutoOpenAndPlay(
                                 view,
-                                reloadOnInteractiveCheckbox = false,
+                                interactWithVerificationButton = false,
                             )
                         }
 
@@ -1719,7 +1938,7 @@ object AfterDarkProofWebView {
                     favicon: android.graphics.Bitmap?,
                 ) {
                     if (!officialPlayerMode.get()) {
-                        checkboxReloadInProgress.set(true)
+                        verificationCheckboxPresent.set(false)
                     }
                     super.onPageStarted(view, url, favicon)
                 }
@@ -1729,12 +1948,12 @@ object AfterDarkProofWebView {
                     url: String?,
                 ) {
                     super.onPageFinished(view, url)
-                    checkboxReloadInProgress.set(false)
+                    cloudflareErrorReloadInProgress.set(false)
 
                     if (!officialPlayerMode.get()) {
                         installAutoOpenAndPlay(
                             view,
-                            reloadOnInteractiveCheckbox = true,
+                            interactWithVerificationButton = true,
                         )
                     } else if (!preferredSourceSelectionDone.get()) {
                         selectPreferredOfficialSource()
