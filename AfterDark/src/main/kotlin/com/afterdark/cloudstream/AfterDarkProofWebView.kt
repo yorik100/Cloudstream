@@ -389,7 +389,7 @@ object AfterDarkProofWebView {
                             node.className
                                 ?.toString()
                                 ?.contains("CheckBox", ignoreCase = true) == true ||
-                            node.roleDescription
+                            node.contentDescription
                                 ?.toString()
                                 ?.contains("checkbox", ignoreCase = true) == true
 
@@ -1467,7 +1467,10 @@ object AfterDarkProofWebView {
 
                               let text;
                               if (value instanceof Error) {
-                                text = `${value.name} ${value.message}`;
+                                text =
+                                  String(value.name || "") +
+                                  " " +
+                                  String(value.message || "");
                               } else if (typeof value === "string") {
                                 text = value;
                               } else {
@@ -1554,7 +1557,9 @@ object AfterDarkProofWebView {
                                 const reason = event.reason;
                                 const text =
                                   reason instanceof Error
-                                    ? `${reason.name}: ${reason.message}`
+                                    ? String(reason.name || "Error") +
+                                      ": " +
+                                      String(reason.message || "")
                                     : String(reason);
 
                                 const code = extractCloudflareCode(text);
