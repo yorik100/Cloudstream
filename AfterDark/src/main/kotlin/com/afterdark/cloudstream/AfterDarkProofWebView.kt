@@ -2398,6 +2398,54 @@ object AfterDarkProofWebView {
                                   rect.height / 2;
                                 let tapStrategy =
                                   "element-center";
+                                let tapOffsetX = 0.0;
+                                let tapOffsetY = 0.0;
+
+                                /*
+                                 * Pick a floating-point point inside the central
+                                 * half of a measured target rectangle.
+                                 *
+                                 * offsetX ∈ [-width/4, +width/4]
+                                 * offsetY ∈ [-height/4, +height/4]
+                                 *
+                                 * There is no fixed pixel coordinate here.
+                                 */
+                                const offsetPointInCentralHalf =
+                                  targetRect => {
+                                    const centerX =
+                                      targetRect.left +
+                                      targetRect.width / 2;
+                                    const centerY =
+                                      targetRect.top +
+                                      targetRect.height / 2;
+
+                                    const offsetX =
+                                      (
+                                        Math.random() * 2.0 -
+                                        1.0
+                                      ) *
+                                      (
+                                        targetRect.width /
+                                        4.0
+                                      );
+
+                                    const offsetY =
+                                      (
+                                        Math.random() * 2.0 -
+                                        1.0
+                                      ) *
+                                      (
+                                        targetRect.height /
+                                        4.0
+                                      );
+
+                                    return {
+                                      x: centerX + offsetX,
+                                      y: centerY + offsetY,
+                                      offsetX,
+                                      offsetY
+                                    };
+                                  };
 
                                 const elementTag =
                                   String(
@@ -2622,14 +2670,20 @@ object AfterDarkProofWebView {
                                 }
 
                                 if (bestVisualBox) {
-                                  x =
-                                    bestVisualBox.left +
-                                    bestVisualBox.width / 2;
-                                  y =
-                                    bestVisualBox.top +
-                                    bestVisualBox.height / 2;
+                                  const point =
+                                    offsetPointInCentralHalf(
+                                      bestVisualBox
+                                    );
+
+                                  x = point.x;
+                                  y = point.y;
+                                  tapOffsetX =
+                                    point.offsetX;
+                                  tapOffsetY =
+                                    point.offsetY;
+
                                   tapStrategy =
-                                    "dynamic-visual-box-center";
+                                    "dynamic-visual-box-offset";
 
                                   turnstileDebug(
                                     "Case visuelle dynamique: " +
@@ -2645,7 +2699,11 @@ object AfterDarkProofWebView {
                                       )
                                       .join(",") +
                                     " score=" +
-                                    bestVisualScore.toFixed(4)
+                                    bestVisualScore.toFixed(4) +
+                                    " offset=" +
+                                    tapOffsetX.toFixed(3) +
+                                    "," +
+                                    tapOffsetY.toFixed(3)
                                   );
                                 } else if (
                                   labelRect.width > 0 &&
@@ -2670,16 +2728,35 @@ object AfterDarkProofWebView {
                                       labelRect.width
                                     );
 
-                                  x =
-                                    labelRect.left +
-                                    inferredSide / 2;
+                                  const inferredRect = {
+                                    left:
+                                      labelRect.left,
+                                    top:
+                                      labelRect.top +
+                                      (
+                                        labelRect.height -
+                                        inferredSide
+                                      ) / 2,
+                                    width:
+                                      inferredSide,
+                                    height:
+                                      inferredSide
+                                  };
 
-                                  y =
-                                    labelRect.top +
-                                    labelRect.height / 2;
+                                  const point =
+                                    offsetPointInCentralHalf(
+                                      inferredRect
+                                    );
+
+                                  x = point.x;
+                                  y = point.y;
+                                  tapOffsetX =
+                                    point.offsetX;
+                                  tapOffsetY =
+                                    point.offsetY;
 
                                   tapStrategy =
-                                    "dynamic-label-square-center";
+                                    "dynamic-label-square-offset";
 
                                   turnstileDebug(
                                     "Case déduite dynamiquement du label: " +
@@ -2696,7 +2773,11 @@ object AfterDarkProofWebView {
                                       )
                                       .join(",") +
                                     " inferredSide=" +
-                                    inferredSide.toFixed(2)
+                                    inferredSide.toFixed(2) +
+                                    " offset=" +
+                                    tapOffsetX.toFixed(3) +
+                                    "," +
+                                    tapOffsetY.toFixed(3)
                                   );
                                 }
 
@@ -2708,9 +2789,13 @@ object AfterDarkProofWebView {
                                   " strategy=" +
                                   tapStrategy +
                                   " tap=" +
-                                  x.toFixed(2) +
+                                  x.toFixed(3) +
                                   "," +
-                                  y.toFixed(2)
+                                  y.toFixed(3) +
+                                  " offset=" +
+                                  tapOffsetX.toFixed(3) +
+                                  "," +
+                                  tapOffsetY.toFixed(3)
                                 );
 
                                 try {
