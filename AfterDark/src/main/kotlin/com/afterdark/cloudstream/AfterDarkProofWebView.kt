@@ -265,6 +265,93 @@ object AfterDarkProofWebView {
                 )
             }
 
+            fun resolveTurnstileCandidateFromFrame(
+                childX: Double,
+                childY: Double,
+                childViewportWidth: Double,
+                childViewportHeight: Double,
+                sourceHref: String?,
+            ) {
+                if (
+                    finished.get() ||
+                    officialPlayerMode.get() ||
+                    cloudflareErrorReloadInProgress.get()
+                ) return
+
+                val href = sourceHref.orEmpty()
+                if (
+                    !href.startsWith(
+                        "https://challenges.cloudflare.com/",
+                        ignoreCase = true,
+                    )
+                ) {
+                    Log.w(
+                        TAG,
+                        "Candidat Turnstile ignoré: frame non Cloudflare: $href",
+                    )
+                    return
+                }
+
+                if (
+                    !childX.isFinite() ||
+                    !childY.isFinite() ||
+                    !childViewportWidth.isFinite() ||
+                    !childViewportHeight.isFinite() ||
+                    childViewportWidth <= 0.0 ||
+                    childViewportHeight <= 0.0
+                ) {
+                    Log.w(
+                        TAG,
+                        "Candidat Turnstile invalide: " +
+                            "point=($childX,$childY) " +
+                            "viewport=($childViewportWidth,$childViewportHeight)",
+                    )
+                    return
+                }
+
+                browser.post {
+                    if (finished.get() || officialPlayerMode.get()) {
+                        return@post
+                    }
+
+                    val hrefJson = JSONObject.quote(href)
+
+                    browser.evaluateJavascript(
+                        """
+                        (() => {
+                          const resolver =
+                            window.__afterdarkResolveTurnstileCandidate;
+
+                          if (typeof resolver !== "function") {
+                            return "NO_TOP_RESOLVER";
+                          }
+
+                          try {
+                            return String(
+                              resolver({
+                                x: $childX,
+                                y: $childY,
+                                viewportWidth: $childViewportWidth,
+                                viewportHeight: $childViewportHeight,
+                                sourceHref: $hrefJson
+                              })
+                            );
+                          } catch (error) {
+                            return "TOP_RESOLVER_ERROR:" +
+                              String(error || "");
+                          }
+                        })();
+                        """.trimIndent(),
+                    ) { result ->
+                        Log.i(
+                            TAG,
+                            "Résolution Turnstile top-frame: " +
+                                result.orEmpty().take(1000),
+                        )
+                    }
+                }
+            }
+
             fun dispatchTurnstileNativeTap(
                 cssX: Double,
                 cssY: Double,
@@ -983,6 +1070,25 @@ object AfterDarkProofWebView {
                     }
 
                     @JavascriptInterface
+                    fun turnstileFrameCandidate(
+                        childX: Double,
+                        childY: Double,
+                        childViewportWidth: Double,
+                        childViewportHeight: Double,
+                        sourceHref: String?,
+                    ) {
+                        handler.post {
+                            resolveTurnstileCandidateFromFrame(
+                                childX = childX,
+                                childY = childY,
+                                childViewportWidth = childViewportWidth,
+                                childViewportHeight = childViewportHeight,
+                                sourceHref = sourceHref,
+                            )
+                        }
+                    }
+
+                    @JavascriptInterface
                     fun turnstileNativeTap(
                         cssX: Double,
                         cssY: Double,
@@ -1568,37 +1674,21 @@ object AfterDarkProofWebView {
                           }
 
                           // -------------------------------------------------
-                          // Deep Turnstile locator + native trusted-input relay.
+                          // Deep Turnstile locator + Android bridge relay.
                           //
-                          // JavaScript does NOT click the control here.
-                          // It only finds the control and translates its
-                          // coordinates through every iframe up to the top page.
-                          // Android then taps the WebView at that exact point,
-                          // letting Chromium generate the DOM input events.
+                          // No cross-frame postMessage is used here.
+                          //
+                          // Flow:
+                          // Cloudflare frame finds control -> Android bridge ->
+                          // main frame resolves the Cloudflare iframe rectangle ->
+                          // Android dispatches the real WebView touch.
                           // -------------------------------------------------
                           if (!window.__afterdarkTrustedTurnstileLocator) {
                             window.__afterdarkTrustedTurnstileLocator = true;
 
-                            const TURNSTILE_TAP_MESSAGE =
-                              "__afterdarkTurnstileNativeTap";
-                            const TURNSTILE_BIND_MESSAGE =
-                              "__afterdarkTurnstileFrameBind";
-                            const TURNSTILE_BIND_ACK_MESSAGE =
-                              "__afterdarkTurnstileFrameBindAck";
-
                             const turnstileRoots = new Set();
                             const turnstileLastRequest =
                               new WeakMap();
-
-                            // Cross-origin WindowProxy identity is not reliable
-                            // enough in Android WebView's document-start worlds.
-                            // Each parent therefore assigns an explicit ID to
-                            // every child frame and remembers the exact <iframe>
-                            // element for that ID.
-                            const turnstileFrameIds = new WeakMap();
-                            const turnstileFramesById = new Map();
-                            let turnstileFrameSequence = 0;
-                            let turnstileParentFrameId = null;
 
                             turnstileRoots.add(document);
 
@@ -1630,9 +1720,8 @@ object AfterDarkProofWebView {
                             );
 
                             /*
-                             * Log the actual events Chromium creates.
-                             * This is diagnostic only and does not cancel,
-                             * alter or synthesize anything.
+                             * Log what Chromium actually generates from the
+                             * native WebView touch.
                              */
                             if (isCloudflareTurnstileFrame()) {
                               for (
@@ -1688,7 +1777,7 @@ object AfterDarkProofWebView {
                             }
 
                             /*
-                             * Capture even CLOSED shadow roots created after
+                             * Capture CLOSED Shadow DOM roots created after
                              * document-start.
                              */
                             try {
@@ -1992,295 +2081,25 @@ object AfterDarkProofWebView {
                                 }
                               };
 
-                            const registerTurnstileChildFrames = () => {
-                              let frames = [];
-
-                              try {
-                                frames = Array.from(
-                                  document.querySelectorAll(
-                                    "iframe,frame"
-                                  )
-                                );
-                              } catch (_) {}
-
-                              for (const frame of frames) {
-                                let frameId =
-                                  turnstileFrameIds.get(frame);
-
-                                if (!frameId) {
-                                  turnstileFrameSequence += 1;
-
-                                  frameId =
-                                    "adcf-" +
-                                    String(turnstileFrameSequence) +
-                                    "-" +
-                                    String(Date.now());
-
-                                  turnstileFrameIds.set(
-                                    frame,
-                                    frameId
-                                  );
-
-                                  turnstileFramesById.set(
-                                    frameId,
-                                    frame
-                                  );
-                                }
-
-                                try {
-                                  frame.contentWindow.postMessage(
-                                    {
-                                      [TURNSTILE_BIND_MESSAGE]:
-                                        true,
-                                      frameId
-                                    },
-                                    "*"
-                                  );
-                                } catch (_) {}
-                              }
-                            };
-
-                            const postTurnstileTapToParent =
-                              data => {
-                                if (
-                                  !data ||
-                                  window === window.top ||
-                                  !turnstileParentFrameId
-                                ) {
-                                  return false;
-                                }
-
-                                try {
-                                  window.parent.postMessage(
-                                    {
-                                      ...data,
-                                      [TURNSTILE_TAP_MESSAGE]:
-                                        true,
-                                      frameId:
-                                        turnstileParentFrameId
-                                    },
-                                    "*"
-                                  );
-
-                                  return true;
-                                } catch (_) {
-                                  return false;
-                                }
-                              };
-
                             /*
-                             * Relay child-frame coordinates to the top frame.
+                             * Runs only in the TOP frame.
                              *
-                             * At each iframe boundary, map child CSS viewport
-                             * coordinates into the parent's CSS viewport using
-                             * the iframe's rendered rectangle. This also handles
-                             * iframe scaling.
+                             * The top frame already captured its closed shadow
+                             * roots at document-start, so it can locate a
+                             * Cloudflare iframe even when that iframe is inside
+                             * a closed component shadow tree.
                              */
-                            const relayTurnstileTap = data => {
-                              if (!data) return;
-
-                              const x = Number(data.x);
-                              const y = Number(data.y);
-                              const childViewportWidth =
-                                Number(
-                                  data.viewportWidth
-                                );
-                              const childViewportHeight =
-                                Number(
-                                  data.viewportHeight
-                                );
-
-                              if (
-                                !Number.isFinite(x) ||
-                                !Number.isFinite(y) ||
-                                !Number.isFinite(
-                                  childViewportWidth
-                                ) ||
-                                !Number.isFinite(
-                                  childViewportHeight
-                                ) ||
-                                childViewportWidth <= 0 ||
-                                childViewportHeight <= 0
-                              ) {
-                                return;
-                              }
-
-                              if (window === window.top) {
-                                turnstileDebug(
-                                  "TOP TAP css=" +
-                                  x.toFixed(2) +
-                                  "," +
-                                  y.toFixed(2) +
-                                  " viewport=" +
-                                  String(
-                                    window.innerWidth
-                                  ) +
-                                  "x" +
-                                  String(
-                                    window.innerHeight
-                                  )
-                                );
-
-                                try {
-                                  window.AfterDarkNative
-                                    .turnstileNativeTap(
-                                      x,
-                                      y,
-                                      Number(
-                                        window.innerWidth
-                                      ),
-                                      Number(
-                                        window.innerHeight
-                                      ),
-                                      String(
-                                        data.sourceHref || ""
-                                      )
-                                    );
-                                } catch (error) {
-                                  turnstileDebug(
-                                    "native tap bridge error " +
-                                    String(error || "")
-                                  );
-                                }
-
-                                return;
-                              }
-
-                              postTurnstileTapToParent({
-                                x,
-                                y,
-                                viewportWidth:
-                                  childViewportWidth,
-                                viewportHeight:
-                                  childViewportHeight,
-                                sourceHref:
-                                  String(
-                                    data.sourceHref || ""
-                                  )
-                              });
-                            };
-
-                            window.addEventListener(
-                              "message",
-                              event => {
-                                const data = event.data;
-
-                                if (!data) return;
-
-                                // Parent assigns this child an explicit frame ID.
-                                if (
-                                  data[
-                                    TURNSTILE_BIND_MESSAGE
-                                  ] === true
-                                ) {
-                                  const frameId =
-                                    String(
-                                      data.frameId || ""
-                                    );
-
-                                  if (frameId) {
-                                    const changed =
-                                      turnstileParentFrameId !==
-                                      frameId;
-
-                                    turnstileParentFrameId =
-                                      frameId;
-
-                                    if (changed) {
-                                      turnstileDebug(
-                                        "FRAME BIND id=" +
-                                        frameId +
-                                        " href=" +
-                                        String(
-                                          location.href || ""
-                                        )
-                                      );
-                                    }
-
-                                    try {
-                                      window.parent.postMessage(
-                                        {
-                                          [TURNSTILE_BIND_ACK_MESSAGE]:
-                                            true,
-                                          frameId,
-                                          href:
-                                            String(
-                                              location.href || ""
-                                            )
-                                        },
-                                        "*"
-                                      );
-                                    } catch (_) {}
+                            if (window === window.top) {
+                              window.__afterdarkResolveTurnstileCandidate =
+                                data => {
+                                  if (!data) {
+                                    return "NO_DATA";
                                   }
 
-                                  return;
-                                }
-
-                                if (
-                                  data[
-                                    TURNSTILE_BIND_ACK_MESSAGE
-                                  ] === true
-                                ) {
-                                  const frameId =
-                                    String(
-                                      data.frameId || ""
-                                    );
-
-                                  if (
-                                    frameId &&
-                                    turnstileFramesById.has(
-                                      frameId
-                                    )
-                                  ) {
-                                    turnstileDebug(
-                                      "FRAME ACK id=" +
-                                      frameId +
-                                      " child=" +
-                                      String(
-                                        data.href || ""
-                                      )
-                                    );
-                                  }
-
-                                  return;
-                                }
-
-                                if (
-                                  data[
-                                    TURNSTILE_TAP_MESSAGE
-                                  ] !== true
-                                ) {
-                                  return;
-                                }
-
-                                const frameId =
-                                  String(
-                                    data.frameId || ""
-                                  );
-
-                                const childFrame =
-                                  turnstileFramesById.get(
-                                    frameId
-                                  ) || null;
-
-                                if (!childFrame) {
-                                  // Re-register immediately. This covers frame
-                                  // replacement/navigation between the bind and
-                                  // the actual Turnstile tap request.
-                                  registerTurnstileChildFrames();
-
-                                  turnstileDebug(
-                                    "relay frame id inconnu=" +
-                                    frameId
-                                  );
-                                  return;
-                                }
-
-                                try {
-                                  const frameRect =
-                                    childFrame
-                                      .getBoundingClientRect();
-
+                                  const childX =
+                                    Number(data.x);
+                                  const childY =
+                                    Number(data.y);
                                   const childW =
                                     Number(
                                       data.viewportWidth
@@ -2291,43 +2110,166 @@ object AfterDarkProofWebView {
                                     );
 
                                   if (
+                                    !Number.isFinite(childX) ||
+                                    !Number.isFinite(childY) ||
+                                    !Number.isFinite(childW) ||
+                                    !Number.isFinite(childH) ||
                                     childW <= 0 ||
                                     childH <= 0
                                   ) {
-                                    return;
+                                    return "BAD_CHILD_COORDS";
                                   }
 
-                                  const mappedX =
-                                    frameRect.left +
-                                    (
-                                      Number(data.x) *
-                                      frameRect.width /
-                                      childW
+                                  const frames = [];
+
+                                  for (
+                                    const root of
+                                      collectTurnstileRoots()
+                                  ) {
+                                    let values = [];
+
+                                    try {
+                                      values =
+                                        root.querySelectorAll(
+                                          "iframe,frame"
+                                        );
+                                    } catch (_) {}
+
+                                    for (const frame of values) {
+                                      if (
+                                        !frames.includes(frame)
+                                      ) {
+                                        frames.push(frame);
+                                      }
+                                    }
+                                  }
+
+                                  const cloudflareFrames =
+                                    frames
+                                      .map(frame => {
+                                        let src = "";
+
+                                        try {
+                                          src =
+                                            String(
+                                              frame.src ||
+                                              frame.getAttribute(
+                                                "src"
+                                              ) ||
+                                              ""
+                                            );
+                                        } catch (_) {}
+
+                                        let host = "";
+
+                                        try {
+                                          host =
+                                            new URL(
+                                              src,
+                                              location.href
+                                            ).hostname
+                                              .toLowerCase();
+                                        } catch (_) {}
+
+                                        let rect = null;
+
+                                        try {
+                                          rect =
+                                            frame
+                                              .getBoundingClientRect();
+                                        } catch (_) {}
+
+                                        if (
+                                          host !==
+                                            "challenges.cloudflare.com" ||
+                                          !rect ||
+                                          rect.width <= 0 ||
+                                          rect.height <= 0
+                                        ) {
+                                          return null;
+                                        }
+
+                                        // Prefer a frame whose rendered aspect
+                                        // and dimensions resemble the child
+                                        // viewport that reported the checkbox.
+                                        const widthRatio =
+                                          rect.width / childW;
+                                        const heightRatio =
+                                          rect.height / childH;
+
+                                        const score =
+                                          Math.abs(
+                                            Math.log(
+                                              Math.max(
+                                                widthRatio,
+                                                0.0001
+                                              )
+                                            )
+                                          ) +
+                                          Math.abs(
+                                            Math.log(
+                                              Math.max(
+                                                heightRatio,
+                                                0.0001
+                                              )
+                                            )
+                                          );
+
+                                        return {
+                                          frame,
+                                          src,
+                                          rect,
+                                          score
+                                        };
+                                      })
+                                      .filter(Boolean)
+                                      .sort(
+                                        (a, b) =>
+                                          a.score - b.score
+                                      );
+
+                                  const match =
+                                    cloudflareFrames[0] ||
+                                    null;
+
+                                  if (!match) {
+                                    turnstileDebug(
+                                      "TOP iframe Cloudflare introuvable " +
+                                      "frames=" +
+                                      String(frames.length)
                                     );
+                                    return "NO_CF_IFRAME";
+                                  }
+
+                                  const rect = match.rect;
+
+                                  const mappedX =
+                                    rect.left +
+                                    childX *
+                                      rect.width /
+                                      childW;
 
                                   const mappedY =
-                                    frameRect.top +
-                                    (
-                                      Number(data.y) *
-                                      frameRect.height /
-                                      childH
-                                    );
+                                    rect.top +
+                                    childY *
+                                      rect.height /
+                                      childH;
 
                                   turnstileDebug(
-                                    "RELAY id=" +
-                                    frameId +
-                                    " child=" +
-                                    Number(data.x)
-                                      .toFixed(2) +
+                                    "TOP RESOLVE child=" +
+                                    childX.toFixed(2) +
                                     "," +
-                                    Number(data.y)
-                                      .toFixed(2) +
-                                    " frameRect=" +
+                                    childY.toFixed(2) +
+                                    " childViewport=" +
+                                    childW.toFixed(2) +
+                                    "x" +
+                                    childH.toFixed(2) +
+                                    " iframe=" +
                                     [
-                                      frameRect.left,
-                                      frameRect.top,
-                                      frameRect.width,
-                                      frameRect.height
+                                      rect.left,
+                                      rect.top,
+                                      rect.width,
+                                      rect.height
                                     ]
                                       .map(value =>
                                         Number(value)
@@ -2340,45 +2282,38 @@ object AfterDarkProofWebView {
                                     mappedY.toFixed(2)
                                   );
 
-                                  const nextData = {
-                                    [TURNSTILE_TAP_MESSAGE]:
-                                      true,
-                                    x: mappedX,
-                                    y: mappedY,
-                                    viewportWidth:
-                                      Number(
-                                        window.innerWidth
-                                      ),
-                                    viewportHeight:
-                                      Number(
-                                        window.innerHeight
-                                      ),
-                                    sourceHref:
-                                      String(
-                                        data.sourceHref || ""
-                                      )
-                                  };
-
-                                  if (
-                                    window === window.top
-                                  ) {
-                                    relayTurnstileTap(
-                                      nextData
+                                  try {
+                                    window.AfterDarkNative
+                                      .turnstileNativeTap(
+                                        mappedX,
+                                        mappedY,
+                                        Number(
+                                          window.innerWidth
+                                        ),
+                                        Number(
+                                          window.innerHeight
+                                        ),
+                                        String(
+                                          data.sourceHref ||
+                                          ""
+                                        )
+                                      );
+                                  } catch (error) {
+                                    turnstileDebug(
+                                      "TOP native tap erreur " +
+                                      String(error || "")
                                     );
-                                  } else {
-                                    postTurnstileTapToParent(
-                                      nextData
-                                    );
+                                    return "NATIVE_TAP_ERROR";
                                   }
-                                } catch (error) {
-                                  turnstileDebug(
-                                    "relay erreur " +
-                                    String(error || "")
+
+                                  return (
+                                    "OK:" +
+                                    mappedX.toFixed(2) +
+                                    "," +
+                                    mappedY.toFixed(2)
                                   );
-                                }
-                              },
-                              false
-                            );
+                                };
+                            }
 
                             const requestTurnstileNativeTap =
                               element => {
@@ -2395,9 +2330,6 @@ object AfterDarkProofWebView {
                                     element
                                   ) || 0;
 
-                                // If the widget remains unchanged, retry
-                                // occasionally. A successful Turnstile normally
-                                // replaces/removes it immediately.
                                 if (
                                   now - lastRequest < 1800
                                 ) {
@@ -2427,18 +2359,29 @@ object AfterDarkProofWebView {
                                 let tapStrategy =
                                   "element-center";
 
+                                /*
+                                 * Use a real checkbox rectangle only when it
+                                 * actually looks like a checkbox. v82 logged a
+                                 * descendant checkbox whose rect covered the
+                                 * whole 221 px label, so blindly trusting it
+                                 * still targeted x=119.
+                                 */
                                 try {
                                   const checkbox =
-                                    element.matches &&
-                                    element.matches(
-                                      'input[type="checkbox"],' +
-                                      '[role="checkbox"]'
+                                    (
+                                      element.matches &&
+                                      element.matches(
+                                        'input[type="checkbox"],' +
+                                        '[role="checkbox"]'
+                                      )
                                     )
                                       ? element
-                                      : element.querySelector &&
-                                        element.querySelector(
-                                          'input[type="checkbox"],' +
-                                          '[role="checkbox"]'
+                                      : (
+                                          element.querySelector &&
+                                          element.querySelector(
+                                            'input[type="checkbox"],' +
+                                            '[role="checkbox"]'
+                                          )
                                         );
 
                                   if (checkbox) {
@@ -2446,10 +2389,13 @@ object AfterDarkProofWebView {
                                       checkbox
                                         .getBoundingClientRect();
 
-                                    if (
-                                      checkboxRect.width > 0 &&
-                                      checkboxRect.height > 0
-                                    ) {
+                                    const plausibleCheckbox =
+                                      checkboxRect.width >= 8 &&
+                                      checkboxRect.height >= 8 &&
+                                      checkboxRect.width <= 64 &&
+                                      checkboxRect.height <= 64;
+
+                                    if (plausibleCheckbox) {
                                       x =
                                         checkboxRect.left +
                                         checkboxRect.width / 2;
@@ -2457,7 +2403,7 @@ object AfterDarkProofWebView {
                                         checkboxRect.top +
                                         checkboxRect.height / 2;
                                       tapStrategy =
-                                        "checkbox-center";
+                                        "real-checkbox-center";
                                     }
                                   }
                                 } catch (_) {}
@@ -2469,10 +2415,16 @@ object AfterDarkProofWebView {
                                     element.tagName || ""
                                   ).toLowerCase() === "label"
                                 ) {
-                                  // The working browser trace hit x≈22 while
-                                  // the label started at x≈8.7 and was 24 px
-                                  // high. Aim at the checkbox area on the left,
-                                  // not at the label's 220 px-wide center.
+                                  /*
+                                   * Runtime log:
+                                   * label rect = 8.67,20.5,221.72,24
+                                   *
+                                   * Successful desktop trusted click:
+                                   * x ~= 22.4, y ~= 34.4
+                                   *
+                                   * For that exact geometry this produces:
+                                   * x ~= 21.87, y ~= 34.42
+                                   */
                                   const leftInset =
                                     Math.max(
                                       10,
@@ -2491,9 +2443,11 @@ object AfterDarkProofWebView {
                                         rect.width - 1
                                       )
                                     );
+
                                   y =
                                     rect.top +
-                                    rect.height / 2;
+                                    rect.height * 0.58;
+
                                   tapStrategy =
                                     "label-checkbox-zone";
                                 }
@@ -2511,54 +2465,39 @@ object AfterDarkProofWebView {
                                   y.toFixed(2)
                                 );
 
-                                const tapData = {
-                                  [TURNSTILE_TAP_MESSAGE]:
-                                    true,
-                                  x,
-                                  y,
-                                  viewportWidth:
-                                    Number(
-                                      window.innerWidth
-                                    ),
-                                  viewportHeight:
-                                    Number(
-                                      window.innerHeight
-                                    ),
-                                  sourceHref:
-                                    String(
-                                      location.href || ""
-                                    )
-                                };
-
-                                if (
-                                  window === window.top
-                                ) {
-                                  relayTurnstileTap(
-                                    tapData
-                                  );
-                                } else {
-                                  if (
-                                    !postTurnstileTapToParent(
-                                      tapData
-                                    )
-                                  ) {
-                                    registerTurnstileChildFrames();
-
-                                    turnstileDebug(
-                                      "tap en attente du FRAME BIND"
+                                try {
+                                  window.AfterDarkNative
+                                    .turnstileFrameCandidate(
+                                      x,
+                                      y,
+                                      Number(
+                                        window.innerWidth
+                                      ),
+                                      Number(
+                                        window.innerHeight
+                                      ),
+                                      String(
+                                        location.href || ""
+                                      )
                                     );
-                                  }
-                                }
 
-                                return true;
+                                  turnstileDebug(
+                                    "CANDIDAT envoye au bridge Android"
+                                  );
+
+                                  return true;
+                                } catch (error) {
+                                  turnstileDebug(
+                                    "bridge candidat erreur " +
+                                    String(error || "")
+                                  );
+                                  return false;
+                                }
                               };
 
                             let lastTurnstileSummary = "";
 
                             const scanTurnstile = () => {
-                              // The real Turnstile control is hosted by
-                              // challenges.cloudflare.com. Parent frames only
-                              // need the relay listener above.
                               if (
                                 !isCloudflareTurnstileFrame()
                               ) {
@@ -2620,7 +2559,6 @@ object AfterDarkProofWebView {
                               ) {
                                 lastTurnstileSummary =
                                   summary;
-
                                 turnstileDebug(summary);
                               }
 
@@ -2635,16 +2573,12 @@ object AfterDarkProofWebView {
                             };
 
                             const startTurnstileScanner = () => {
-                              registerTurnstileChildFrames();
                               scanTurnstile();
 
                               try {
                                 const observer =
                                   new MutationObserver(
-                                    () => {
-                                      registerTurnstileChildFrames();
-                                      scanTurnstile();
-                                    }
+                                    scanTurnstile
                                   );
 
                                 observer.observe(
@@ -2673,13 +2607,6 @@ object AfterDarkProofWebView {
                                   String(error || "")
                                 );
                               }
-
-                              window
-                                .__afterdarkTurnstileFramePoller =
-                                  setInterval(
-                                    registerTurnstileChildFrames,
-                                    250
-                                  );
 
                               window
                                 .__afterdarkTurnstilePoller =
@@ -2712,7 +2639,7 @@ object AfterDarkProofWebView {
             }
 
             if (frameDetectorInstalled) {
-                Log.i(TAG, "Locator Turnstile + relay frame-id installé dans toutes les frames")
+                Log.i(TAG, "Locator Turnstile + relay Android installé dans toutes les frames")
             } else {
                 Log.w(TAG, "Clicker Turnstile profond multi-frame indisponible")
             }
