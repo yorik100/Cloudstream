@@ -453,8 +453,8 @@ object AfterDarkProofWebView {
                     // 50..70 ms range, inclusive.
                     val nativePressDurationMs =
                         kotlin.random.Random.nextLong(
-                            from = 50L,
-                            until = 71L,
+                            from = 40L,
+                            until = 55L,
                         )
 
                     Log.i(
@@ -2525,13 +2525,13 @@ object AfterDarkProofWebView {
 
                                         const insideHost =
                                           centerX >=
-                                            hostRect.left - 2 &&
+                                            hostRect.left - 8 &&
                                           centerX <=
-                                            hostRect.right + 2 &&
+                                            hostRect.right + 8 &&
                                           centerY >=
-                                            hostRect.top - 2 &&
+                                            hostRect.top - 8 &&
                                           centerY <=
-                                            hostRect.bottom + 2;
+                                            hostRect.bottom + 8;
 
                                         if (!insideHost) {
                                           continue;
@@ -2813,11 +2813,7 @@ object AfterDarkProofWebView {
                                     .join(",")
                                 );
 
-                                const dispatchDelayMs =
-                                  100 +
-                                  Math.floor(
-                                    Math.random() * 51
-                                  );
+                                const dispatchDelayMs = 0;
 
                                 turnstileDebug(
                                   "CANDIDAT delai avant tap=" +
@@ -2869,9 +2865,9 @@ object AfterDarkProofWebView {
 
                                     // Independent FLOAT jitter in [-2, +2].
                                     const jitterX =
-                                      Math.random() * 4 - 2;
+                                      Math.random() * 16 - 8;
                                     const jitterY =
-                                      Math.random() * 4 - 2;
+                                      Math.random() * 16 - 8;
 
                                     const x =
                                       centerX + jitterX;
