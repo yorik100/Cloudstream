@@ -1581,10 +1581,24 @@ object AfterDarkProofWebView {
 
                             const TURNSTILE_TAP_MESSAGE =
                               "__afterdarkTurnstileNativeTap";
+                            const TURNSTILE_BIND_MESSAGE =
+                              "__afterdarkTurnstileFrameBind";
+                            const TURNSTILE_BIND_ACK_MESSAGE =
+                              "__afterdarkTurnstileFrameBindAck";
 
                             const turnstileRoots = new Set();
                             const turnstileLastRequest =
                               new WeakMap();
+
+                            // Cross-origin WindowProxy identity is not reliable
+                            // enough in Android WebView's document-start worlds.
+                            // Each parent therefore assigns an explicit ID to
+                            // every child frame and remembers the exact <iframe>
+                            // element for that ID.
+                            const turnstileFrameIds = new WeakMap();
+                            const turnstileFramesById = new Map();
+                            let turnstileFrameSequence = 0;
+                            let turnstileParentFrameId = null;
 
                             turnstileRoots.add(document);
 
@@ -1978,6 +1992,82 @@ object AfterDarkProofWebView {
                                 }
                               };
 
+                            const registerTurnstileChildFrames = () => {
+                              let frames = [];
+
+                              try {
+                                frames = Array.from(
+                                  document.querySelectorAll(
+                                    "iframe,frame"
+                                  )
+                                );
+                              } catch (_) {}
+
+                              for (const frame of frames) {
+                                let frameId =
+                                  turnstileFrameIds.get(frame);
+
+                                if (!frameId) {
+                                  turnstileFrameSequence += 1;
+
+                                  frameId =
+                                    "adcf-" +
+                                    String(turnstileFrameSequence) +
+                                    "-" +
+                                    String(Date.now());
+
+                                  turnstileFrameIds.set(
+                                    frame,
+                                    frameId
+                                  );
+
+                                  turnstileFramesById.set(
+                                    frameId,
+                                    frame
+                                  );
+                                }
+
+                                try {
+                                  frame.contentWindow.postMessage(
+                                    {
+                                      [TURNSTILE_BIND_MESSAGE]:
+                                        true,
+                                      frameId
+                                    },
+                                    "*"
+                                  );
+                                } catch (_) {}
+                              }
+                            };
+
+                            const postTurnstileTapToParent =
+                              data => {
+                                if (
+                                  !data ||
+                                  window === window.top ||
+                                  !turnstileParentFrameId
+                                ) {
+                                  return false;
+                                }
+
+                                try {
+                                  window.parent.postMessage(
+                                    {
+                                      ...data,
+                                      [TURNSTILE_TAP_MESSAGE]:
+                                        true,
+                                      frameId:
+                                        turnstileParentFrameId
+                                    },
+                                    "*"
+                                  );
+
+                                  return true;
+                                } catch (_) {
+                                  return false;
+                                }
+                              };
+
                             /*
                              * Relay child-frame coordinates to the top frame.
                              *
@@ -2056,25 +2146,18 @@ object AfterDarkProofWebView {
                                 return;
                               }
 
-                              try {
-                                window.parent.postMessage(
-                                  {
-                                    [TURNSTILE_TAP_MESSAGE]:
-                                      true,
-                                    x,
-                                    y,
-                                    viewportWidth:
-                                      childViewportWidth,
-                                    viewportHeight:
-                                      childViewportHeight,
-                                    sourceHref:
-                                      String(
-                                        data.sourceHref || ""
-                                      )
-                                  },
-                                  "*"
-                                );
-                              } catch (_) {}
+                              postTurnstileTapToParent({
+                                x,
+                                y,
+                                viewportWidth:
+                                  childViewportWidth,
+                                viewportHeight:
+                                  childViewportHeight,
+                                sourceHref:
+                                  String(
+                                    data.sourceHref || ""
+                                  )
+                              });
                             };
 
                             window.addEventListener(
@@ -2082,8 +2165,87 @@ object AfterDarkProofWebView {
                               event => {
                                 const data = event.data;
 
+                                if (!data) return;
+
+                                // Parent assigns this child an explicit frame ID.
                                 if (
-                                  !data ||
+                                  data[
+                                    TURNSTILE_BIND_MESSAGE
+                                  ] === true
+                                ) {
+                                  const frameId =
+                                    String(
+                                      data.frameId || ""
+                                    );
+
+                                  if (frameId) {
+                                    const changed =
+                                      turnstileParentFrameId !==
+                                      frameId;
+
+                                    turnstileParentFrameId =
+                                      frameId;
+
+                                    if (changed) {
+                                      turnstileDebug(
+                                        "FRAME BIND id=" +
+                                        frameId +
+                                        " href=" +
+                                        String(
+                                          location.href || ""
+                                        )
+                                      );
+                                    }
+
+                                    try {
+                                      window.parent.postMessage(
+                                        {
+                                          [TURNSTILE_BIND_ACK_MESSAGE]:
+                                            true,
+                                          frameId,
+                                          href:
+                                            String(
+                                              location.href || ""
+                                            )
+                                        },
+                                        "*"
+                                      );
+                                    } catch (_) {}
+                                  }
+
+                                  return;
+                                }
+
+                                if (
+                                  data[
+                                    TURNSTILE_BIND_ACK_MESSAGE
+                                  ] === true
+                                ) {
+                                  const frameId =
+                                    String(
+                                      data.frameId || ""
+                                    );
+
+                                  if (
+                                    frameId &&
+                                    turnstileFramesById.has(
+                                      frameId
+                                    )
+                                  ) {
+                                    turnstileDebug(
+                                      "FRAME ACK id=" +
+                                      frameId +
+                                      " child=" +
+                                      String(
+                                        data.href || ""
+                                      )
+                                    );
+                                  }
+
+                                  return;
+                                }
+
+                                if (
                                   data[
                                     TURNSTILE_TAP_MESSAGE
                                   ] !== true
@@ -2091,28 +2253,25 @@ object AfterDarkProofWebView {
                                   return;
                                 }
 
-                                let childFrame = null;
+                                const frameId =
+                                  String(
+                                    data.frameId || ""
+                                  );
 
-                                try {
-                                  childFrame = Array.from(
-                                    document.querySelectorAll(
-                                      "iframe,frame"
-                                    )
-                                  ).find(frame => {
-                                    try {
-                                      return (
-                                        frame.contentWindow ===
-                                        event.source
-                                      );
-                                    } catch (_) {
-                                      return false;
-                                    }
-                                  }) || null;
-                                } catch (_) {}
+                                const childFrame =
+                                  turnstileFramesById.get(
+                                    frameId
+                                  ) || null;
 
                                 if (!childFrame) {
+                                  // Re-register immediately. This covers frame
+                                  // replacement/navigation between the bind and
+                                  // the actual Turnstile tap request.
+                                  registerTurnstileChildFrames();
+
                                   turnstileDebug(
-                                    "relay iframe introuvable"
+                                    "relay frame id inconnu=" +
+                                    frameId
                                   );
                                   return;
                                 }
@@ -2154,6 +2313,33 @@ object AfterDarkProofWebView {
                                       childH
                                     );
 
+                                  turnstileDebug(
+                                    "RELAY id=" +
+                                    frameId +
+                                    " child=" +
+                                    Number(data.x)
+                                      .toFixed(2) +
+                                    "," +
+                                    Number(data.y)
+                                      .toFixed(2) +
+                                    " frameRect=" +
+                                    [
+                                      frameRect.left,
+                                      frameRect.top,
+                                      frameRect.width,
+                                      frameRect.height
+                                    ]
+                                      .map(value =>
+                                        Number(value)
+                                          .toFixed(2)
+                                      )
+                                      .join(",") +
+                                    " mapped=" +
+                                    mappedX.toFixed(2) +
+                                    "," +
+                                    mappedY.toFixed(2)
+                                  );
+
                                   const nextData = {
                                     [TURNSTILE_TAP_MESSAGE]:
                                       true,
@@ -2180,9 +2366,8 @@ object AfterDarkProofWebView {
                                       nextData
                                     );
                                   } else {
-                                    window.parent.postMessage(
-                                      nextData,
-                                      "*"
+                                    postTurnstileTapToParent(
+                                      nextData
                                     );
                                   }
                                 } catch (error) {
@@ -2233,18 +2418,93 @@ object AfterDarkProofWebView {
                                   return false;
                                 }
 
-                                const x =
+                                let x =
                                   rect.left +
                                   rect.width / 2;
-                                const y =
+                                let y =
                                   rect.top +
                                   rect.height / 2;
+                                let tapStrategy =
+                                  "element-center";
+
+                                try {
+                                  const checkbox =
+                                    element.matches &&
+                                    element.matches(
+                                      'input[type="checkbox"],' +
+                                      '[role="checkbox"]'
+                                    )
+                                      ? element
+                                      : element.querySelector &&
+                                        element.querySelector(
+                                          'input[type="checkbox"],' +
+                                          '[role="checkbox"]'
+                                        );
+
+                                  if (checkbox) {
+                                    const checkboxRect =
+                                      checkbox
+                                        .getBoundingClientRect();
+
+                                    if (
+                                      checkboxRect.width > 0 &&
+                                      checkboxRect.height > 0
+                                    ) {
+                                      x =
+                                        checkboxRect.left +
+                                        checkboxRect.width / 2;
+                                      y =
+                                        checkboxRect.top +
+                                        checkboxRect.height / 2;
+                                      tapStrategy =
+                                        "checkbox-center";
+                                    }
+                                  }
+                                } catch (_) {}
+
+                                if (
+                                  tapStrategy ===
+                                    "element-center" &&
+                                  String(
+                                    element.tagName || ""
+                                  ).toLowerCase() === "label"
+                                ) {
+                                  // The working browser trace hit x≈22 while
+                                  // the label started at x≈8.7 and was 24 px
+                                  // high. Aim at the checkbox area on the left,
+                                  // not at the label's 220 px-wide center.
+                                  const leftInset =
+                                    Math.max(
+                                      10,
+                                      Math.min(
+                                        18,
+                                        rect.height * 0.55
+                                      )
+                                    );
+
+                                  x =
+                                    rect.left +
+                                    Math.min(
+                                      leftInset,
+                                      Math.max(
+                                        1,
+                                        rect.width - 1
+                                      )
+                                    );
+                                  y =
+                                    rect.top +
+                                    rect.height / 2;
+                                  tapStrategy =
+                                    "label-checkbox-zone";
+                                }
 
                                 turnstileDebug(
                                   "CANDIDAT " +
                                   describeTurnstile(
                                     element
                                   ) +
+                                  " strategy=" +
+                                  tapStrategy +
                                   " tap=" +
                                   x.toFixed(2) +
                                   "," +
@@ -2277,12 +2537,17 @@ object AfterDarkProofWebView {
                                     tapData
                                   );
                                 } else {
-                                  try {
-                                    window.parent.postMessage(
-                                      tapData,
-                                      "*"
+                                  if (
+                                    !postTurnstileTapToParent(
+                                      tapData
+                                    )
+                                  ) {
+                                    registerTurnstileChildFrames();
+
+                                    turnstileDebug(
+                                      "tap en attente du FRAME BIND"
                                     );
-                                  } catch (_) {}
+                                  }
                                 }
 
                                 return true;
@@ -2370,12 +2635,16 @@ object AfterDarkProofWebView {
                             };
 
                             const startTurnstileScanner = () => {
+                              registerTurnstileChildFrames();
                               scanTurnstile();
 
                               try {
                                 const observer =
                                   new MutationObserver(
-                                    scanTurnstile
+                                    () => {
+                                      registerTurnstileChildFrames();
+                                      scanTurnstile();
+                                    }
                                   );
 
                                 observer.observe(
@@ -2404,6 +2673,13 @@ object AfterDarkProofWebView {
                                   String(error || "")
                                 );
                               }
+
+                              window
+                                .__afterdarkTurnstileFramePoller =
+                                  setInterval(
+                                    registerTurnstileChildFrames,
+                                    250
+                                  );
 
                               window
                                 .__afterdarkTurnstilePoller =
@@ -2436,7 +2712,7 @@ object AfterDarkProofWebView {
             }
 
             if (frameDetectorInstalled) {
-                Log.i(TAG, "Clicker Turnstile profond installé dans toutes les frames")
+                Log.i(TAG, "Locator Turnstile + relay frame-id installé dans toutes les frames")
             } else {
                 Log.w(TAG, "Clicker Turnstile profond multi-frame indisponible")
             }
