@@ -16,7 +16,7 @@ Ce dépôt contient plusieurs extensions pour [CloudStream](https://github.com/r
 
 - Vérification automatique de la disponibilité des vidéos.
 - Lancement automatique de la vidéo.
-- Support presque natif de Videasy et Peachify.
+- Support presque natif de Peachify.
 - Indicateur du temps restant lorsqu'un épisode de série n'est pas encore sorti.
 - Affichage du nom et de la description des épisodes.
 
