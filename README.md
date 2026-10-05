@@ -19,22 +19,21 @@ Ce dépôt contient plusieurs extensions pour [CloudStream](https://github.com/r
 - Support presque natif de Peachify.
 - Indicateur du temps restant lorsqu'un épisode de série n'est pas encore sorti.
 - Affichage du nom et de la description des épisodes.
+- Résolution automatique du domaine actif.
 
 ### Frembed
 
 - Support natif des films et séries.
 - Indicateur du temps restant lorsqu'un épisode de série n'est pas encore sorti.
 - Affichage du nom et de la description des épisodes.
-
-Frembed ne génère aucun `x-nabi-proof`, n'utilise pas Turnstile et n'ouvre pas de WebView.
-
-L'extension suit les redirections de l'API, récupère les URLs des serveurs présentes dans les réponses ou lecteurs, délègue les hébergeurs connus aux extracteurs CloudStream et peut également récupérer les liens directs HLS, DASH et MP4 présents dans les pages.
+- Résolution automatique du domaine actif.
 
 ### Flemmix / Wiflix
 
 - Support natif des films et séries.
 - Indicateur du temps restant lorsqu'un épisode de série n'est pas encore sorti.
 - Affichage du nom et de la description des épisodes.
+- Résolution automatique du domaine actif.
 
 ### Xalaflix
 
