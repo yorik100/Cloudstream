@@ -133,6 +133,9 @@ class FlemmixProvider : MainAPI() {
 
         domainResolver.invalidate(firstOrigin)
         val refreshedOrigin = ensureDomain()
+        if (refreshedOrigin == firstOrigin) {
+            throw ErrorLoadingException("Catalogue Flemmix/Wiflix inaccessible")
+        }
         return fetchCatalogue(refreshedOrigin, type, page)
             ?: throw ErrorLoadingException("Catalogue Flemmix/Wiflix inaccessible")
     }
@@ -144,21 +147,64 @@ class FlemmixProvider : MainAPI() {
     ): CataloguePage? {
         val route = if (type == "tv") "/serie-en-streaming/" else "/film-en-streaming/"
         val pageUrl = origin + route + if (page > 1) "page/$page/" else ""
+
+        // HTTP is fast when the WebView has already obtained Bot Shield cookies.
+        val cookie = FlemmixSearchWebViewV16.cookieHeader(origin)
+        val headers = if (cookie.isNullOrBlank()) {
+            browserHeaders
+        } else {
+            browserHeaders + ("Cookie" to cookie)
+        }
+
         val response = runCatching {
             app.get(
                 url = pageUrl,
-                headers = browserHeaders,
+                headers = headers,
                 referer = "$origin/",
-                cacheTime = CATALOGUE_CACHE_SECONDS,
+                cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
-        }.getOrNull() ?: return null
+        }.onFailure { error ->
+            Log.w(SEARCH_TAG, "Catalogue HTTP inaccessible : $pageUrl", error)
+        }.getOrNull()
 
-        if (response.okhttpResponse.code !in 200..299) return null
-        val items = parseItems(response.text, origin, type).map { it.response }
+        val httpHtml = response?.takeIf {
+            it.okhttpResponse.code in 200..299 &&
+                !it.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)
+        }?.text
+
+        if (httpHtml != null) {
+            parseCatalogueHtml(httpHtml, origin, type, page)?.let {
+                Log.i(SEARCH_TAG, "Accueil HTTP: $type page=$page éléments=${it.items.size}")
+                return it
+            }
+        }
+
+        Log.w(
+            SEARCH_TAG,
+            "Accueil HTTP sans catalogue utilisable ($type p$page) ; " +
+                "secours WebView, HTTP=${response?.okhttpResponse?.code ?: "erreur"}",
+        )
+        val browserHtml = FlemmixSearchWebViewV16.loadCatalogue(origin, pageUrl)
+            ?: return null
+        return parseCatalogueHtml(browserHtml, origin, type, page).also {
+            Log.i(
+                SEARCH_TAG,
+                "Accueil WebView: $type page=$page éléments=${it?.items?.size ?: 0}",
+            )
+        }
+    }
+
+    private fun parseCatalogueHtml(
+        html: String,
+        origin: String,
+        type: String,
+        page: Int,
+    ): CataloguePage? {
+        val items = parseItems(html, origin, type).map { it.response }
         if (items.isEmpty()) return null
 
-        val totalPages = PAGE_LINK_REGEX.findAll(response.text)
+        val totalPages = PAGE_LINK_REGEX.findAll(html)
             .mapNotNull { it.groupValues[2].toIntOrNull() }
             .maxOrNull()
 
@@ -199,9 +245,12 @@ class FlemmixProvider : MainAPI() {
             .filter(String::isNotBlank)
         if (queryTerms.isEmpty()) return emptyList()
 
-        // Dès qu'un domaine a confirmé que son Bot Shield refuse les clients
-        // HTTP, ne pas refaire les trois requêtes lentes à chaque recherche.
+        // The WebView is the normal path for Bot Shield. However a transient
+        // empty document is not a successful search result: try the HTTP
+        // fallback before concluding that the search has no results.
+        var webViewTried = false
         if (webViewSearchOrigins.contains(origin)) {
+            webViewTried = true
             // Si un cookie Bot Shield valide a déjà été obtenu par le
             // warm-up ou une recherche WebView précédente, on l'essaie
             // d'abord en HTTP classique : résultat en une fraction de
@@ -211,13 +260,18 @@ class FlemmixProvider : MainAPI() {
             val cachedCookie = FlemmixSearchWebViewV16.cookieHeader(origin)
             if (cachedCookie != null) {
                 val quick = quickCookieSearch(origin, query, queryTerms, cachedCookie)
-                if (quick != null) {
+                if (!quick.isNullOrEmpty()) {
                     Log.i(SEARCH_TAG, "Recherche rapide (cookie réutilisé) : ${quick.size} résultat(s)")
                     return quick
                 }
                 Log.i(SEARCH_TAG, "Cookie Bot Shield expiré sur $origin, renouvellement WebView")
             }
-            return searchWithWebView(origin, query)
+            val browserResults = searchWithWebView(origin, query)
+            if (!browserResults.isNullOrEmpty()) return browserResults
+            Log.w(
+                SEARCH_TAG,
+                "WebView sans résultat exploitable, tentative HTTP de secours sur $origin",
+            )
         }
 
         // DLE lie le jeton de recherche aux cookies créés en chargeant la
@@ -329,7 +383,7 @@ class FlemmixProvider : MainAPI() {
         if (results.isEmpty() && (navigationBlocked || ajaxBlocked)) {
             webViewSearchOrigins.add(origin)
             Log.i(SEARCH_TAG, "Bot Shield détecté, recherche WebView en arrière-plan")
-            return searchWithWebView(origin, query)
+            return if (webViewTried) null else searchWithWebView(origin, query)
         }
 
         if (results.isEmpty()) {
@@ -542,6 +596,47 @@ class FlemmixProvider : MainAPI() {
                 "$type:$path",
                 ParsedItem(response, originalTitle),
             )
+        }
+
+        // The historical mov-t class is only an optimization. A redesign
+        // must not make the catalogue and search invisible to CloudStream.
+        run {
+            val document = Jsoup.parse(html, "$origin/")
+            for (anchor in document.select("a[href]")) {
+                val absolute = resolveUrl("$origin/", anchor.attr("href")) ?: continue
+                val uri = runCatching { URI(absolute) }.getOrNull() ?: continue
+                val path = uri.path ?: continue
+                val pathMatch = DETAIL_PATH_REGEX.matchEntire(path) ?: continue
+                val type = typeFromPath(pathMatch.groupValues[1])
+                if (forcedType != null && type != forcedType) continue
+
+                val image = anchor.selectFirst("img") ?: anchor.parent()?.selectFirst("img")
+                val imageAlt = image?.attr("alt")?.trim().orEmpty()
+                val title = sequenceOf(
+                    anchor.text().trim(),
+                    anchor.attr("title").trim(),
+                    imageAlt,
+                ).firstOrNull { it.isNotBlank() } ?: continue
+                val posterValue = sequenceOf(
+                    image?.attr("data-src"),
+                    image?.attr("data-lazy-src"),
+                    image?.attr("src"),
+                ).filterNotNull().firstOrNull(String::isNotBlank)
+                val posterUrl = posterValue?.let { resolveUrl("$origin/", it) }
+
+                val itemUrl = "$origin$path"
+                val item = if (type == "movie") {
+                    newMovieSearchResponse(title, itemUrl, TvType.Movie) {
+                        this.posterUrl = posterUrl
+                    }
+                } else {
+                    newTvSeriesSearchResponse(title, itemUrl, TvType.TvSeries) {
+                        this.posterUrl = posterUrl
+                    }
+                }
+                results.putIfAbsent("$type:$path", ParsedItem(item, null))
+            }
+            Log.i(SEARCH_TAG, "Extraction DOM générique: ${results.size} fiche(s)")
         }
 
         return results.values.toList()
@@ -1331,6 +1426,11 @@ object FlemmixSearchWebViewV16 {
     private const val WARM_UP_TIMEOUT_MS = 15_000L
     private const val POLL_INTERVAL_MS = 500L
     private const val WARM_UP_POLL_INTERVAL_MS = 100L
+    // Functional link pattern, not a CSS or visual-layout fingerprint.
+    private val SEARCH_DETAIL_LINK_REGEX = Regex(
+        """/(?:film-en-streaming|serie-en-streaming|film-ancien|saison-complete)/[0-9]+-[^\s"'<>]+\.html""",
+        RegexOption.IGNORE_CASE,
+    )
     private val initializedOrigins = ConcurrentHashMap.newKeySet<String>()
     private val warmingOrigins = ConcurrentHashMap.newKeySet<String>()
 
@@ -1443,6 +1543,114 @@ object FlemmixSearchWebViewV16 {
         }
     }
 
+    /**
+     * Loads a catalogue in the same Android WebView session as search.
+     * Called only when the fast HTTP catalogue response lacks usable cards.
+     * No CSS class or visible layout is required for readiness.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun loadCatalogue(origin: String, pageUrl: String): String? =
+        suspendCancellableCoroutine { continuation ->
+            val handler = Handler(Looper.getMainLooper())
+            val finished = AtomicBoolean(false)
+            var webView: WebView? = null
+            var lastHtml: String? = null
+            var attempts = 0
+            var polling = false
+            lateinit var timeout: Runnable
+            var poll: Runnable? = null
+
+            fun finish(html: String?) {
+                if (!finished.compareAndSet(false, true)) return
+                handler.removeCallbacks(timeout)
+                poll?.let { handler.removeCallbacks(it) }
+                handler.post {
+                    runCatching {
+                        webView?.let { view ->
+                            (view.parent as? ViewGroup)?.removeView(view)
+                            view.stopLoading()
+                            view.destroy()
+                        }
+                    }
+                    webView = null
+                }
+                if (continuation.isActive) continuation.resume(html)
+            }
+
+            timeout = Runnable {
+                Log.w(
+                    "FlemmixSearchWebView",
+                    "Expiration catalogue WebView : $pageUrl, " +
+                        "taille=${lastHtml?.length ?: 0}",
+                )
+                finish(lastHtml)
+            }
+            continuation.invokeOnCancellation { finish(null) }
+
+            handler.post {
+                val activity = FlemmixRuntimeV16.currentActivity()
+                if (activity == null || activity.isFinishing) {
+                    finish(null)
+                    return@post
+                }
+
+                try {
+                    val cookieManager = CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+                    val view = WebView(activity).apply {
+                        setBackgroundColor(Color.TRANSPARENT)
+                        alpha = 0.01f
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, url: String) {
+                                if (finished.get() || url == "about:blank" || polling) return
+                                polling = true
+                                // Wait for real catalogue links, rather than
+                                // accepting a short Bot Shield/skeleton page.
+                                // No implicit page reload is performed.
+                                val task = object : Runnable {
+                                    override fun run() {
+                                        if (finished.get()) return
+                                        view.evaluateJavascript(
+                                        "(function(){return document.documentElement.outerHTML;})()",
+                                    ) { encoded ->
+                                        if (finished.get()) return@evaluateJavascript
+                                        val html = runCatching {
+                                            JSONTokener(encoded).nextValue() as? String
+                                        }.getOrNull()
+                                        if (!html.isNullOrBlank()) lastHtml = html
+                                        attempts++
+                                        val hasCatalogue = html != null &&
+                                            !html.contains("Bot shield active.", ignoreCase = true) &&
+                                            SEARCH_DETAIL_LINK_REGEX.containsMatchIn(html)
+                                        if (hasCatalogue) {
+                                            finish(html)
+                                        } else if (attempts >= 20) {
+                                            finish(html)
+                                        } else {
+                                            handler.postDelayed(this, 500L)
+                                        }
+                                        }
+                                    }
+                                }
+                                poll = task
+                                handler.post(task)
+                            }
+                        }
+                    }
+                    webView = view
+                    cookieManager.setAcceptThirdPartyCookies(view, true)
+                    activity.addContentView(view, ViewGroup.LayoutParams(1, 1))
+                    view.loadUrl(pageUrl)
+                    handler.postDelayed(timeout, 12_000L)
+                } catch (error: Throwable) {
+                    Log.w("FlemmixSearchWebView", "WebView catalogue impossible", error)
+                    finish(null)
+                }
+            }
+        }
+
     @SuppressLint("SetJavaScriptEnabled")
     suspend fun load(origin: String, query: String): String? =
         suspendCancellableCoroutine { continuation ->
@@ -1455,6 +1663,7 @@ object FlemmixSearchWebViewV16 {
             var homeRetryDone = false
             var lastHtml: String? = null
             var lastUrl: String? = null
+            var contentPolls = 0
 
             val quotedQuery = JSONObject.quote(query)
             val quotedAction = JSONObject.quote(
@@ -1539,7 +1748,19 @@ object FlemmixSearchWebViewV16 {
                                                     "FlemmixSearchWebView",
                                                     "Soumission du formulaire : $result",
                                                 )
-                                                if (result.contains("missing-")) finish(null)
+                                                if (result.contains("missing-")) {
+                                                    // Search widgets can change markup.
+                                                    // Fall back to a normal search URL.
+                                                    Log.w(
+                                                        "FlemmixSearchWebView",
+                                                        "Formulaire introuvable ($result), navigation de secours",
+                                                    )
+                                                    directAttempt = true
+                                                    view.loadUrl(
+                                                        "$origin/index.php?do=search&subaction=search" +
+                                                            "&story=${URLEncoder.encode(query, "UTF-8")}",
+                                                    )
+                                                }
                                             }
                                         }
                                     }, 500L)
@@ -1573,11 +1794,24 @@ object FlemmixSearchWebViewV16 {
                                             initializedOrigins.remove(origin)
                                             view.loadUrl("$origin/")
                                         } else if (!html.isNullOrBlank() && !blocked) {
-                                            // onPageFinished garantit ici que la réponse est complète.
-                                            // Terminer aussi quand la recherche ne contient aucun résultat,
-                                            // au lieu d'attendre inutilement l'expiration de 25 secondes.
-                                            finish(html)
+                                            contentPolls++
+                                            // A nonempty HTML skeleton is not proof of
+                                            // search completion. Prefer a populated
+                                            // result document; let empty searches settle.
+                                            val hasDetailLinks =
+                                                SEARCH_DETAIL_LINK_REGEX.containsMatchIn(html)
+                                            if (hasDetailLinks || contentPolls >= 6) {
+                                                Log.i(
+                                                    "FlemmixSearchWebView",
+                                                    "Résultat HTML stabilisé: liens=$hasDetailLinks, " +
+                                                        "taille=${html.length}, polls=$contentPolls",
+                                                )
+                                                finish(html)
+                                            } else {
+                                                handler.postDelayed(poll, POLL_INTERVAL_MS)
+                                            }
                                         } else {
+                                            contentPolls = 0
                                             handler.postDelayed(poll, POLL_INTERVAL_MS)
                                         }
                                     }

@@ -24,16 +24,18 @@ internal class FlemmixDomainResolver(
         return resolutionMutex.withLock {
             cachedOrigin?.let { return@withLock it }
 
+            // Primary source: the live announcement page. GitHub is strictly
+            // a fallback if that page cannot supply a usable origin.
             resolveFromRegistry()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis Wiflix Adresses (Lien principal) : $resolved")
+                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis neufneuf.space : $resolved")
                 return@withLock resolved
             }
 
-            Log.w(TAG, "Wiflix Adresses indisponible ou sans Lien principal valide, essai de KeepLinkFlemmix.txt")
+            Log.w(TAG, "neufneuf.space indisponible ou sans domaine valide : recours à KeepLinkFlemmix.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLinkFlemmix.txt : $resolved")
+                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLinkFlemmix.txt (secours) : $resolved")
                 return@withLock resolved
             }
 
@@ -69,8 +71,8 @@ internal class FlemmixDomainResolver(
     }
 
     private fun extractRegistryTargets(html: String): List<String> {
-        // Preserve the featured link as a preference, not a mandatory HTML
-        // class/adjacency contract. All destination links are candidates.
+        // Extract only the advertised primary link, never arbitrary
+        // external links that might belong to other services.
         val preferred = runCatching {
             val label = SPAN_REGEX.findAll(html).firstOrNull { span ->
                 normalizeText(TAG_REGEX.replace(span.groupValues[1], " ")) ==
@@ -81,14 +83,10 @@ internal class FlemmixDomainResolver(
             normalizeOrigin(decodeHtml(link.groupValues[1]))
         }.getOrNull()
 
-        val otherLinks = ANCHOR_REGEX.findAll(html)
-            .mapNotNull { match ->
-                normalizeOrigin(decodeHtml(match.groupValues[1]))
-            }.toList()
-
-        return (listOfNotNull(preferred) + otherLinks)
+        // A registry can link to entirely different services. Never
+        // validate every outgoing link as though it were Flemmix.
+        return listOfNotNull(preferred)
             .filter { it != REGISTRY_ORIGIN }
-            .distinct()
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -173,7 +171,7 @@ internal class FlemmixDomainResolver(
 
     internal companion object {
         const val TAG = "FlemmixResolver"
-        const val REGISTRY_ORIGIN = "https://ww1.wiflix-adresses.fun"
+        const val REGISTRY_ORIGIN = "https://www.neufneuf.space"
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
