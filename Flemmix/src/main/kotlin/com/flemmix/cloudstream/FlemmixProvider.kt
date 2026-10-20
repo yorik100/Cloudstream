@@ -678,33 +678,88 @@ class FlemmixProvider : MainAPI() {
     }
 
     private suspend fun fetchDetail(origin: String, path: String): String? {
-        // Search already acquires the Bot Shield session in WebView. Reuse
-        // its cookie when fetching a detail page so HTTP sees that session.
+        // Fast path: reuse the Bot Shield WebView cookie for the HTTP request.
         val cookie = FlemmixSearchWebViewV16.cookieHeader(origin)
         val headers = if (cookie == null) browserHeaders
             else browserHeaders + ("Cookie" to cookie)
 
+        val pageUrl = "$origin$path"
         val response = runCatching {
             app.get(
-                url = "$origin$path",
+                url = pageUrl,
                 headers = headers,
                 referer = "$origin/",
-                // Never cache a transient challenge instead of movie HTML.
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
-        }.getOrNull() ?: return null
+        }.getOrNull()
 
-        if (response.okhttpResponse.code !in 200..299) return null
-        if (response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)) {
-            Log.w(SEARCH_TAG, "Bot Shield encore présent sur la fiche : $origin$path")
+        val httpHtml = response
+            ?.takeIf { it.okhttpResponse.code in 200..299 }
+            ?.text
+            ?.takeUnless { it.contains(BOT_SHIELD_TEXT, ignoreCase = true) }
+
+        if (httpHtml != null && extractDetailTitle(httpHtml) != null) {
+            val markers = countPlayerMarkers(httpHtml)
+            Log.i(
+                SEARCH_TAG,
+                "Fiche HTTP : $path, taille=${httpHtml.length}, " +
+                    "marqueursLecteur=$markers",
+            )
+
+            // A title is enough to prove that the detail page exists, but not
+            // enough to prove that the server returned the player DOM. Current
+            // deployments can hydrate that part in the browser session.
+            if (markers > 0) return httpHtml
+
+            Log.w(
+                SEARCH_TAG,
+                "Fiche HTTP sans lecteurs, récupération du DOM WebView : $path",
+            )
+            val browserHtml = FlemmixSearchWebViewV16.loadDetail(origin, pageUrl)
+            if (
+                !browserHtml.isNullOrBlank() &&
+                extractDetailTitle(browserHtml) != null
+            ) {
+                Log.i(
+                    SEARCH_TAG,
+                    "Fiche WebView : $path, taille=${browserHtml.length}, " +
+                        "marqueursLecteur=${countPlayerMarkers(browserHtml)}",
+                )
+                return browserHtml
+            }
+
+            // Keep a valid information page even when it genuinely has no
+            // player. Films can then show the fiche instead of "not found".
+            return httpHtml
+        }
+
+        Log.w(
+            SEARCH_TAG,
+            "Fiche HTTP inutilisable, tentative WebView directe : $pageUrl",
+        )
+        val browserHtml = FlemmixSearchWebViewV16.loadDetail(origin, pageUrl)
+            ?: return null
+
+        if (extractDetailTitle(browserHtml) == null) {
+            Log.w(SEARCH_TAG, "Fiche WebView sans titre exploitable : $pageUrl")
             return null
         }
-        if (extractDetailTitle(response.text) == null) {
-            Log.w(SEARCH_TAG, "Fiche sans titre exploitable : $origin$path")
-            return null
-        }
-        return response.text
+
+        Log.i(
+            SEARCH_TAG,
+            "Fiche obtenue uniquement par WebView : $path, " +
+                "taille=${browserHtml.length}, " +
+                "marqueursLecteur=${countPlayerMarkers(browserHtml)}",
+        )
+        return browserHtml
+    }
+
+    private fun countPlayerMarkers(html: String): Int {
+        val document = Jsoup.parse(html)
+        val dataV = document.select("[data-v]").size
+        val loadVideo = LOAD_VIDEO_CALL_REGEX.findAll(html).count()
+        return dataV + loadVideo
     }
 
     /**
@@ -1611,6 +1666,167 @@ object FlemmixSearchWebViewV16 {
             }
         }
     }
+
+    /**
+     * Loads a detail page in the real browser session when the HTTP response
+     * contains the fiche but not the player DOM.
+     *
+     * Readiness is based only on functional player attributes
+     * (`data-v` / `loadVideo`) or a settled timeout, never on visual classes.
+     */
+    @SuppressLint("SetJavaScriptEnabled")
+    suspend fun loadDetail(origin: String, pageUrl: String): String? =
+        suspendCancellableCoroutine { continuation ->
+            val handler = Handler(Looper.getMainLooper())
+            val finished = AtomicBoolean(false)
+            var webView: WebView? = null
+            var lastHtml: String? = null
+            var polls = 0
+            lateinit var timeout: Runnable
+            lateinit var poll: Runnable
+
+            fun finish(html: String?) {
+                if (!finished.compareAndSet(false, true)) return
+                handler.removeCallbacks(timeout)
+                handler.removeCallbacks(poll)
+                handler.post {
+                    runCatching {
+                        webView?.let { view ->
+                            (view.parent as? ViewGroup)?.removeView(view)
+                            view.stopLoading()
+                            view.destroy()
+                        }
+                    }
+                    webView = null
+                }
+                if (continuation.isActive) continuation.resume(html)
+            }
+
+            timeout = Runnable {
+                Log.w(
+                    "FlemmixSearchWebView",
+                    "Expiration fiche WebView : $pageUrl, " +
+                        "taille=${lastHtml?.length ?: 0}",
+                )
+                finish(lastHtml)
+            }
+            continuation.invokeOnCancellation { finish(null) }
+
+            handler.post {
+                val activity = FlemmixRuntimeV16.currentActivity()
+                if (activity == null || activity.isFinishing) {
+                    finish(null)
+                    return@post
+                }
+
+                try {
+                    val cookieManager = CookieManager.getInstance()
+                    cookieManager.setAcceptCookie(true)
+
+                    val view = WebView(activity).apply {
+                        setBackgroundColor(Color.TRANSPARENT)
+                        alpha = 0.01f
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView, url: String) {
+                                if (finished.get() || url == "about:blank") return
+
+                                poll = object : Runnable {
+                                    override fun run() {
+                                        if (finished.get()) return
+
+                                        view.evaluateJavascript(
+                                            """
+                                            (function () {
+                                              const html =
+                                                document.documentElement.outerHTML || "";
+                                              const dataV =
+                                                document.querySelectorAll("[data-v]").length;
+                                              const loadVideo =
+                                                (html.match(/loadVideo\s*\(/gi) || []).length;
+                                              return JSON.stringify({
+                                                html: html,
+                                                dataV: dataV,
+                                                loadVideo: loadVideo,
+                                                readyState: document.readyState
+                                              });
+                                            })();
+                                            """.trimIndent(),
+                                        ) { encoded ->
+                                            if (finished.get()) {
+                                                return@evaluateJavascript
+                                            }
+
+                                            val raw = runCatching {
+                                                JSONTokener(encoded).nextValue() as? String
+                                            }.getOrNull()
+
+                                            val payload = runCatching {
+                                                JSONObject(raw.orEmpty())
+                                            }.getOrNull()
+
+                                            val html = payload
+                                                ?.optString("html", "")
+                                                ?.takeIf(String::isNotBlank)
+
+                                            if (html != null) lastHtml = html
+
+                                            val dataV = payload?.optInt("dataV", 0) ?: 0
+                                            val loadVideo =
+                                                payload?.optInt("loadVideo", 0) ?: 0
+                                            val readyState =
+                                                payload?.optString("readyState", "").orEmpty()
+
+                                            polls++
+
+                                            Log.i(
+                                                "FlemmixSearchWebView",
+                                                "Fiche DOM poll=$polls " +
+                                                    "data-v=$dataV " +
+                                                    "loadVideo=$loadVideo " +
+                                                    "state=$readyState " +
+                                                    "url=$url",
+                                            )
+
+                                            if (dataV > 0 || loadVideo > 0) {
+                                                finish(html)
+                                            } else if (polls >= 16) {
+                                                // Eight seconds after onPageFinished.
+                                                // A genuine fiche without players must
+                                                // not keep the WebView alive forever.
+                                                finish(html)
+                                            } else {
+                                                handler.postDelayed(this, 500L)
+                                            }
+                                        }
+                                    }
+                                }
+
+                                handler.post(poll)
+                            }
+                        }
+                    }
+
+                    webView = view
+                    cookieManager.setAcceptThirdPartyCookies(view, true)
+                    activity.addContentView(
+                        view,
+                        ViewGroup.LayoutParams(1, 1),
+                    )
+                    view.loadUrl(pageUrl)
+                    handler.postDelayed(timeout, 12_000L)
+                } catch (error: Throwable) {
+                    Log.w(
+                        "FlemmixSearchWebView",
+                        "WebView fiche impossible : $pageUrl",
+                        error,
+                    )
+                    finish(lastHtml)
+                }
+            }
+        }
 
     /**
      * Loads a catalogue in the same Android WebView session as search.
