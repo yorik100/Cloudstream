@@ -35,6 +35,7 @@ import com.lagradost.nicehttp.Session
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
+import org.jsoup.Jsoup
 import java.net.URI
 import java.net.URLEncoder
 import java.text.Normalizer
@@ -581,19 +582,49 @@ class FlemmixProvider : MainAPI() {
     }
 
     private suspend fun fetchDetail(origin: String, path: String): String? {
+        // Search already acquires the Bot Shield session in WebView. Reuse
+        // its cookie when fetching a detail page so HTTP sees that session.
+        val cookie = FlemmixSearchWebViewV16.cookieHeader(origin)
+        val headers = if (cookie == null) browserHeaders
+            else browserHeaders + ("Cookie" to cookie)
+
         val response = runCatching {
             app.get(
                 url = "$origin$path",
-                headers = browserHeaders,
+                headers = headers,
                 referer = "$origin/",
-                cacheTime = DETAIL_CACHE_SECONDS,
+                // Never cache a transient challenge instead of movie HTML.
+                cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
-        if (!DETAIL_TITLE_REGEX.containsMatchIn(response.text)) return null
+        if (response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)) {
+            Log.w(SEARCH_TAG, "Bot Shield encore présent sur la fiche : $origin$path")
+            return null
+        }
+        if (extractDetailTitle(response.text) == null) {
+            Log.w(SEARCH_TAG, "Fiche sans titre exploitable : $origin$path")
+            return null
+        }
         return response.text
+    }
+
+    /**
+     * A film fiche can use a normal h1, schema.org itemprop or OpenGraph.
+     * Do not require a particular HTML attribute order or visual layout.
+     */
+    private fun extractDetailTitle(html: String): String? {
+        val document = Jsoup.parse(html)
+        val candidates = sequenceOf(
+            document.selectFirst("h1[itemprop=name]")?.text(),
+            document.selectFirst("h1")?.text(),
+            document.selectFirst("meta[property=og:title]")?.attr("content"),
+            document.selectFirst("meta[name=twitter:title]")?.attr("content"),
+        )
+        return candidates.mapNotNull { it?.trim()?.takeIf(String::isNotBlank) }
+            .firstOrNull()
     }
 
     private fun parseDetails(
@@ -603,10 +634,7 @@ class FlemmixProvider : MainAPI() {
     ): SourceDetails? {
         val match = DETAIL_PATH_REGEX.matchEntire(path) ?: return null
         val type = typeFromPath(match.groupValues[1])
-        val title = DETAIL_TITLE_REGEX.find(html)?.groupValues?.getOrNull(1)
-            ?.let(::plainText)
-            ?.takeIf(String::isNotBlank)
-            ?: return null
+        val title = extractDetailTitle(html) ?: return null
         val sourceText = plainText(html)
         val originalTitle = labeledValue(html, "titre original")
         val year = sequenceOf("date de sortie", "année")
@@ -654,7 +682,10 @@ class FlemmixProvider : MainAPI() {
     ): LoadResponse {
         val servers = parseMovieServers(html, origin)
         if (servers.isEmpty()) {
-            throw ErrorLoadingException("Film pas disponible sur Flemmix/Wiflix")
+            Log.w(
+                SEARCH_TAG,
+                "Fiche film valide mais aucun lecteur trouvé : ${source.path}",
+            )
         }
 
         val title = tmdb?.stringOrNull("title") ?: source.title
@@ -666,7 +697,17 @@ class FlemmixProvider : MainAPI() {
             posterUrl = poster
             backgroundPosterUrl = tmdbPoster(tmdb?.stringOrNull("backdrop_path"), "w1280")
             year = releaseYear
-            plot = tmdb?.stringOrNull("overview")?.takeIf(String::isNotBlank) ?: source.plot
+            val originalPlot = tmdb?.stringOrNull("overview")
+                ?.takeIf(String::isNotBlank) ?: source.plot
+            plot = if (servers.isEmpty()) {
+                listOfNotNull(
+                    originalPlot,
+                    "Fiche disponible, mais aucun lien de lecture exploitable " +
+                        "n'a été trouvé pour le moment.",
+                ).joinToString("\n\n")
+            } else {
+                originalPlot
+            }
             tags = tmdbGenres(tmdb).ifEmpty { source.tags }
             duration = tmdb?.optInt("runtime", 0)?.takeIf { it > 0 } ?: source.durationMinutes
             score = tmdbScore(tmdb)
@@ -751,23 +792,189 @@ class FlemmixProvider : MainAPI() {
         }
     }
 
-    private fun parseMovieServers(html: String, origin: String): List<FlemmixServer> =
-        parseServers(html, origin, null)
+    /**
+     * Movie players may be anchors, buttons, data attributes or embedded
+     * video frames. Parse the DOM instead of relying on the exact quote/order
+     * of `<a onclick=loadVideo(...)>`. No site-layout class is required.
+     */
+    private fun parseMovieServers(html: String, origin: String): List<FlemmixServer> {
+        val found = LinkedHashMap<String, FlemmixServer>()
+
+        // Preserve the historical anchor format as a compatibility path.
+        for (server in parseServers(html, origin, null)) {
+            found.putIfAbsent(server.url, server)
+        }
+
+        val document = Jsoup.parse(html, "$origin/")
+        val candidates = document.select(
+            "[onclick], [data-url], [data-embed], [data-link], " +
+                "[data-player], iframe[src], iframe[data-src], " +
+                "video[src], video[data-src], source[src], source[data-src]",
+        )
+        var playerCalls = 0
+
+        for (element in candidates) {
+            val call = LOAD_VIDEO_CALL_REGEX.find(element.attr("onclick"))
+                ?.groupValues?.getOrNull(2)
+            if (call != null) playerCalls++
+
+            val mediaElement = element.normalName() in
+                setOf("iframe", "video", "source")
+            val rawUrls = sequenceOf(
+                call,
+                element.attr("data-embed").takeIf(String::isNotBlank),
+                element.attr("data-player").takeIf(String::isNotBlank),
+                element.attr("data-link").takeIf(String::isNotBlank),
+                element.attr("data-url").takeIf(String::isNotBlank),
+                if (mediaElement) element.attr("src").takeIf(String::isNotBlank) else null,
+                if (mediaElement) element.attr("data-src").takeIf(String::isNotBlank) else null,
+            ).filterNotNull()
+
+            val label = element.attr("data-server")
+                .ifBlank { element.text().trim() }
+                .ifBlank { element.attr("title") }
+                .ifBlank { "Lecteur" }
+
+            for (rawUrl in rawUrls) {
+                val cleanUrl = decodeHtml(rawUrl.trim()).replace("\\/", "/")
+                // Ignore data-* values that are just identifiers (e.g. "1")
+                // rather than URLs. Never manufacture /1, /2 ... links.
+                if (!looksLikePlayerUrl(cleanUrl)) continue
+                val resolved = resolveUrl("$origin/", cleanUrl) ?: continue
+                found.putIfAbsent(resolved, FlemmixServer(label, resolved))
+            }
+        }
+
+        Log.i(
+            SEARCH_TAG,
+            "Lecteurs film : candidats=${candidates.size}, " +
+                "loadVideo=$playerCalls, liens=${found.size}",
+        )
+        return found.values.toList()
+    }
+
+    private fun looksLikePlayerUrl(raw: String): Boolean {
+        if (raw.isBlank() || raw.startsWith("#")) return false
+        if (raw.startsWith("javascript:", ignoreCase = true)) return false
+        if (raw.startsWith("data:", ignoreCase = true)) return false
+        if (raw.startsWith("//") || raw.startsWith("/")) return true
+        if (raw.startsWith("https://", ignoreCase = true) ||
+            raw.startsWith("http://", ignoreCase = true)
+        ) return true
+        // Allow relative paths such as embed/player.php?x=1, not bare IDs.
+        return raw.contains('/') || raw.contains('.')
+    }
 
     private fun parseSeriesServers(
         html: String,
         origin: String,
     ): Map<Int, List<FlemmixServer>> {
         val result = LinkedHashMap<Int, MutableList<FlemmixServer>>()
+        val document = Jsoup.parse(html, "$origin/")
+        var episodeBlocks = 0
 
-        for (block in EPISODE_BLOCK_REGEX.findAll(html)) {
-            val episode = block.groupValues[1].toIntOrNull() ?: continue
-            val language = if (block.groupValues[2].equals("vs", true)) "VOSTFR" else "VF"
-            val servers = parseServers(block.groupValues[3], origin, language)
-            if (servers.isNotEmpty()) result.getOrPut(episode) { ArrayList() }.addAll(servers)
+        // Parse the DOM instead of applying a regex ending at the first
+        // </div>. Episode containers can contain nested divs, including
+        // the player tabs themselves. A regex truncates such containers and
+        // silently drops valid players.
+        for (element in document.select("[class], [id], [data-episode]")) {
+            val marker = (element.classNames().asSequence() + sequenceOf(element.id()))
+                .mapNotNull { EPISODE_MARKER_REGEX.matchEntire(it) }
+                .firstOrNull()
+
+            val episode = marker?.groupValues?.getOrNull(1)?.toIntOrNull()
+                ?: element.attr("data-episode").toIntOrNull()
+                ?: continue
+            if (episode <= 0) continue
+
+            episodeBlocks++
+            val language = when (marker?.groupValues?.getOrNull(2)?.lowercase()) {
+                "vs", "vostfr" -> "VOSTFR"
+                else -> "VF"
+            }
+
+            // Existing loadVideo(...) anchors remain the preferred source.
+            // The DOM subtree includes all nested tags, unlike the previous
+            // non-greedy regex capture.
+            val servers = (
+                parseServers(element.html(), origin, language) +
+                    parseEpisodePlayersFromDom(element, origin, language)
+                ).distinctBy(FlemmixServer::url)
+
+            if (servers.isNotEmpty()) {
+                result.getOrPut(episode) { ArrayList() }.addAll(servers)
+            }
         }
 
-        return result.mapValues { (_, servers) -> servers.distinctBy(FlemmixServer::url) }
+        // Keep the former format as a compatibility fallback if an older
+        // deployment emits markup that Jsoup cannot associate with a marker.
+        if (result.isEmpty()) {
+            for (block in EPISODE_BLOCK_REGEX.findAll(html)) {
+                val episode = block.groupValues[1].toIntOrNull() ?: continue
+                val language = if (block.groupValues[2].equals("vs", true)) "VOSTFR" else "VF"
+                val servers = parseServers(block.groupValues[3], origin, language)
+                if (servers.isNotEmpty()) {
+                    result.getOrPut(episode) { ArrayList() }.addAll(servers)
+                }
+            }
+        }
+
+        val parsed = result.mapValues { (_, servers) ->
+            servers.distinctBy(FlemmixServer::url)
+        }
+        Log.i(
+            SEARCH_TAG,
+            "Lecteurs série : blocs=$episodeBlocks, épisodes=${parsed.size}, " +
+                "liens=${parsed.values.sumOf { it.size }}, " +
+                "loadVideo=${LOAD_VIDEO_CALL_REGEX.findAll(html).count()}",
+        )
+        return parsed
+    }
+
+    /**
+     * Secondary extraction for episode tabs using buttons, attributes or
+     * embedded players instead of the historical <a onclick=loadVideo(... )>.
+     * This operates strictly inside an identified episode container.
+     */
+    private fun parseEpisodePlayersFromDom(
+        element: org.jsoup.nodes.Element,
+        origin: String,
+        language: String,
+    ): List<FlemmixServer> {
+        val results = LinkedHashMap<String, FlemmixServer>()
+        val candidates = element.select(
+            "[onclick], [data-url], [data-embed], [data-link], " +
+                "iframe[src], iframe[data-src], video[src], video[data-src], " +
+                "source[src], source[data-src]",
+        )
+
+        for (candidate in candidates) {
+            val scriptedUrl = LOAD_VIDEO_CALL_REGEX.find(candidate.attr("onclick"))
+                ?.groupValues?.getOrNull(2)
+
+            val rawUrls = sequenceOf(
+                scriptedUrl,
+                candidate.attr("data-url").takeIf(String::isNotBlank),
+                candidate.attr("data-embed").takeIf(String::isNotBlank),
+                candidate.attr("data-link").takeIf(String::isNotBlank),
+                if (candidate.normalName() in setOf("iframe", "video", "source")) {
+                    candidate.attr("src").takeIf(String::isNotBlank)
+                } else null,
+                if (candidate.normalName() in setOf("iframe", "video", "source")) {
+                    candidate.attr("data-src").takeIf(String::isNotBlank)
+                } else null,
+            ).filterNotNull()
+
+            val label = candidate.text().trim().ifBlank {
+                candidate.attr("title").ifBlank { "Lecteur" }
+            }
+            for (rawUrl in rawUrls) {
+                val url = resolveUrl("$origin/", decodeHtml(rawUrl).replace("\\/", "/"))
+                    ?: continue
+                results.putIfAbsent(url, FlemmixServer("$language · $label", url))
+            }
+        }
+        return results.values.toList()
     }
 
     private fun parseServers(
@@ -803,7 +1010,10 @@ class FlemmixProvider : MainAPI() {
             request.episode?.let { parseSeriesServers(page.html, page.origin)[it] }
                 .orEmpty()
         }
-        if (servers.isEmpty()) return false
+        if (servers.isEmpty()) {
+            Log.w(SEARCH_TAG, "Aucun lecteur exploitable pour ${request.path}")
+            return false
+        }
 
         var emitted = false
         val referer = "${page.origin}${request.path}"
@@ -1073,10 +1283,6 @@ class FlemmixProvider : MainAPI() {
             """\bdle_skin\s*=\s*[\"']([^\"']+)[\"']""",
             RegexOption.IGNORE_CASE,
         )
-        val DETAIL_TITLE_REGEX = Regex(
-            """<h1\b[^>]*itemprop=[\"']name[\"'][^>]*>(.*?)</h1>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
         val POSTER_REGEX = Regex(
             """<img\b[^>]*\bid=[\"']posterimg[\"'][^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*>""",
             RegexOption.IGNORE_CASE,
@@ -1091,6 +1297,16 @@ class FlemmixProvider : MainAPI() {
         )
         val VIDEO_ANCHOR_REGEX = Regex(
             """<a\b[^>]*\bonclick\s*=\s*[\"'][^\"']*loadVideo\(\s*['\"]([^'\"]+)['\"][^\"']*[\"'][^>]*>(.*?)</a>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        // Flexible functional episode markers; no domain or CSS layout check.
+        val EPISODE_MARKER_REGEX = Regex(
+            """(?:ep|episode)[_-]?0*([0-9]+)(?:[_-]?(vf|vs|vostfr))?""",
+            RegexOption.IGNORE_CASE,
+        )
+        // Group 1 is the opening quote; group 2 is the media/embed URL.
+        val LOAD_VIDEO_CALL_REGEX = Regex(
+            """\bloadVideo\s*\(\s*(['\"])(.*?)\1""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
         val EPISODE_BLOCK_REGEX = Regex(
