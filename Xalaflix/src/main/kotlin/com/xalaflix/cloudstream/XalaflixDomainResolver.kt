@@ -82,15 +82,25 @@ internal class XalaflixDomainResolver(
     }
 
     private suspend fun validate(candidate: String): String? {
-        val response = runCatching {
-            app.get("$candidate/movies", headers = requestHeaders, referer = "$candidate/", cacheTime = 0, timeout = 12L)
-        }.getOrNull() ?: return null
-        if (response.okhttpResponse.code !in 200..299) return null
-        val finalUrl = response.okhttpResponse.request.url
-        val origin = normalizeOrigin("${finalUrl.scheme}://${finalUrl.host}") ?: return null
-        val count = Jsoup.parse(response.text, "$origin/")
-            .select("a[href*=/movie/], a[href*=/tv-show/]").map { it.absUrl("href") }.distinct().size
-        return origin.takeIf { count >= 3 }
+        for (route in listOf("/movies")) {
+            val response = runCatching {
+                app.get(
+                    "$candidate$route",
+                    headers = requestHeaders,
+                    referer = "$candidate/",
+                    cacheTime = 0,
+                    timeout = 12L,
+                )
+            }.getOrNull() ?: continue
+            if (response.okhttpResponse.code !in 200..299) continue
+            val finalUrl = response.okhttpResponse.request.url
+            val origin = normalizeOrigin(
+                "${finalUrl.scheme}://${finalUrl.host}" +
+                    if (finalUrl.port != 443) ":${finalUrl.port}" else "",
+            ) ?: continue
+            return origin
+        }
+        return null
     }
 
     private fun normalizeOrigin(value: String?): String? {

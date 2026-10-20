@@ -63,8 +63,12 @@ internal class AfterDarkDomainResolver {
             return null
         }
 
-        val candidate = extractCurrentOrigin(source.text) ?: return null
-        return validateWithClassicHttp(candidate)
+        // Prefer the published access link, but do not require a specific
+        // heading, phrase or HTML template from the announcement page.
+        for (candidate in extractCurrentOrigins(source.text)) {
+            validateWithClassicHttp(candidate)?.let { return it }
+        }
+        return null
     }
 
     /**
@@ -89,15 +93,15 @@ internal class AfterDarkDomainResolver {
 
         if (response.okhttpResponse.code !in 200..299) return null
 
-        val candidate = response.text
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
+        for (candidate in response.text.lineSequence()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
             .mapNotNull(::normalizeOrigin)
-            .firstOrNull()
-            ?: return null
-
-        return validateWithClassicHttp(candidate)
+            .distinct()
+        ) {
+            validateWithClassicHttp(candidate)?.let { return it }
+        }
+        return null
     }
 
     private suspend fun validateWithClassicHttp(candidateOrigin: String): String? {
@@ -125,7 +129,6 @@ internal class AfterDarkDomainResolver {
             "https://$host"
         }
         if (isSourceOrigin(finalOrigin)) return null
-        if (!isUsableTargetPage(response.text)) return null
 
         return finalOrigin
     }
@@ -151,22 +154,6 @@ internal class AfterDarkDomainResolver {
             "Accept-Language" to "fr-FR,fr;q=0.9,en;q=0.7",
         )
 
-        val REJECTED_DIRECTORY_MARKERS = listOf(
-            "Nouvelle adresse",
-            "Ouvrir le site",
-        )
-        val REJECTED_MISSING_PAGE_MARKERS = listOf(
-            "404 Not Found",
-            "Page not found",
-            "Page introuvable",
-            "Cette page n'existe pas",
-        )
-        val CLOUDFLARE_CHALLENGE_MARKERS = listOf(
-            "Just a moment",
-            "Checking your browser",
-            "cf-chl-",
-            "challenge-platform",
-        )
         val ANCHOR_TAG = Regex(
             "<a\\b[^>]*>.*?</a>",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
@@ -176,19 +163,26 @@ internal class AfterDarkDomainResolver {
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
 
-        fun extractCurrentOrigin(html: String): String? {
-            if (!html.contains("Afterdark", ignoreCase = true)) return null
-
-            val tag = ANCHOR_TAG.findAll(html)
-                .map { it.value }
-                .firstOrNull { anchor ->
-                    anchor.contains("Ouvrir le site", ignoreCase = true) &&
-                        anchor.contains("href", ignoreCase = true)
+        fun extractCurrentOrigins(html: String): List<String> {
+            // The announcement's wording and CSS may change. Collect HTTPS
+            // links generically and validate the destination over HTTP.
+            val anchors = ANCHOR_TAG.findAll(html)
+                .mapNotNull { tag ->
+                    val href = HREF.find(tag.value)?.groupValues?.getOrNull(2)
+                    val origin = href?.let(::normalizeOrigin)
+                        ?.takeUnless(::isSourceOrigin)
+                    origin?.let { value ->
+                        // Existing call-to-action is a preference, not a gate.
+                        val preferred = tag.value.contains(
+                            "Ouvrir le site", ignoreCase = true,
+                        )
+                        preferred to value
+                    }
                 }
-                ?: return null
-
-            val rawUrl = HREF.find(tag)?.groupValues?.getOrNull(2) ?: return null
-            return normalizeOrigin(rawUrl)?.takeUnless(::isSourceOrigin)
+                .toList()
+            return anchors.sortedByDescending { it.first }
+                .map { it.second }
+                .distinct()
         }
 
         fun normalizeOrigin(rawValue: String): String? {
@@ -211,18 +205,5 @@ internal class AfterDarkDomainResolver {
             return host.removePrefix("www.").equals(SOURCE_HOST, ignoreCase = true)
         }
 
-        fun isUsableTargetPage(page: String): Boolean {
-            if (page.isBlank()) return false
-            if (REJECTED_DIRECTORY_MARKERS.any { page.contains(it, ignoreCase = true) }) {
-                return false
-            }
-            if (REJECTED_MISSING_PAGE_MARKERS.any { page.contains(it, ignoreCase = true) }) {
-                return false
-            }
-            if (CLOUDFLARE_CHALLENGE_MARKERS.any { page.contains(it, ignoreCase = true) }) {
-                return false
-            }
-            return true
-        }
     }
 }

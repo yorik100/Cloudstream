@@ -1356,7 +1356,7 @@ object FlemmixSearchWebViewV16 {
                                             pollingStarted = false
                                             initializedOrigins.remove(origin)
                                             view.loadUrl("$origin/")
-                                        } else if (!html.isNullOrBlank() && html.length > 500 && !blocked) {
+                                        } else if (!html.isNullOrBlank() && !blocked) {
                                             // onPageFinished garantit ici que la réponse est complète.
                                             // Terminer aussi quand la recherche ne contient aucun résultat,
                                             // au lieu d'attendre inutilement l'expiration de 25 secondes.

@@ -538,13 +538,11 @@ class AfterDarkProvider : MainAPI() {
             for (index in 0 until items.length()) {
                 val item = items.optJSONObject(index) ?: continue
                 val sourceUrl = item.stringOrNull("url") ?: continue
-                val service = item.stringOrNull("service") ?: "AfterDark"
-                val provider = item.stringOrNull("provider") ?: groupName
 
                 sources += ParsedSource(
                     group = groupName,
-                    service = service,
-                    provider = provider,
+                    service = item.stringOrNull("service") ?: "AfterDark",
+                    provider = item.stringOrNull("provider") ?: groupName,
                     url = sourceUrl,
                     quality = item.stringOrNull("quality"),
                     language = item.stringOrNull("language"),
@@ -894,14 +892,15 @@ class AfterDarkProvider : MainAPI() {
 
             if (extractorEmitted) {
                 // "Secours" is a failover chain, not a list that should be
-                // resolved all at once. Once an allowed fallback produced a
-                // real link, stop here so another fallback cannot replace it.
+                // resolved all at once. Once Videasy (or a later fallback)
+                // produced a real link, stop here so the next fallback does
+                // not replace it while it is still loading.
                 if (source.group == "Secours") return true
                 continue
             }
 
-            // Defensive browser fallback for the remaining allowed
-            // AfterDark source(s). Videasy is not part of this compatible set.
+            // Defensive browser fallback for the remaining source(s).
+            // Videasy stays inside the official AfterDark WebView path.
             if (isEmbed && source.group == "Secours") {
                 val resolved = runCatching {
                     AfterDarkEmbedWebView.resolve(

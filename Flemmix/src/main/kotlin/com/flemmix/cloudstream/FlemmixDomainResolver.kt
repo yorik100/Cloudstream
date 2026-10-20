@@ -61,40 +61,34 @@ internal class FlemmixDomainResolver(
 
         if (response.okhttpResponse.code !in 200..299) return null
 
-        val candidate = extractRegistryTarget(response.text) ?: return null
-        return validateCandidate(candidate)
-    }
-
-    private fun extractRegistryTarget(html: String): String? {
-        val mainLabel = SPAN_REGEX.findAll(html).firstOrNull { span ->
-            "card-featured-label" in extractClasses(span.value) &&
-                normalizeText(TAG_REGEX.replace(span.groupValues[1], " ")) ==
-                PRIMARY_LABEL
-        } ?: return null
-
-        val contentAfterLabel = html.substring(mainLabel.range.last + 1)
-        val mainCard = ANCHOR_REGEX.find(contentAfterLabel) ?: return null
-        val contentBeforeCard = contentAfterLabel.substring(0, mainCard.range.first)
-        if (COMMENT_REGEX.replace(contentBeforeCard, " ").isNotBlank()) return null
-
-        val cardClasses = extractClasses(mainCard.value)
-        if ("domain-card" !in cardClasses || "card-featured" !in cardClasses) {
-            return null
+        val candidates = extractRegistryTargets(response.text)
+        for (candidate in candidates) {
+            validateCandidate(candidate)?.let { return it }
         }
-
-        val candidate = normalizeOrigin(decodeHtml(mainCard.groupValues[1]))
-            ?: return null
-        return candidate.takeIf { it != REGISTRY_ORIGIN }
+        return null
     }
 
-    private fun extractClasses(tag: String): Set<String> {
-        val classes = CLASS_ATTRIBUTE_REGEX.find(tag)?.groupValues?.get(2)
-            ?: return emptySet()
-        return decodeHtml(classes)
-            .lowercase()
-            .split(Regex("\\s+"))
-            .filter(String::isNotBlank)
-            .toSet()
+    private fun extractRegistryTargets(html: String): List<String> {
+        // Preserve the featured link as a preference, not a mandatory HTML
+        // class/adjacency contract. All destination links are candidates.
+        val preferred = runCatching {
+            val label = SPAN_REGEX.findAll(html).firstOrNull { span ->
+                normalizeText(TAG_REGEX.replace(span.groupValues[1], " ")) ==
+                    PRIMARY_LABEL
+            } ?: return@runCatching null
+            val after = html.substring(label.range.last + 1)
+            val link = ANCHOR_REGEX.find(after) ?: return@runCatching null
+            normalizeOrigin(decodeHtml(link.groupValues[1]))
+        }.getOrNull()
+
+        val otherLinks = ANCHOR_REGEX.findAll(html)
+            .mapNotNull { match ->
+                normalizeOrigin(decodeHtml(match.groupValues[1]))
+            }.toList()
+
+        return (listOfNotNull(preferred) + otherLinks)
+            .filter { it != REGISTRY_ORIGIN }
+            .distinct()
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -114,42 +108,40 @@ internal class FlemmixDomainResolver(
 
         if (response.okhttpResponse.code !in 200..299) return null
 
-        val candidate = response.text.lineSequence()
+        for (candidate in response.text.lineSequence()
             .map(String::trim)
             .filter(String::isNotEmpty)
             .mapNotNull(::normalizeOrigin)
-            .firstOrNull()
-            ?: return null
-
-        return validateCandidate(candidate)
+            .distinct()
+        ) {
+            validateCandidate(candidate)?.let { return it }
+        }
+        return null
     }
 
     private suspend fun validateCandidate(candidate: String): String? {
-        val response = runCatching {
-            app.get(
-                url = "$candidate/film-en-streaming/",
-                headers = requestHeaders,
-                referer = "$candidate/",
-                cacheTime = 0,
-                timeout = VALIDATION_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return null
+        // A working HTTPS response on the provider's catalogue route is
+        // sufficient. CSS layout and number of cards are not domain checks.
+        for (route in listOf("/film-en-streaming/")) {
+            val response = runCatching {
+                app.get(
+                    url = candidate + route,
+                    headers = requestHeaders,
+                    referer = "$candidate/",
+                    cacheTime = 0,
+                    timeout = VALIDATION_TIMEOUT_SECONDS,
+                )
+            }.getOrNull() ?: continue
 
-        if (response.okhttpResponse.code !in 200..299) return null
-
-        val finalUrl = response.okhttpResponse.request.url
-        val finalOrigin = normalizeOrigin(
-            "${finalUrl.scheme}://${finalUrl.host}" +
-                if (finalUrl.port != 443) ":${finalUrl.port}" else "",
-        ) ?: return null
-
-        val catalogueLinks = DETAIL_LINK_REGEX.findAll(response.text)
-            .map { it.groupValues[1] }
-            .distinct()
-            .take(MINIMUM_CATALOGUE_LINKS)
-            .count()
-
-        return finalOrigin.takeIf { catalogueLinks >= MINIMUM_CATALOGUE_LINKS }
+            if (response.okhttpResponse.code !in 200..299) continue
+            val finalUrl = response.okhttpResponse.request.url
+            val finalOrigin = normalizeOrigin(
+                "${finalUrl.scheme}://${finalUrl.host}" +
+                    if (finalUrl.port != 443) ":${finalUrl.port}" else "",
+            ) ?: continue
+            return finalOrigin
+        }
+        return null
     }
 
     private fun normalizeOrigin(rawValue: String): String? {
@@ -189,7 +181,6 @@ internal class FlemmixDomainResolver(
 
         const val RESOLVER_TIMEOUT_SECONDS = 10L
         const val VALIDATION_TIMEOUT_SECONDS = 12L
-        const val MINIMUM_CATALOGUE_LINKS = 3
         const val PRIMARY_LABEL = "lien principal"
 
         val HOST_REGEX = Regex(
@@ -203,18 +194,6 @@ internal class FlemmixDomainResolver(
         val ANCHOR_REGEX = Regex(
             """<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
-        val CLASS_ATTRIBUTE_REGEX = Regex(
-            """\bclass\s*=\s*(["'])(.*?)\1""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
-        val COMMENT_REGEX = Regex(
-            """<!--.*?-->""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
-        )
-        val DETAIL_LINK_REGEX = Regex(
-            """href\s*=\s*["'](?:https://[^/"']+)?/(?:film|serie)-en-streaming/(\d+-[^"']+\.html)["']""",
-            RegexOption.IGNORE_CASE,
         )
         val TAG_REGEX = Regex("""<[^>]+>""")
     }

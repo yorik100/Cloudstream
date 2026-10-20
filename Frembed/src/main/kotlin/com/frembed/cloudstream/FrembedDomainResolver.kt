@@ -3,13 +3,8 @@ package com.frembed.cloudstream
 import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
 
@@ -33,36 +28,18 @@ internal class FrembedDomainResolver(
                 return@withLock resolved
             }
 
-            Log.w(TAG, "config.json invalide ou indisponible, essai de KeepLinkFrembed.txt")
+            Log.w(
+                TAG,
+                "config.json invalide ou indisponible, essai de KeepLinkFrembed.txt",
+            )
+
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Frembed obtenu depuis KeepLinkFrembed.txt : $resolved")
-                return@withLock resolved
-            }
-
-            Log.w(TAG, "KeepLinkFrembed.txt invalide ou indisponible, recours à crt.sh")
-            val candidates = discoverCandidates()
-            if (candidates.isEmpty()) {
-                throw ErrorLoadingException(
-                    "Aucun domaine Frembed trouvé dans les certificats publics",
+                Log.i(
+                    TAG,
+                    "Domaine Frembed obtenu depuis KeepLinkFrembed.txt : $resolved",
                 )
-            }
-
-            // Candidates are ordered by certificate acquisition date. A real
-            // catalogue page is both the reachability and identity check.
-            for (validationBatch in candidates.chunked(MAX_PARALLEL_PROBES)) {
-                val results = coroutineScope {
-                    validationBatch.map { candidate ->
-                        async { validateCandidate(candidate) }
-                    }.awaitAll()
-                }
-
-                // awaitAll preserves input order: a newer valid domain wins.
-                results.firstOrNull { it != null }?.let { resolved ->
-                    cachedOrigin = resolved
-                    Log.i(TAG, "Domaine Frembed obtenu via crt.sh : $resolved")
-                    return@withLock resolved
-                }
+                return@withLock resolved
             }
 
             throw ErrorLoadingException(
@@ -72,9 +49,8 @@ internal class FrembedDomainResolver(
     }
 
     /**
-     * First source: validate "main", then validate "backup" only when main
-     * failed and both normalized origins are different. Every other JSON
-     * field is deliberately ignored.
+     * config.json publie les URL complètes à tester.
+     * Le résolveur ne déduit jamais l'adresse depuis le nom du service.
      */
     private suspend fun resolveFromConfig(): String? {
         val response = runCatching {
@@ -95,11 +71,12 @@ internal class FrembedDomainResolver(
 
         val config = runCatching { JSONObject(response.text) }.getOrNull()
             ?: return null
+
         val main = normalizeOrigin(config.optString("main", ""))
         val backup = normalizeOrigin(config.optString("backup", ""))
 
         if (main != null) {
-            validateConfiguredOrigin(main)?.let { resolved ->
+            validateCandidate(main)?.let { resolved ->
                 Log.i(TAG, "config.json/main validé : $resolved")
                 return resolved
             }
@@ -112,13 +89,15 @@ internal class FrembedDomainResolver(
             Log.w(TAG, "config.json/backup absent ou invalide")
             return null
         }
+
         if (backup == main) {
             Log.i(TAG, "config.json/backup identique à main, second test ignoré")
             return null
         }
 
         Log.i(TAG, "Échec de main, validation de config.json/backup : $backup")
-        return validateConfiguredOrigin(backup).also { resolved ->
+
+        return validateCandidate(backup).also { resolved ->
             if (resolved != null) {
                 Log.i(TAG, "config.json/backup validé : $resolved")
             } else {
@@ -127,19 +106,20 @@ internal class FrembedDomainResolver(
         }
     }
 
-    private suspend fun validateConfiguredOrigin(candidate: String): String? {
-        val validatedOrigin = validateCandidate(candidate) ?: return null
-        return validatedOrigin.takeIf { validatePublicApi(it) }
-    }
-
+    /**
+     * Validation générique, comme pour les autres résolveurs :
+     * HTTPS + hostname DNS syntaxiquement valide.
+     *
+     * Aucun nom, suffixe, TLD ou motif propre au site cible n'est imposé.
+     */
     private fun normalizeOrigin(rawValue: String): String? {
         val uri = runCatching { URI(rawValue.trim()) }.getOrNull() ?: return null
-        val host = uri.host?.lowercase() ?: return null
+        val host = uri.host?.lowercase()?.takeIf { it.isNotBlank() } ?: return null
 
-        if (uri.scheme != "https") return null
+        if (uri.scheme?.lowercase() != "https") return null
         if (uri.userInfo != null) return null
         if (uri.port != -1 && uri.port != 443) return null
-        if (!FREMBED_DOMAIN.matches(host)) return null
+        if (!HOST_REGEX.matches(host)) return null
 
         return "https://$host"
     }
@@ -151,8 +131,8 @@ internal class FrembedDomainResolver(
     }
 
     /**
-     * Fast path: only GitHub's KeepLinkFrembed.txt, the announced Frembed site and
-     * that site's own public API are contacted. Nothing is persisted.
+     * KeepLink publie lui aussi une ou plusieurs URL complètes.
+     * On les valide dans l'ordre, sans deviner le domaine.
      */
     private suspend fun resolveFromKeepLink(): String? {
         val response = runCatching {
@@ -171,19 +151,50 @@ internal class FrembedDomainResolver(
 
         if (response.okhttpResponse.code !in 200..299) return null
 
-        val candidate = response.text
-            .lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .mapNotNull(::normalizeOrigin)
-            .firstOrNull()
-            ?: return null
+        for (
+            candidate in response.text
+                .lineSequence()
+                .map(String::trim)
+                .filter(String::isNotEmpty)
+                .mapNotNull(::normalizeOrigin)
+                .distinct()
+        ) {
+            validateCandidate(candidate)?.let { return it }
+        }
 
-        val validatedOrigin = validateCandidate(candidate) ?: return null
-        return validatedOrigin.takeIf { validatePublicApi(it) }
+        return null
     }
 
-    private suspend fun validatePublicApi(candidateOrigin: String): Boolean {
+    /**
+     * Valide le comportement du service, jamais son hostname.
+     *
+     * L'API est essayée directement. Si l'ancienne adresse ne redirige que sa
+     * page d'accueil, on récupère l'origine finale de cette redirection puis
+     * on reteste exactement la même API.
+     */
+    private suspend fun validateCandidate(candidateOrigin: String): String? {
+        validatePublicApi(candidateOrigin)?.let { return it }
+
+        val redirectedOrigin = resolveRedirectedOrigin(candidateOrigin)
+            ?: return null
+
+        if (redirectedOrigin == candidateOrigin) return null
+
+        Log.i(
+            TAG,
+            "Redirection d'origine détectée : " +
+                "$candidateOrigin -> $redirectedOrigin",
+        )
+
+        return validatePublicApi(redirectedOrigin)
+    }
+
+    /**
+     * L'identité est validée par la structure JSON réellement consommée par
+     * le provider. Une redirection HTTPS vers un hostname différent est
+     * acceptée et l'origine finale est renvoyée.
+     */
+    private suspend fun validatePublicApi(candidateOrigin: String): String? {
         val response = runCatching {
             app.get(
                 url = "$candidateOrigin/api/public/v1/movies?limit=1&page=1",
@@ -194,136 +205,69 @@ internal class FrembedDomainResolver(
             )
         }.onFailure { error ->
             Log.w(TAG, "API Frembed inaccessible sur $candidateOrigin", error)
-        }.getOrNull() ?: return false
-
-        if (response.okhttpResponse.code !in 200..299) return false
-
-        val finalOrigin = response.okhttpResponse.request.url.let { url ->
-            val port = if (url.port != 443) ":${url.port}" else ""
-            normalizeOrigin("${url.scheme}://${url.host}$port")
-        } ?: return false
-        if (finalOrigin != candidateOrigin) return false
-
-        val payload = runCatching { JSONObject(response.text) }.getOrNull()
-            ?: return false
-        if (payload.optInt("status", 0) != 200) return false
-
-        val items = payload.optJSONObject("result")
-            ?.optJSONArray("items")
-            ?: return false
-        val firstItem = items.optJSONObject(0) ?: return false
-
-        return firstItem.optString("title").isNotBlank() &&
-            firstItem.optString("tmdb").isNotBlank()
-    }
-
-    private suspend fun discoverCandidates(): List<String> {
-        var lastHttpCode: Int? = null
-
-        for (attempt in 1..DISCOVERY_ATTEMPTS) {
-            val response = runCatching {
-                app.get(
-                    url = DISCOVERY_URL,
-                    headers = mapOf(
-                        "Accept" to "application/json",
-                        "User-Agent" to requestHeaders["User-Agent"].orEmpty(),
-                    ),
-                    cacheTime = 0,
-                    timeout = DISCOVERY_TIMEOUT_SECONDS,
-                )
-            }.getOrNull()
-
-            if (response != null) {
-                lastHttpCode = response.okhttpResponse.code
-                if (response.okhttpResponse.code in 200..299) {
-                    runCatching { JSONArray(response.text) }
-                        .getOrNull()
-                        ?.let { return parseCandidates(it) }
-                }
-            }
-
-            if (attempt < DISCOVERY_ATTEMPTS) delay(DISCOVERY_RETRY_DELAY_MS)
-        }
-
-        val detail = lastHttpCode?.let { " (HTTP $it)" }.orEmpty()
-        throw ErrorLoadingException(
-            "Impossible de consulter le registre des domaines Frembed$detail",
-        )
-    }
-
-    private fun parseCandidates(certificates: JSONArray): List<String> {
-        val newestCertificateByDomain = LinkedHashMap<String, String>()
-
-        for (index in 0 until certificates.length()) {
-            val certificate = certificates.optJSONObject(index) ?: continue
-            // crt.sh's entry timestamp is the closest available signal for
-            // when this Frembed hostname was newly obtained/activated. Fall
-            // back to the certificate validity start on older responses.
-            val acquiredAt = certificate.optString("entry_timestamp", "")
-                .ifBlank { certificate.optString("not_before", "") }
-
-            sequenceOf(
-                certificate.optString("common_name", ""),
-                certificate.optString("name_value", ""),
-            ).flatMap { it.lineSequence() }
-                .mapNotNull(::normalizeDomain)
-                .forEach { domain ->
-                    val previous = newestCertificateByDomain[domain]
-                    if (previous == null || acquiredAt > previous) {
-                        newestCertificateByDomain[domain] = acquiredAt
-                    }
-                }
-        }
-
-        return newestCertificateByDomain.entries
-            .sortedByDescending { it.value }
-            .map { "https://${it.key}" }
-    }
-
-    private fun normalizeDomain(rawValue: String): String? {
-        var value = rawValue.trim().lowercase()
-        if (value.startsWith("*.")) value = value.removePrefix("*.")
-        if (value.startsWith("www.")) value = value.removePrefix("www.")
-
-        return value.takeIf { FREMBED_DOMAIN.matches(it) }
-    }
-
-    private suspend fun validateCandidate(candidateOrigin: String): String? {
-        val response = runCatching {
-            app.get(
-                url = "$candidateOrigin/movies",
-                headers = requestHeaders,
-                referer = "$candidateOrigin/",
-                cacheTime = 0,
-                timeout = PROBE_TIMEOUT_SECONDS,
-            )
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
 
         val finalOrigin = response.okhttpResponse.request.url.let { url ->
-            val scheme = url.scheme
-            val host = url.host.lowercase()
-            if (scheme != "https" || !FREMBED_DOMAIN.matches(host)) return null
-            "$scheme://$host" + if (url.port != 443) ":${url.port}" else ""
-        }
+            normalizeOrigin(
+                "${url.scheme}://${url.host}" +
+                    if (url.port != 443) ":${url.port}" else "",
+            )
+        } ?: return null
 
-        val html = response.text
-        val plainText = TAG_REGEX.replace(html, " ")
-        if (REJECTED_PAGE_MARKERS.any { plainText.contains(it, ignoreCase = true) }) {
+        // A successful JSON API response establishes domain usability.
+        // Empty catalogues and changes in item fields do not make the
+        // domain invalid. A JSON-level explicit API error is still rejected.
+        val payload = runCatching { JSONObject(response.text) }.getOrNull()
+            ?: return null
+        if (payload.has("status") && payload.optInt("status", 200) !in 200..299) {
             return null
         }
 
-        // A usable domain exposes several genuine film detail links and a
-        // pagination marker. This rejects blank/404/parked/address pages.
-        val catalogueLinks = CATALOGUE_LINK_REGEX.findAll(html).take(3).count()
-        return finalOrigin.takeIf {
-            catalogueLinks >= 3 && PAGE_COUNT_REGEX.containsMatchIn(plainText)
+        if (finalOrigin != candidateOrigin) {
+            Log.i(
+                TAG,
+                "Redirection API acceptée : $candidateOrigin -> $finalOrigin",
+            )
+        }
+
+        return finalOrigin
+    }
+
+    /**
+     * Résout l'origine finale d'une redirection HTTPS sans utiliser le HTML
+     * pour reconnaître le site.
+     */
+    private suspend fun resolveRedirectedOrigin(candidateOrigin: String): String? {
+        val response = runCatching {
+            app.get(
+                url = "$candidateOrigin/",
+                headers = requestHeaders,
+                cacheTime = 0,
+                timeout = REDIRECT_TIMEOUT_SECONDS,
+            )
+        }.onFailure { error ->
+            Log.w(
+                TAG,
+                "Résolution de redirection impossible pour $candidateOrigin",
+                error,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+
+        return response.okhttpResponse.request.url.let { url ->
+            normalizeOrigin(
+                "${url.scheme}://${url.host}" +
+                    if (url.port != 443) ":${url.port}" else "",
+            )
         }
     }
 
     internal companion object {
         const val TAG = "FrembedResolver"
+
         const val CONFIG_ORIGIN = "https://raw.githubusercontent.com"
         const val CONFIG_URL =
             "$CONFIG_ORIGIN/kingofthrone73-dotcom/frembed-config/refs/heads/main/config.json"
@@ -332,31 +276,15 @@ internal class FrembedDomainResolver(
         const val KEEP_LINK_URL =
             "$KEEP_LINK_ORIGIN/yorik100/Cloudstream/refs/heads/main/KeepLinkFrembed.txt"
 
-        const val DISCOVERY_ORIGIN = "https://crt.sh"
-        const val DISCOVERY_URL =
-            "$DISCOVERY_ORIGIN/?Identity=frembed.%25&output=json"
-
-        const val DISCOVERY_ATTEMPTS = 2
-        const val DISCOVERY_TIMEOUT_SECONDS = 25L
-        const val DISCOVERY_RETRY_DELAY_MS = 1_000L
         const val CONFIG_TIMEOUT_SECONDS = 8L
         const val KEEP_LINK_TIMEOUT_SECONDS = 8L
         const val API_PROBE_TIMEOUT_SECONDS = 8L
-        const val PROBE_TIMEOUT_SECONDS = 8L
-        const val MAX_PARALLEL_PROBES = 10
+        const val REDIRECT_TIMEOUT_SECONDS = 8L
 
-        val FREMBED_DOMAIN = Regex(
-            "^frembed\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+        val HOST_REGEX = Regex(
+            "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?" +
+                "(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$",
             RegexOption.IGNORE_CASE,
         )
-        val CATALOGUE_LINK_REGEX = Regex(
-            """href\s*=\s*[\"'][^\"']*/movies/[^\"'/]+/\d+/?[\"']""",
-            RegexOption.IGNORE_CASE,
-        )
-        val PAGE_COUNT_REGEX = Regex(
-            """(?i)\bpage\s+\d+\s*/\s*\d+""",
-        )
-        val TAG_REGEX = Regex("""<[^>]+>""")
-        val REJECTED_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
     }
 }

@@ -57,13 +57,9 @@ class FrembedProvider : MainAPI() {
             """^/(movies|tv-show)/([^/?#]+)/([0-9]+)/*$""",
             RegexOption.IGNORE_CASE,
         )
-        val PAGE_COUNT_REGEX = Regex(
-            """(?i)\bpage\s+\d+\s*/\s*(\d+)""",
-        )
         val YEAR_REGEX = Regex("""\b(?:19|20)\d{2}\b""")
         val HEX_ENTITY_REGEX = Regex("""&#x([0-9a-fA-F]+);""")
         val DECIMAL_ENTITY_REGEX = Regex("""&#(\d+);""")
-        val REGISTRY_PAGE_MARKERS = listOf("Nouvelle adresse", "Ouvrir le site")
         const val SERIES_PAGE_CACHE_SECONDS = 60
         const val SERIES_PAGE_TIMEOUT_SECONDS = 25L
         const val LOG_TAG = "FrembedDebug"
@@ -287,6 +283,10 @@ class FrembedProvider : MainAPI() {
         type: String,
         page: Int,
     ): FrembedCataloguePage? {
+        // Use the documented JSON catalogue first. It exposes pagination
+        // structurally and remains valid when the website layout changes.
+        fetchFrembedCatalogueApi(origin, type, page)?.let { return it }
+
         val route = if (type == "tv") "/tv-show" else "/movies"
         val pageUrl = "$origin$route" +
             if (page > 1) "?page=$page" else ""
@@ -307,33 +307,90 @@ class FrembedProvider : MainAPI() {
             html = response.text,
             origin = origin,
             expectedType = type,
+            page = page,
         ) ?: return null
 
-        // An empty page beyond the end is valid. An empty page inside the
-        // advertised range means this is not a usable Frembed catalogue.
-        if (parsed.items.isEmpty() && page <= parsed.totalPages) return null
+        // Only the legacy HTML parser requires extractable items. The JSON
+        // API above is allowed to return a genuinely empty catalogue page.
+        if (parsed.items.isEmpty()) return null
         return parsed
+    }
+
+    private suspend fun fetchFrembedCatalogueApi(
+        origin: String,
+        type: String,
+        page: Int,
+    ): FrembedCataloguePage? {
+        val endpoint = if (type == "tv") "tv" else "movies"
+        val response = runCatching {
+            app.get(
+                url = "$origin/api/public/v1/$endpoint?limit=20&page=$page",
+                headers = browserHeaders + ("Accept" to "application/json"),
+                referer = "$origin/api-docs",
+                cacheTime = CATALOGUE_CACHE_SECONDS,
+                timeout = CATALOGUE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.okhttpResponse.code !in 200..299) return null
+        val payload = runCatching { JSONObject(response.text) }.getOrNull()
+            ?: return null
+        if (payload.has("status") && payload.optInt("status", 200) !in 200..299) {
+            return null
+        }
+        val result = payload.optJSONObject("result") ?: return null
+        val items = result.optJSONArray("items") ?: return null
+        val totalPages = result.optInt("totalPages", page).coerceAtLeast(page)
+        val results = LinkedHashMap<String, SearchResponse>()
+
+        for (index in 0 until items.length()) {
+            val item = items.optJSONObject(index) ?: continue
+            val tmdbId = item.optString("tmdb").toIntOrNull()
+                ?.takeIf { it > 0 } ?: continue
+            val title = item.optString("title").takeIf(String::isNotBlank)
+                ?: continue
+            val year = item.optString("year").toIntOrNull()
+            val posterUrl = item.optString("poster")
+                .takeIf { it.startsWith("https://") }
+
+            val search = if (type == "tv") {
+                newTvSeriesSearchResponse(
+                    name = title,
+                    url = catalogUrl("tv", tmdbId),
+                    type = TvType.TvSeries,
+                ) {
+                    this.posterUrl = posterUrl
+                    this.year = year
+                }
+            } else {
+                newMovieSearchResponse(
+                    name = title,
+                    url = catalogUrl("movie", tmdbId),
+                    type = TvType.Movie,
+                ) {
+                    this.posterUrl = posterUrl
+                    this.year = year
+                }
+            }
+            // /tv lists one item per episode; CloudStream's catalogue needs
+            // one entry per series.
+            results.putIfAbsent(search.url, search)
+        }
+
+        // A non-empty API page whose entries are all unparseable is a schema
+        // incompatibility, not an empty catalogue. Try legacy HTML instead.
+        if (items.length() > 0 && results.isEmpty()) return null
+        return FrembedCataloguePage(results.values.toList(), totalPages)
     }
 
     private fun parseFrembedCatalogue(
         html: String,
         origin: String,
         expectedType: String,
+        page: Int,
     ): FrembedCataloguePage? {
-        val plainText = decodeHtml(
-            TAG_REGEX.replace(html, " ")
-        ).replace(Regex("\\s+"), " ")
-
-        if (REGISTRY_PAGE_MARKERS.any { plainText.contains(it, ignoreCase = true) }) {
-            return null
-        }
-
-        val totalPages = PAGE_COUNT_REGEX.find(plainText)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
-            ?: return null
-
+        // Legacy HTML fallback only: never invalidate a page because its
+        // visible pagination label or announcement text has changed.
         val expectedRoute = if (expectedType == "tv") "tv-show" else "movies"
         val results = LinkedHashMap<String, SearchResponse>()
 
@@ -386,7 +443,22 @@ class FrembedProvider : MainAPI() {
             results.putIfAbsent(item.url, item)
         }
 
-        return FrembedCataloguePage(results.values.toList(), totalPages)
+        // Do not require a literal "Page X / Y" string. Infer the next page
+        // from navigation hrefs, independently of their visible text/classes.
+        val hasNextHref = ANCHOR_REGEX.findAll(html).any { anchor ->
+            val href = decodeHtml(anchor.groupValues[1]).trim()
+            val url = runCatching { URI(origin).resolve(href) }.getOrNull()
+            val query = url?.rawQuery.orEmpty()
+            query.split('&').any { part ->
+                val pair = part.split('=', limit = 2)
+                pair.size == 2 && pair[0].equals("page", ignoreCase = true) &&
+                    pair[1].toIntOrNull() == page + 1
+            }
+        }
+        return FrembedCataloguePage(
+            results.values.toList(),
+            if (hasNextHref) page + 1 else page,
+        )
     }
 
     private fun attribute(tag: String, name: String): String? =
