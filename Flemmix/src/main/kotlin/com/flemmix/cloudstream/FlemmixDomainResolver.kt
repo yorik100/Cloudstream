@@ -1,5 +1,6 @@
 package com.flemmix.cloudstream
 
+import android.util.Base64
 import android.util.Log
 import com.lagradost.cloudstream3.ErrorLoadingException
 import com.lagradost.cloudstream3.app
@@ -71,22 +72,35 @@ internal class FlemmixDomainResolver(
     }
 
     private fun extractRegistryTargets(html: String): List<String> {
-        // Extract only the advertised primary link, never arbitrary
-        // external links that might belong to other services.
-        val preferred = runCatching {
+        val candidates = LinkedHashSet<String>()
+
+        // Current portal format: the primary destination can be carried in
+        // inline JavaScript as a base64 string while visible anchors use "#".
+        for (match in BASE64_STRING_REGEX.findAll(html)) {
+            val decoded = runCatching {
+                Base64.decode(match.groupValues[1], Base64.DEFAULT)
+                    .toString(Charsets.UTF_8)
+            }.getOrNull() ?: continue
+
+            normalizeOrigin(decoded)?.let { origin ->
+                if (origin != REGISTRY_ORIGIN) candidates.add(origin)
+            }
+        }
+
+        // Older portal format: "Lien principal" followed by a real <a href>.
+        runCatching {
             val label = SPAN_REGEX.findAll(html).firstOrNull { span ->
                 normalizeText(TAG_REGEX.replace(span.groupValues[1], " ")) ==
                     PRIMARY_LABEL
-            } ?: return@runCatching null
+            } ?: return@runCatching
             val after = html.substring(label.range.last + 1)
-            val link = ANCHOR_REGEX.find(after) ?: return@runCatching null
-            normalizeOrigin(decodeHtml(link.groupValues[1]))
-        }.getOrNull()
+            val link = ANCHOR_REGEX.find(after) ?: return@runCatching
+            normalizeOrigin(decodeHtml(link.groupValues[1]))?.let { origin ->
+                if (origin != REGISTRY_ORIGIN) candidates.add(origin)
+            }
+        }
 
-        // A registry can link to entirely different services. Never
-        // validate every outgoing link as though it were Flemmix.
-        return listOfNotNull(preferred)
-            .filter { it != REGISTRY_ORIGIN }
+        return candidates.toList()
     }
 
     private suspend fun resolveFromKeepLink(): String? {
@@ -192,6 +206,9 @@ internal class FlemmixDomainResolver(
         val ANCHOR_REGEX = Regex(
             """<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>""",
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        val BASE64_STRING_REGEX = Regex(
+            """["']([A-Za-z0-9+/]{16,}={0,2})["']""",
         )
         val TAG_REGEX = Regex("""<[^>]+>""")
     }

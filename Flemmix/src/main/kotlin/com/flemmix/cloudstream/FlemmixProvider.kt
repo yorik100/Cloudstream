@@ -11,6 +11,9 @@ import android.webkit.CookieManager
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.ErrorLoadingException
+import com.lagradost.cloudstream3.extractors.DoodLaExtractor
+import com.lagradost.cloudstream3.extractors.Uqload
+import com.lagradost.cloudstream3.extractors.Voe
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MainAPI
@@ -678,88 +681,33 @@ class FlemmixProvider : MainAPI() {
     }
 
     private suspend fun fetchDetail(origin: String, path: String): String? {
-        // Fast path: reuse the Bot Shield WebView cookie for the HTTP request.
+        // Search already acquires the Bot Shield session in WebView. Reuse
+        // its cookie when fetching a detail page so HTTP sees that session.
         val cookie = FlemmixSearchWebViewV16.cookieHeader(origin)
         val headers = if (cookie == null) browserHeaders
             else browserHeaders + ("Cookie" to cookie)
 
-        val pageUrl = "$origin$path"
         val response = runCatching {
             app.get(
-                url = pageUrl,
+                url = "$origin$path",
                 headers = headers,
                 referer = "$origin/",
+                // Never cache a transient challenge instead of movie HTML.
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
-        }.getOrNull()
+        }.getOrNull() ?: return null
 
-        val httpHtml = response
-            ?.takeIf { it.okhttpResponse.code in 200..299 }
-            ?.text
-            ?.takeUnless { it.contains(BOT_SHIELD_TEXT, ignoreCase = true) }
-
-        if (httpHtml != null && extractDetailTitle(httpHtml) != null) {
-            val markers = countPlayerMarkers(httpHtml)
-            Log.i(
-                SEARCH_TAG,
-                "Fiche HTTP : $path, taille=${httpHtml.length}, " +
-                    "marqueursLecteur=$markers",
-            )
-
-            // A title is enough to prove that the detail page exists, but not
-            // enough to prove that the server returned the player DOM. Current
-            // deployments can hydrate that part in the browser session.
-            if (markers > 0) return httpHtml
-
-            Log.w(
-                SEARCH_TAG,
-                "Fiche HTTP sans lecteurs, récupération du DOM WebView : $path",
-            )
-            val browserHtml = FlemmixSearchWebViewV16.loadDetail(origin, pageUrl)
-            if (
-                !browserHtml.isNullOrBlank() &&
-                extractDetailTitle(browserHtml) != null
-            ) {
-                Log.i(
-                    SEARCH_TAG,
-                    "Fiche WebView : $path, taille=${browserHtml.length}, " +
-                        "marqueursLecteur=${countPlayerMarkers(browserHtml)}",
-                )
-                return browserHtml
-            }
-
-            // Keep a valid information page even when it genuinely has no
-            // player. Films can then show the fiche instead of "not found".
-            return httpHtml
-        }
-
-        Log.w(
-            SEARCH_TAG,
-            "Fiche HTTP inutilisable, tentative WebView directe : $pageUrl",
-        )
-        val browserHtml = FlemmixSearchWebViewV16.loadDetail(origin, pageUrl)
-            ?: return null
-
-        if (extractDetailTitle(browserHtml) == null) {
-            Log.w(SEARCH_TAG, "Fiche WebView sans titre exploitable : $pageUrl")
+        if (response.okhttpResponse.code !in 200..299) return null
+        if (response.text.contains(BOT_SHIELD_TEXT, ignoreCase = true)) {
+            Log.w(SEARCH_TAG, "Bot Shield encore présent sur la fiche : $origin$path")
             return null
         }
-
-        Log.i(
-            SEARCH_TAG,
-            "Fiche obtenue uniquement par WebView : $path, " +
-                "taille=${browserHtml.length}, " +
-                "marqueursLecteur=${countPlayerMarkers(browserHtml)}",
-        )
-        return browserHtml
-    }
-
-    private fun countPlayerMarkers(html: String): Int {
-        val document = Jsoup.parse(html)
-        val dataV = document.select("[data-v]").size
-        val loadVideo = LOAD_VIDEO_CALL_REGEX.findAll(html).count()
-        return dataV + loadVideo
+        if (extractDetailTitle(response.text) == null) {
+            Log.w(SEARCH_TAG, "Fiche sans titre exploitable : $origin$path")
+            return null
+        }
+        return response.text
     }
 
     /**
@@ -948,131 +896,115 @@ class FlemmixProvider : MainAPI() {
      * video frames. Parse the DOM instead of relying on the exact quote/order
      * of `<a onclick=loadVideo(...)>`. No site-layout class is required.
      */
-    private fun parseMovieServers(html: String, origin: String): List<FlemmixServer> {
+    /**
+     * Current Flemmix movie structure:
+     *
+     *   div.tabs-sel a[data-v]
+     *
+     * The old loadVideo(...) format remains supported. The exact visual
+     * classes around the player are irrelevant; tabs-sel is the functional
+     * player container used by the site itself.
+     */
+    private fun parseMovieServers(
+        html: String,
+        origin: String,
+    ): List<FlemmixServer> {
+        val document = Jsoup.parse(html, "$origin/")
         val found = LinkedHashMap<String, FlemmixServer>()
 
-        // Preserve the historical anchor format as a compatibility path.
-        for (server in parseServers(html, origin, null)) {
-            found.putIfAbsent(server.url, server)
+        val currentAnchors = document.select("div.tabs-sel a")
+        for (anchor in currentAnchors) {
+            serverFromAnchor(anchor, origin, null)?.let { server ->
+                found.putIfAbsent(server.url, server)
+            }
         }
 
-        val document = Jsoup.parse(html, "$origin/")
-        val candidates = document.select(
-            "[data-v], [onclick], [data-url], [data-embed], [data-link], " +
-                "[data-player], iframe[src], iframe[data-src], " +
-                "video[src], video[data-src], source[src], source[data-src]",
-        )
-        var playerCalls = 0
-        var encodedPlayers = 0
-
-        for (element in candidates) {
-            val call = LOAD_VIDEO_CALL_REGEX.find(element.attr("onclick"))
-                ?.groupValues?.getOrNull(2)
-            if (call != null) playerCalls++
-
-            val dataV = element.attr("data-v")
-                .takeIf(String::isNotBlank)
-                ?.let(::decodePlayerDataV)
-                .also { if (it != null) encodedPlayers++ }
-
-            val mediaElement = element.normalName() in
-                setOf("iframe", "video", "source")
-            val rawUrls = sequenceOf(
-                dataV,
-                call,
-                element.attr("data-embed").takeIf(String::isNotBlank),
-                element.attr("data-player").takeIf(String::isNotBlank),
-                element.attr("data-link").takeIf(String::isNotBlank),
-                element.attr("data-url").takeIf(String::isNotBlank),
-                if (mediaElement) element.attr("src").takeIf(String::isNotBlank) else null,
-                if (mediaElement) element.attr("data-src").takeIf(String::isNotBlank) else null,
-            ).filterNotNull()
-
-            val label = element.attr("data-server")
-                .ifBlank { element.text().trim() }
-                .ifBlank { element.attr("title") }
-                .ifBlank { "Lecteur" }
-
-            for (rawUrl in rawUrls) {
-                val cleanUrl = decodeHtml(rawUrl.trim()).replace("\\/", "/")
-                // Ignore data-* values that are just identifiers (e.g. "1")
-                // rather than URLs. Never manufacture /1, /2 ... links.
-                if (!looksLikePlayerUrl(cleanUrl)) continue
-                val resolved = resolveUrl("$origin/", cleanUrl) ?: continue
-                found.putIfAbsent(resolved, FlemmixServer(label, resolved))
+        // Compatibility fallback for older/alternate templates.
+        if (found.isEmpty()) {
+            for (anchor in document.select("a[data-v], a[onclick*=loadVideo]")) {
+                serverFromAnchor(anchor, origin, null)?.let { server ->
+                    found.putIfAbsent(server.url, server)
+                }
             }
         }
 
         Log.i(
             SEARCH_TAG,
-            "Lecteurs film : candidats=${candidates.size}, " +
-                "data-v=$encodedPlayers, loadVideo=$playerCalls, liens=${found.size}",
+            "Lecteurs film courant : tabs=${currentAnchors.size}, " +
+                "liens=${found.size}",
         )
         return found.values.toList()
     }
 
-    private fun looksLikePlayerUrl(raw: String): Boolean {
-        if (raw.isBlank() || raw.startsWith("#")) return false
-        if (raw.startsWith("javascript:", ignoreCase = true)) return false
-        if (raw.startsWith("data:", ignoreCase = true)) return false
-        if (raw.startsWith("//") || raw.startsWith("/")) return true
-        if (raw.startsWith("https://", ignoreCase = true) ||
-            raw.startsWith("http://", ignoreCase = true)
-        ) return true
-        // Allow relative paths such as embed/player.php?x=1, not bare IDs.
-        return raw.contains('/') || raw.contains('.')
-    }
-
+    /**
+     * Current Flemmix series structure is relational:
+     *
+     *   div.blocfr / div.blocvostfr
+     *     ul.eplist li[rel=<player-class>]
+     *
+     * then:
+     *
+     *   div.<player-class> a[data-v]
+     *
+     * Reading the `rel` used by the site is more reliable than guessing the
+     * episode number from arbitrary surrounding DOM.
+     */
     private fun parseSeriesServers(
         html: String,
         origin: String,
     ): Map<Int, List<FlemmixServer>> {
-        val result = LinkedHashMap<Int, MutableList<FlemmixServer>>()
         val document = Jsoup.parse(html, "$origin/")
-        var episodeBlocks = 0
+        val result = LinkedHashMap<Int, MutableList<FlemmixServer>>()
+        var relEntries = 0
+        var playerAnchors = 0
 
-        // Parse the DOM instead of applying a regex ending at the first
-        // </div>. Episode containers can contain nested divs, including
-        // the player tabs themselves. A regex truncates such containers and
-        // silently drops valid players.
-        for (element in document.select("[class], [id], [data-episode]")) {
-            val marker = (element.classNames().asSequence() + sequenceOf(element.id()))
-                .mapNotNull { EPISODE_MARKER_REGEX.matchEntire(it) }
-                .firstOrNull()
+        fun addFromList(containerClass: String, language: String) {
+            for (item in document.select("div.$containerClass ul.eplist li")) {
+                val rel = item.attr("rel").trim()
+                if (rel.isBlank()) continue
 
-            val episode = marker?.groupValues?.getOrNull(1)?.toIntOrNull()
-                ?: element.attr("data-episode").toIntOrNull()
-                ?: continue
-            if (episode <= 0) continue
+                val episode = EPISODE_TEXT_REGEX.find(item.text())
+                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ?: EPISODE_MARKER_REGEX.find(rel)
+                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    ?: continue
 
-            episodeBlocks++
-            val language = when (marker?.groupValues?.getOrNull(2)?.lowercase()) {
-                "vs", "vostfr" -> "VOSTFR"
-                else -> "VF"
-            }
-
-            // Existing loadVideo(...) anchors remain the preferred source.
-            // The DOM subtree includes all nested tags, unlike the previous
-            // non-greedy regex capture.
-            val servers = (
-                parseServers(element.html(), origin, language) +
-                    parseEpisodePlayersFromDom(element, origin, language)
-                ).distinctBy(FlemmixServer::url)
-
-            if (servers.isNotEmpty()) {
-                result.getOrPut(episode) { ArrayList() }.addAll(servers)
+                relEntries++
+                val blocks = document.getElementsByClass(rel)
+                for (block in blocks) {
+                    for (anchor in block.select("a")) {
+                        playerAnchors++
+                        serverFromAnchor(anchor, origin, language)?.let { server ->
+                            result.getOrPut(episode) { ArrayList() }.add(server)
+                        }
+                    }
+                }
             }
         }
 
-        // Keep the former format as a compatibility fallback if an older
-        // deployment emits markup that Jsoup cannot associate with a marker.
+        addFromList("blocfr", "VF")
+        addFromList("blocvostfr", "VOSTFR")
+
+        // Current direct episode blocks, used as a second functional path.
         if (result.isEmpty()) {
-            for (block in EPISODE_BLOCK_REGEX.findAll(html)) {
-                val episode = block.groupValues[1].toIntOrNull() ?: continue
-                val language = if (block.groupValues[2].equals("vs", true)) "VOSTFR" else "VF"
-                val servers = parseServers(block.groupValues[3], origin, language)
-                if (servers.isNotEmpty()) {
-                    result.getOrPut(episode) { ArrayList() }.addAll(servers)
+            for (element in document.select("div[class]")) {
+                val marker = element.classNames()
+                    .asSequence()
+                    .mapNotNull { EPISODE_MARKER_REGEX.matchEntire(it) }
+                    .firstOrNull()
+                    ?: continue
+
+                val episode = marker.groupValues[1].toIntOrNull() ?: continue
+                val language = when (marker.groupValues.getOrNull(2)?.lowercase()) {
+                    "vs", "vostfr" -> "VOSTFR"
+                    else -> "VF"
+                }
+
+                for (anchor in element.select("a")) {
+                    playerAnchors++
+                    serverFromAnchor(anchor, origin, language)?.let { server ->
+                        result.getOrPut(episode) { ArrayList() }.add(server)
+                    }
                 }
             }
         }
@@ -1080,132 +1012,70 @@ class FlemmixProvider : MainAPI() {
         val parsed = result.mapValues { (_, servers) ->
             servers.distinctBy(FlemmixServer::url)
         }
+
         Log.i(
             SEARCH_TAG,
-            "Lecteurs série : blocs=$episodeBlocks, épisodes=${parsed.size}, " +
-                "liens=${parsed.values.sumOf { it.size }}, " +
-                "data-v=${Jsoup.parse(html).select("[data-v]").size}, " +
-                "loadVideo=${LOAD_VIDEO_CALL_REGEX.findAll(html).count()}",
+            "Lecteurs série courant : rel=$relEntries, " +
+                "anchors=$playerAnchors, épisodes=${parsed.size}, " +
+                "liens=${parsed.values.sumOf { it.size }}",
         )
         return parsed
     }
 
     /**
-     * Secondary extraction for episode tabs using buttons, attributes or
-     * embedded players instead of the historical <a onclick=loadVideo(... )>.
-     * This operates strictly inside an identified episode container.
+     * Decode one player anchor exactly like the site:
+     *
+     * - old format: onclick="loadVideo('https://...')"
+     * - current format: data-v = Base64(ROT13(url))
+     *
+     * No player hostname is required here.
      */
-    private fun parseEpisodePlayersFromDom(
-        element: org.jsoup.nodes.Element,
-        origin: String,
-        language: String,
-    ): List<FlemmixServer> {
-        val results = LinkedHashMap<String, FlemmixServer>()
-        val candidates = element.select(
-            "[data-v], [onclick], [data-url], [data-embed], [data-link], " +
-                "iframe[src], iframe[data-src], video[src], video[data-src], " +
-                "source[src], source[data-src]",
-        )
-
-        for (candidate in candidates) {
-            val scriptedUrl = LOAD_VIDEO_CALL_REGEX.find(candidate.attr("onclick"))
-                ?.groupValues?.getOrNull(2)
-
-            val dataV = candidate.attr("data-v")
-                .takeIf(String::isNotBlank)
-                ?.let(::decodePlayerDataV)
-
-            val rawUrls = sequenceOf(
-                dataV,
-                scriptedUrl,
-                candidate.attr("data-url").takeIf(String::isNotBlank),
-                candidate.attr("data-embed").takeIf(String::isNotBlank),
-                candidate.attr("data-link").takeIf(String::isNotBlank),
-                if (candidate.normalName() in setOf("iframe", "video", "source")) {
-                    candidate.attr("src").takeIf(String::isNotBlank)
-                } else null,
-                if (candidate.normalName() in setOf("iframe", "video", "source")) {
-                    candidate.attr("data-src").takeIf(String::isNotBlank)
-                } else null,
-            ).filterNotNull()
-
-            val label = candidate.text().trim().ifBlank {
-                candidate.attr("title").ifBlank { "Lecteur" }
-            }
-            for (rawUrl in rawUrls) {
-                val url = resolveUrl("$origin/", decodeHtml(rawUrl).replace("\\/", "/"))
-                    ?: continue
-                results.putIfAbsent(url, FlemmixServer("$language · $label", url))
-            }
-        }
-        return results.values.toList()
-    }
-
-    private fun parseServers(
-        html: String,
+    private fun serverFromAnchor(
+        anchor: org.jsoup.nodes.Element,
         origin: String,
         language: String?,
-    ): List<FlemmixServer> {
-        val results = LinkedHashMap<String, FlemmixServer>()
+    ): FlemmixServer? {
+        val onclick = anchor.attr("onclick")
+        val oldUrl = LOAD_VIDEO_CALL_REGEX.find(onclick)
+            ?.groupValues?.getOrNull(2)
 
-        // Legacy loadVideo(...) format.
-        for (match in VIDEO_ANCHOR_REGEX.findAll(html)) {
-            val rawUrl = decodeHtml(match.groupValues[1]).replace("\\/", "/")
-            val url = resolveUrl("$origin/", rawUrl) ?: continue
-            if (url.startsWith("javascript:", true)) continue
-            val rawLabel = plainText(match.groupValues[2]).ifBlank { "Lecteur" }
-            val label = listOfNotNull(language, rawLabel).joinToString(" · ")
-            results.putIfAbsent(url, FlemmixServer(label, url))
-        }
+        val raw = oldUrl
+            ?: anchor.attr("data-v")
+                .takeIf(String::isNotBlank)
+                ?.let(::decodePlayerDataV)
+            ?: return null
 
-        // Current format: player URL stored in data-v as Base64(ROT13(url)).
-        // This is a functional encoding, not a visual-layout dependency.
-        val document = Jsoup.parseBodyFragment(html, "$origin/")
-        for (anchor in document.select("[data-v]")) {
-            val rawUrl = decodePlayerDataV(anchor.attr("data-v")) ?: continue
-            val url = resolveUrl("$origin/", rawUrl) ?: continue
-            val rawLabel = anchor.text().trim()
-                .ifBlank { anchor.attr("title").trim() }
-                .ifBlank { anchor.attr("data-server").trim() }
-                .ifBlank { "Lecteur" }
-            val label = listOfNotNull(language, rawLabel).joinToString(" · ")
-            results.putIfAbsent(url, FlemmixServer(label, url))
-        }
+        val clean = decodeHtml(raw.trim()).replace("\\/", "/")
+        if (!looksLikePlayerUrl(clean)) return null
 
-        return results.values.toList()
+        val url = resolveUrl("$origin/", clean) ?: return null
+        val rawLabel = anchor.selectFirst("span")?.text()?.trim()
+            .orEmpty()
+            .ifBlank { anchor.text().trim() }
+            .ifBlank { anchor.attr("title").trim() }
+            .ifBlank { "Lecteur" }
+
+        val label = listOfNotNull(language, rawLabel)
+            .filter(String::isNotBlank)
+            .joinToString(" · ")
+
+        return FlemmixServer(label.ifBlank { "Lecteur" }, url)
     }
 
-    /**
-     * Current Flemmix player links can be stored in data-v.
-     *
-     * Encoding used by the site:
-     *   data-v = Base64(ROT13(realUrl))
-     *
-     * Direct URLs are accepted too. No hostname/provider name is hardcoded:
-     * the decoded value only has to be an HTTP(S), scheme-relative or
-     * relative player URL.
-     */
     private fun decodePlayerDataV(rawValue: String): String? {
         val value = decodeHtml(rawValue.trim()).replace("\\/", "/")
         if (looksLikePlayerUrl(value)) return value
 
-        val decoded = sequenceOf(
-            Base64.DEFAULT,
-            Base64.URL_SAFE or Base64.NO_WRAP,
-        ).mapNotNull { flags ->
-            runCatching {
-                Base64.decode(value, flags).toString(Charsets.UTF_8)
-            }.getOrNull()
-        }.firstOrNull() ?: return null
+        val decoded = runCatching {
+            Base64.decode(value, Base64.DEFAULT).toString(Charsets.UTF_8)
+        }.getOrNull() ?: return null
 
         val rot13 = buildString(decoded.length) {
             for (char in decoded) {
                 append(
                     when (char) {
-                        in 'a'..'z' ->
-                            'a' + ((char - 'a' + 13) % 26)
-                        in 'A'..'Z' ->
-                            'A' + ((char - 'A' + 13) % 26)
+                        in 'a'..'z' -> 'a' + ((char - 'a' + 13) % 26)
+                        in 'A'..'Z' -> 'A' + ((char - 'A' + 13) % 26)
                         else -> char
                     },
                 )
@@ -1213,6 +1083,85 @@ class FlemmixProvider : MainAPI() {
         }.trim().replace("\\/", "/")
 
         return rot13.takeIf(::looksLikePlayerUrl)
+    }
+
+    private fun looksLikePlayerUrl(raw: String): Boolean {
+        if (raw.isBlank() || raw.startsWith("#")) return false
+        if (raw.startsWith("javascript:", ignoreCase = true)) return false
+        if (raw.startsWith("data:", ignoreCase = true)) return false
+        if (raw.startsWith("//") || raw.startsWith("/")) return true
+        return raw.startsWith("https://", ignoreCase = true) ||
+            raw.startsWith("http://", ignoreCase = true)
+    }
+
+    /**
+     * CloudStream's normal URL matcher is tried first. If a rotating hostname
+     * is unknown to the matcher, use the player family name displayed by
+     * Flemmix to invoke the corresponding built-in extractor directly.
+     *
+     * This avoids hardcoding rotating hostnames.
+     */
+    private suspend fun extractServer(
+        server: FlemmixServer,
+        referer: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit,
+    ): Boolean {
+        var emitted = false
+
+        runCatching {
+            loadExtractor(
+                url = server.url,
+                referer = referer,
+                subtitleCallback = subtitleCallback,
+                callback = {
+                    emitted = true
+                    callback(it)
+                },
+            )
+        }
+        if (emitted) return true
+
+        val family = normalizeForMatch(server.label)
+        val actualOrigin = runCatching {
+            URI(server.url).let { uri ->
+                "${uri.scheme}://${uri.host}" +
+                    if (uri.port != -1 && uri.port != 443) ":${uri.port}" else ""
+            }
+        }.getOrNull()
+
+        val extractor = when {
+            "voe" in family -> object : Voe() {
+                override val mainUrl: String = actualOrigin ?: super.mainUrl
+            }
+            "uqload" in family -> Uqload().apply {
+                if (actualOrigin != null) mainUrl = actualOrigin
+            }
+            "ddstream" in family || "dood" in family -> DoodLaExtractor().apply {
+                if (actualOrigin != null) mainUrl = actualOrigin
+            }
+            else -> null
+        } ?: return false
+
+        Log.i(
+            SEARCH_TAG,
+            "Fallback extracteur par famille : label='${server.label}', " +
+                "host=${runCatching { URI(server.url).host }.getOrNull().orEmpty()}",
+        )
+
+        runCatching {
+            extractor.getUrl(
+                url = server.url,
+                referer = referer,
+                subtitleCallback = subtitleCallback,
+                callback = {
+                    emitted = true
+                    callback(it)
+                },
+            )
+        }
+
+        return emitted
     }
 
     override suspend fun loadLinks(
@@ -1259,16 +1208,15 @@ class FlemmixProvider : MainAPI() {
                 continue
             }
 
-            runCatching {
-                loadExtractor(
-                    url = server.url,
+            if (
+                extractServer(
+                    server = server,
                     referer = referer,
                     subtitleCallback = subtitleCallback,
-                    callback = {
-                        emitted = true
-                        callback(it)
-                    },
+                    callback = callback,
                 )
+            ) {
+                emitted = true
             }
         }
 
@@ -1523,6 +1471,10 @@ class FlemmixProvider : MainAPI() {
             """(?:ep|episode)[_-]?0*([0-9]+)(?:[_-]?(vf|vs|vostfr))?""",
             RegexOption.IGNORE_CASE,
         )
+        val EPISODE_TEXT_REGEX = Regex(
+            """\b(?:épisode|episode)\s*0*([0-9]+)\b""",
+            RegexOption.IGNORE_CASE,
+        )
         // Group 1 is the opening quote; group 2 is the media/embed URL.
         val LOAD_VIDEO_CALL_REGEX = Regex(
             """\bloadVideo\s*\(\s*(['\"])(.*?)\1""",
@@ -1666,167 +1618,6 @@ object FlemmixSearchWebViewV16 {
             }
         }
     }
-
-    /**
-     * Loads a detail page in the real browser session when the HTTP response
-     * contains the fiche but not the player DOM.
-     *
-     * Readiness is based only on functional player attributes
-     * (`data-v` / `loadVideo`) or a settled timeout, never on visual classes.
-     */
-    @SuppressLint("SetJavaScriptEnabled")
-    suspend fun loadDetail(origin: String, pageUrl: String): String? =
-        suspendCancellableCoroutine { continuation ->
-            val handler = Handler(Looper.getMainLooper())
-            val finished = AtomicBoolean(false)
-            var webView: WebView? = null
-            var lastHtml: String? = null
-            var polls = 0
-            lateinit var timeout: Runnable
-            lateinit var poll: Runnable
-
-            fun finish(html: String?) {
-                if (!finished.compareAndSet(false, true)) return
-                handler.removeCallbacks(timeout)
-                handler.removeCallbacks(poll)
-                handler.post {
-                    runCatching {
-                        webView?.let { view ->
-                            (view.parent as? ViewGroup)?.removeView(view)
-                            view.stopLoading()
-                            view.destroy()
-                        }
-                    }
-                    webView = null
-                }
-                if (continuation.isActive) continuation.resume(html)
-            }
-
-            timeout = Runnable {
-                Log.w(
-                    "FlemmixSearchWebView",
-                    "Expiration fiche WebView : $pageUrl, " +
-                        "taille=${lastHtml?.length ?: 0}",
-                )
-                finish(lastHtml)
-            }
-            continuation.invokeOnCancellation { finish(null) }
-
-            handler.post {
-                val activity = FlemmixRuntimeV16.currentActivity()
-                if (activity == null || activity.isFinishing) {
-                    finish(null)
-                    return@post
-                }
-
-                try {
-                    val cookieManager = CookieManager.getInstance()
-                    cookieManager.setAcceptCookie(true)
-
-                    val view = WebView(activity).apply {
-                        setBackgroundColor(Color.TRANSPARENT)
-                        alpha = 0.01f
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-
-                        webViewClient = object : WebViewClient() {
-                            override fun onPageFinished(view: WebView, url: String) {
-                                if (finished.get() || url == "about:blank") return
-
-                                poll = object : Runnable {
-                                    override fun run() {
-                                        if (finished.get()) return
-
-                                        view.evaluateJavascript(
-                                            """
-                                            (function () {
-                                              const html =
-                                                document.documentElement.outerHTML || "";
-                                              const dataV =
-                                                document.querySelectorAll("[data-v]").length;
-                                              const loadVideo =
-                                                (html.match(/loadVideo\s*\(/gi) || []).length;
-                                              return JSON.stringify({
-                                                html: html,
-                                                dataV: dataV,
-                                                loadVideo: loadVideo,
-                                                readyState: document.readyState
-                                              });
-                                            })();
-                                            """.trimIndent(),
-                                        ) { encoded ->
-                                            if (finished.get()) {
-                                                return@evaluateJavascript
-                                            }
-
-                                            val raw = runCatching {
-                                                JSONTokener(encoded).nextValue() as? String
-                                            }.getOrNull()
-
-                                            val payload = runCatching {
-                                                JSONObject(raw.orEmpty())
-                                            }.getOrNull()
-
-                                            val html = payload
-                                                ?.optString("html", "")
-                                                ?.takeIf(String::isNotBlank)
-
-                                            if (html != null) lastHtml = html
-
-                                            val dataV = payload?.optInt("dataV", 0) ?: 0
-                                            val loadVideo =
-                                                payload?.optInt("loadVideo", 0) ?: 0
-                                            val readyState =
-                                                payload?.optString("readyState", "").orEmpty()
-
-                                            polls++
-
-                                            Log.i(
-                                                "FlemmixSearchWebView",
-                                                "Fiche DOM poll=$polls " +
-                                                    "data-v=$dataV " +
-                                                    "loadVideo=$loadVideo " +
-                                                    "state=$readyState " +
-                                                    "url=$url",
-                                            )
-
-                                            if (dataV > 0 || loadVideo > 0) {
-                                                finish(html)
-                                            } else if (polls >= 16) {
-                                                // Eight seconds after onPageFinished.
-                                                // A genuine fiche without players must
-                                                // not keep the WebView alive forever.
-                                                finish(html)
-                                            } else {
-                                                handler.postDelayed(this, 500L)
-                                            }
-                                        }
-                                    }
-                                }
-
-                                handler.post(poll)
-                            }
-                        }
-                    }
-
-                    webView = view
-                    cookieManager.setAcceptThirdPartyCookies(view, true)
-                    activity.addContentView(
-                        view,
-                        ViewGroup.LayoutParams(1, 1),
-                    )
-                    view.loadUrl(pageUrl)
-                    handler.postDelayed(timeout, 12_000L)
-                } catch (error: Throwable) {
-                    Log.w(
-                        "FlemmixSearchWebView",
-                        "WebView fiche impossible : $pageUrl",
-                        error,
-                    )
-                    finish(lastHtml)
-                }
-            }
-        }
 
     /**
      * Loads a catalogue in the same Android WebView session as search.
