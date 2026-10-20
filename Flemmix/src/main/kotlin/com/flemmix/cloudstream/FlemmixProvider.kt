@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.util.Log
 import android.view.ViewGroup
 import android.webkit.CookieManager
@@ -902,20 +903,27 @@ class FlemmixProvider : MainAPI() {
 
         val document = Jsoup.parse(html, "$origin/")
         val candidates = document.select(
-            "[onclick], [data-url], [data-embed], [data-link], " +
+            "[data-v], [onclick], [data-url], [data-embed], [data-link], " +
                 "[data-player], iframe[src], iframe[data-src], " +
                 "video[src], video[data-src], source[src], source[data-src]",
         )
         var playerCalls = 0
+        var encodedPlayers = 0
 
         for (element in candidates) {
             val call = LOAD_VIDEO_CALL_REGEX.find(element.attr("onclick"))
                 ?.groupValues?.getOrNull(2)
             if (call != null) playerCalls++
 
+            val dataV = element.attr("data-v")
+                .takeIf(String::isNotBlank)
+                ?.let(::decodePlayerDataV)
+                .also { if (it != null) encodedPlayers++ }
+
             val mediaElement = element.normalName() in
                 setOf("iframe", "video", "source")
             val rawUrls = sequenceOf(
+                dataV,
                 call,
                 element.attr("data-embed").takeIf(String::isNotBlank),
                 element.attr("data-player").takeIf(String::isNotBlank),
@@ -943,7 +951,7 @@ class FlemmixProvider : MainAPI() {
         Log.i(
             SEARCH_TAG,
             "Lecteurs film : candidats=${candidates.size}, " +
-                "loadVideo=$playerCalls, liens=${found.size}",
+                "data-v=$encodedPlayers, loadVideo=$playerCalls, liens=${found.size}",
         )
         return found.values.toList()
     }
@@ -1021,6 +1029,7 @@ class FlemmixProvider : MainAPI() {
             SEARCH_TAG,
             "Lecteurs série : blocs=$episodeBlocks, épisodes=${parsed.size}, " +
                 "liens=${parsed.values.sumOf { it.size }}, " +
+                "data-v=${Jsoup.parse(html).select("[data-v]").size}, " +
                 "loadVideo=${LOAD_VIDEO_CALL_REGEX.findAll(html).count()}",
         )
         return parsed
@@ -1038,7 +1047,7 @@ class FlemmixProvider : MainAPI() {
     ): List<FlemmixServer> {
         val results = LinkedHashMap<String, FlemmixServer>()
         val candidates = element.select(
-            "[onclick], [data-url], [data-embed], [data-link], " +
+            "[data-v], [onclick], [data-url], [data-embed], [data-link], " +
                 "iframe[src], iframe[data-src], video[src], video[data-src], " +
                 "source[src], source[data-src]",
         )
@@ -1047,7 +1056,12 @@ class FlemmixProvider : MainAPI() {
             val scriptedUrl = LOAD_VIDEO_CALL_REGEX.find(candidate.attr("onclick"))
                 ?.groupValues?.getOrNull(2)
 
+            val dataV = candidate.attr("data-v")
+                .takeIf(String::isNotBlank)
+                ?.let(::decodePlayerDataV)
+
             val rawUrls = sequenceOf(
+                dataV,
                 scriptedUrl,
                 candidate.attr("data-url").takeIf(String::isNotBlank),
                 candidate.attr("data-embed").takeIf(String::isNotBlank),
@@ -1079,6 +1093,7 @@ class FlemmixProvider : MainAPI() {
     ): List<FlemmixServer> {
         val results = LinkedHashMap<String, FlemmixServer>()
 
+        // Legacy loadVideo(...) format.
         for (match in VIDEO_ANCHOR_REGEX.findAll(html)) {
             val rawUrl = decodeHtml(match.groupValues[1]).replace("\\/", "/")
             val url = resolveUrl("$origin/", rawUrl) ?: continue
@@ -1088,7 +1103,61 @@ class FlemmixProvider : MainAPI() {
             results.putIfAbsent(url, FlemmixServer(label, url))
         }
 
+        // Current format: player URL stored in data-v as Base64(ROT13(url)).
+        // This is a functional encoding, not a visual-layout dependency.
+        val document = Jsoup.parseBodyFragment(html, "$origin/")
+        for (anchor in document.select("[data-v]")) {
+            val rawUrl = decodePlayerDataV(anchor.attr("data-v")) ?: continue
+            val url = resolveUrl("$origin/", rawUrl) ?: continue
+            val rawLabel = anchor.text().trim()
+                .ifBlank { anchor.attr("title").trim() }
+                .ifBlank { anchor.attr("data-server").trim() }
+                .ifBlank { "Lecteur" }
+            val label = listOfNotNull(language, rawLabel).joinToString(" · ")
+            results.putIfAbsent(url, FlemmixServer(label, url))
+        }
+
         return results.values.toList()
+    }
+
+    /**
+     * Current Flemmix player links can be stored in data-v.
+     *
+     * Encoding used by the site:
+     *   data-v = Base64(ROT13(realUrl))
+     *
+     * Direct URLs are accepted too. No hostname/provider name is hardcoded:
+     * the decoded value only has to be an HTTP(S), scheme-relative or
+     * relative player URL.
+     */
+    private fun decodePlayerDataV(rawValue: String): String? {
+        val value = decodeHtml(rawValue.trim()).replace("\\/", "/")
+        if (looksLikePlayerUrl(value)) return value
+
+        val decoded = sequenceOf(
+            Base64.DEFAULT,
+            Base64.URL_SAFE or Base64.NO_WRAP,
+        ).mapNotNull { flags ->
+            runCatching {
+                Base64.decode(value, flags).toString(Charsets.UTF_8)
+            }.getOrNull()
+        }.firstOrNull() ?: return null
+
+        val rot13 = buildString(decoded.length) {
+            for (char in decoded) {
+                append(
+                    when (char) {
+                        in 'a'..'z' ->
+                            'a' + ((char - 'a' + 13) % 26)
+                        in 'A'..'Z' ->
+                            'A' + ((char - 'A' + 13) % 26)
+                        else -> char
+                    },
+                )
+            }
+        }.trim().replace("\\/", "/")
+
+        return rot13.takeIf(::looksLikePlayerUrl)
     }
 
     override suspend fun loadLinks(
