@@ -28,11 +28,11 @@ internal class FlemmixDomainResolver(
             // a fallback if that page cannot supply a usable origin.
             resolveFromRegistry()?.let { resolved ->
                 cachedOrigin = resolved
-                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis neufneuf.space : $resolved")
+                Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis wiflix-adresses.fun : $resolved")
                 return@withLock resolved
             }
 
-            Log.w(TAG, "neufneuf.space indisponible ou sans domaine valide : recours à KeepLinkFlemmix.txt")
+            Log.w(TAG, "wiflix-adresses.fun indisponible ou sans domaine valide : recours à KeepLinkFlemmix.txt")
             resolveFromKeepLink()?.let { resolved ->
                 cachedOrigin = resolved
                 Log.i(TAG, "Domaine Flemmix/Wiflix obtenu depuis KeepLinkFlemmix.txt (secours) : $resolved")
@@ -171,7 +171,7 @@ internal class FlemmixDomainResolver(
 
     internal companion object {
         const val TAG = "FlemmixResolver"
-        const val REGISTRY_ORIGIN = "https://www.neufneuf.space"
+        const val REGISTRY_ORIGIN = "https://ww1.wiflix-adresses.fun"
         const val REGISTRY_URL = "$REGISTRY_ORIGIN/"
         const val KEEP_LINK_ORIGIN = "https://raw.githubusercontent.com"
         const val KEEP_LINK_URL =
