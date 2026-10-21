@@ -1,6 +1,6 @@
 import com.lagradost.cloudstream3.gradle.tasks.GenerateManifestTask
 
-version = 34
+version = 35
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +
@@ -8,6 +8,11 @@ val publishedIconBase =
         "/refs/heads/main/icons"
 
 dependencies {
+    // Jsoup exposes JSpecify type-use annotations (for example @Nullable).
+    // Kotlin needs the annotation classes on the compile classpath even
+    // though they are not required at runtime.
+    compileOnly("org.jspecify:jspecify:1.0.0")
+
     // CloudStream already provides coroutines at runtime.
     compileOnly("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 }
