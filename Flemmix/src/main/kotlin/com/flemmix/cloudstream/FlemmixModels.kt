@@ -55,3 +55,11 @@ internal data class FlemmixServer(
     val label: String,
     val url: String,
 )
+
+/** A page advertises either a URL or an opaque token, never necessarily a URL. */
+internal data class FlemmixPlayer(
+    val label: String,
+    val value: String,
+) {
+    val needsResolution: Boolean get() = value.startsWith("fx1_")
+}

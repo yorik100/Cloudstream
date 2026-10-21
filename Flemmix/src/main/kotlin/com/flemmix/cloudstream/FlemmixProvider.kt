@@ -32,6 +32,7 @@ import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -40,6 +41,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.Jsoup
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import java.net.URI
 import java.net.URLEncoder
 import java.text.Normalizer
@@ -51,6 +54,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.CancellationException
 import kotlin.math.max
 
 class FlemmixProvider : MainAPI() {
@@ -79,6 +83,9 @@ class FlemmixProvider : MainAPI() {
     )
 
     private val domainResolver = FlemmixDomainResolver(browserHeaders)
+    private val playerParser = FlemmixPlayerParser { value ->
+        runCatching { Base64.decode(value, Base64.DEFAULT).toString(Charsets.UTF_8) }.getOrNull()
+    }
     private val webViewSearchOrigins = ConcurrentHashMap.newKeySet<String>()
     private val tmdbApi = "https://api.themoviedb.org/3"
     private val tmdbImages = "https://image.tmdb.org/t/p"
@@ -669,26 +676,37 @@ class FlemmixProvider : MainAPI() {
     private data class DetailPage(
         val html: String,
         val origin: String,
+        val url: String,
+        val session: Session,
+        val headers: Map<String, String>,
     )
 
     private suspend fun fetchDetailWithRefresh(path: String): DetailPage? {
         val firstOrigin = ensureDomain()
-        fetchDetail(firstOrigin, path)?.let { return DetailPage(it, firstOrigin) }
+        fetchDetail(firstOrigin, path)?.let { return it }
 
         domainResolver.invalidate(firstOrigin)
         val refreshedOrigin = ensureDomain()
-        return fetchDetail(refreshedOrigin, path)?.let { DetailPage(it, refreshedOrigin) }
+        return fetchDetail(refreshedOrigin, path)
     }
 
-    private suspend fun fetchDetail(origin: String, path: String): String? {
+    private suspend fun fetchDetail(origin: String, path: String): DetailPage? {
         // Search already acquires the Bot Shield session in WebView. Reuse
         // its cookie when fetching a detail page so HTTP sees that session.
         val cookie = FlemmixSearchWebViewV16.cookieHeader(origin)
-        val headers = if (cookie == null) browserHeaders
-            else browserHeaders + ("Cookie" to cookie)
+        val headers = browserHeaders
 
+        // Keep the page and its player API in the same cookie session.
+        val session = Session(app.baseClient)
+        if (!cookie.isNullOrBlank()) {
+            val cookieUrl = "$origin/".toHttpUrl()
+            val cookies = cookie.split(';').mapNotNull { value ->
+                Cookie.parse(cookieUrl, "${value.trim()}; Path=/")
+            }
+            session.baseClient.cookieJar.saveFromResponse(cookieUrl, cookies)
+        }
         val response = runCatching {
-            app.get(
+            session.get(
                 url = "$origin$path",
                 headers = headers,
                 referer = "$origin/",
@@ -707,7 +725,10 @@ class FlemmixProvider : MainAPI() {
             Log.w(SEARCH_TAG, "Fiche sans titre exploitable : $origin$path")
             return null
         }
-        return response.text
+        val finalUrl = response.okhttpResponse.request.url
+        val finalOrigin = "${finalUrl.scheme}://${finalUrl.host}" +
+            if (finalUrl.port != 443 && finalUrl.port != 80) ":${finalUrl.port}" else ""
+        return DetailPage(response.text, finalOrigin, finalUrl.toString(), session, headers)
     }
 
     /**
@@ -822,7 +843,7 @@ class FlemmixProvider : MainAPI() {
     ): LoadResponse {
         val availableServers = parseSeriesServers(html, origin)
         if (availableServers.isEmpty()) {
-            throw ErrorLoadingException("Série pas disponible sur Flemmix/Wiflix")
+            throw ErrorLoadingException("Fiche chargée, mais aucun lecteur d’épisode reconnu sur Flemmix/Wiflix")
         }
 
         val seasonNumber = source.season ?: 1
@@ -891,207 +912,57 @@ class FlemmixProvider : MainAPI() {
         }
     }
 
-    /**
-     * Movie players may be anchors, buttons, data attributes or embedded
-     * video frames. Parse the DOM instead of relying on the exact quote/order
-     * of `<a onclick=loadVideo(...)>`. No site-layout class is required.
-     */
-    /**
-     * Current Flemmix movie structure:
-     *
-     *   div.tabs-sel a[data-v]
-     *
-     * The old loadVideo(...) format remains supported. The exact visual
-     * classes around the player are irrelevant; tabs-sel is the functional
-     * player container used by the site itself.
-     */
-    private fun parseMovieServers(
-        html: String,
-        origin: String,
-    ): List<FlemmixServer> {
-        val document = Jsoup.parse(html, "$origin/")
-        val found = LinkedHashMap<String, FlemmixServer>()
-
-        val currentAnchors = document.select("div.tabs-sel a")
-        for (anchor in currentAnchors) {
-            serverFromAnchor(anchor, origin, null)?.let { server ->
-                found.putIfAbsent(server.url, server)
-            }
+    private fun parseMovieServers(html: String, origin: String): List<FlemmixPlayer> =
+        playerParser.movie(html, origin).also { players ->
+            Log.i(SEARCH_TAG, "Lecteurs film v34 : candidats=${players.size}, " +
+                "jetons=${players.count { it.needsResolution }}")
         }
 
-        // Compatibility fallback for older/alternate templates.
-        if (found.isEmpty()) {
-            for (anchor in document.select("a[data-v], a[onclick*=loadVideo]")) {
-                serverFromAnchor(anchor, origin, null)?.let { server ->
-                    found.putIfAbsent(server.url, server)
-                }
-            }
-        }
-
-        Log.i(
-            SEARCH_TAG,
-            "Lecteurs film courant : tabs=${currentAnchors.size}, " +
-                "liens=${found.size}",
-        )
-        return found.values.toList()
-    }
-
-    /**
-     * Current Flemmix series structure is relational:
-     *
-     *   div.blocfr / div.blocvostfr
-     *     ul.eplist li[rel=<player-class>]
-     *
-     * then:
-     *
-     *   div.<player-class> a[data-v]
-     *
-     * Reading the `rel` used by the site is more reliable than guessing the
-     * episode number from arbitrary surrounding DOM.
-     */
     private fun parseSeriesServers(
         html: String,
         origin: String,
-    ): Map<Int, List<FlemmixServer>> {
-        val document = Jsoup.parse(html, "$origin/")
-        val result = LinkedHashMap<Int, MutableList<FlemmixServer>>()
-        var relEntries = 0
-        var playerAnchors = 0
-
-        fun addFromList(containerClass: String, language: String) {
-            for (item in document.select("div.$containerClass ul.eplist li")) {
-                val rel = item.attr("rel").trim()
-                if (rel.isBlank()) continue
-
-                val episode = EPISODE_TEXT_REGEX.find(item.text())
-                    ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    ?: EPISODE_MARKER_REGEX.find(rel)
-                        ?.groupValues?.getOrNull(1)?.toIntOrNull()
-                    ?: continue
-
-                relEntries++
-                val blocks = document.getElementsByClass(rel)
-                for (block in blocks) {
-                    for (anchor in block.select("a")) {
-                        playerAnchors++
-                        serverFromAnchor(anchor, origin, language)?.let { server ->
-                            result.getOrPut(episode) { ArrayList() }.add(server)
-                        }
-                    }
-                }
-            }
-        }
-
-        addFromList("blocfr", "VF")
-        addFromList("blocvostfr", "VOSTFR")
-
-        // Current direct episode blocks, used as a second functional path.
-        if (result.isEmpty()) {
-            for (element in document.select("div[class]")) {
-                val marker = element.classNames()
-                    .asSequence()
-                    .mapNotNull { EPISODE_MARKER_REGEX.matchEntire(it) }
-                    .firstOrNull()
-                    ?: continue
-
-                val episode = marker.groupValues[1].toIntOrNull() ?: continue
-                val language = when (marker.groupValues.getOrNull(2)?.lowercase()) {
-                    "vs", "vostfr" -> "VOSTFR"
-                    else -> "VF"
-                }
-
-                for (anchor in element.select("a")) {
-                    playerAnchors++
-                    serverFromAnchor(anchor, origin, language)?.let { server ->
-                        result.getOrPut(episode) { ArrayList() }.add(server)
-                    }
-                }
-            }
-        }
-
-        val parsed = result.mapValues { (_, servers) ->
-            servers.distinctBy(FlemmixServer::url)
-        }
-
-        Log.i(
-            SEARCH_TAG,
-            "Lecteurs série courant : rel=$relEntries, " +
-                "anchors=$playerAnchors, épisodes=${parsed.size}, " +
-                "liens=${parsed.values.sumOf { it.size }}",
-        )
-        return parsed
+    ): Map<Int, List<FlemmixPlayer>> = playerParser.series(html, origin).also { episodes ->
+        Log.i(SEARCH_TAG, "Lecteurs série v34 : épisodes=${episodes.size}, " +
+            "candidats=${episodes.values.sumOf { it.size }}, " +
+            "jetons=${episodes.values.sumOf { players -> players.count { it.needsResolution } }}")
     }
 
-    /**
-     * Decode one player anchor exactly like the site:
-     *
-     * - old format: onclick="loadVideo('https://...')"
-     * - current format: data-v = Base64(ROT13(url))
-     *
-     * No player hostname is required here.
-     */
-    private fun serverFromAnchor(
-        anchor: org.jsoup.nodes.Element,
-        origin: String,
-        language: String?,
+    private suspend fun resolvePlayer(
+        player: FlemmixPlayer,
+        page: DetailPage,
+        api: FlemmixPlayerApi?,
     ): FlemmixServer? {
-        val onclick = anchor.attr("onclick")
-        val oldUrl = LOAD_VIDEO_CALL_REGEX.find(onclick)
-            ?.groupValues?.getOrNull(2)
-
-        val raw = oldUrl
-            ?: anchor.attr("data-v")
-                .takeIf(String::isNotBlank)
-                ?.let(::decodePlayerDataV)
-            ?: return null
-
-        val clean = decodeHtml(raw.trim()).replace("\\/", "/")
-        if (!looksLikePlayerUrl(clean)) return null
-
-        val url = resolveUrl("$origin/", clean) ?: return null
-        val rawLabel = anchor.selectFirst("span")?.text()?.trim()
-            .orEmpty()
-            .ifBlank { anchor.text().trim() }
-            .ifBlank { anchor.attr("title").trim() }
-            .ifBlank { "Lecteur" }
-
-        val label = listOfNotNull(language, rawLabel)
-            .filter(String::isNotBlank)
-            .joinToString(" · ")
-
-        return FlemmixServer(label.ifBlank { "Lecteur" }, url)
-    }
-
-    private fun decodePlayerDataV(rawValue: String): String? {
-        val value = decodeHtml(rawValue.trim()).replace("\\/", "/")
-        if (looksLikePlayerUrl(value)) return value
-
-        val decoded = runCatching {
-            Base64.decode(value, Base64.DEFAULT).toString(Charsets.UTF_8)
-        }.getOrNull() ?: return null
-
-        val rot13 = buildString(decoded.length) {
-            for (char in decoded) {
-                append(
-                    when (char) {
-                        in 'a'..'z' -> 'a' + ((char - 'a' + 13) % 26)
-                        in 'A'..'Z' -> 'A' + ((char - 'A' + 13) % 26)
-                        else -> char
-                    },
+        return try {
+            resolveFlemmixPlayer(player, api) { endpoint, form ->
+                val response = page.session.post(
+                    url = endpoint,
+                    data = form,
+                    headers = page.headers + mapOf(
+                        "Accept" to "application/json",
+                        "Origin" to page.origin,
+                        "X-Requested-With" to "XMLHttpRequest",
+                    ),
+                    referer = page.url,
+                    cacheTime = 0,
+                    timeout = PAGE_TIMEOUT_SECONDS,
                 )
+                val code = response.okhttpResponse.code
+                Log.i(SEARCH_TAG, "API lecteur '${player.label}' : HTTP=$code")
+                response.text.takeIf { code in 200..299 }
+            }.also { server ->
+                if (server == null) {
+                    Log.w(SEARCH_TAG, "Lecteur '${player.label}' non résolu : " +
+                        if (api == null && player.needsResolution) "paramètres API absents" else "réponse sans URL")
+                } else if (player.needsResolution) {
+                    Log.i(SEARCH_TAG, "Jeton résolu '${player.label}' : host=${URI(server.url).host}")
+                }
             }
-        }.trim().replace("\\/", "/")
-
-        return rot13.takeIf(::looksLikePlayerUrl)
-    }
-
-    private fun looksLikePlayerUrl(raw: String): Boolean {
-        if (raw.isBlank() || raw.startsWith("#")) return false
-        if (raw.startsWith("javascript:", ignoreCase = true)) return false
-        if (raw.startsWith("data:", ignoreCase = true)) return false
-        if (raw.startsWith("//") || raw.startsWith("/")) return true
-        return raw.startsWith("https://", ignoreCase = true) ||
-            raw.startsWith("http://", ignoreCase = true)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(SEARCH_TAG, "Échec API lecteur '${player.label}'", error)
+            null
+        }
     }
 
     /**
@@ -1109,7 +980,7 @@ class FlemmixProvider : MainAPI() {
     ): Boolean {
         var emitted = false
 
-        runCatching {
+        try {
             loadExtractor(
                 url = server.url,
                 referer = referer,
@@ -1119,12 +990,63 @@ class FlemmixProvider : MainAPI() {
                     callback(it)
                 },
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(SEARCH_TAG, "Extracteur standard en échec : ${server.label}", error)
         }
         if (emitted) return true
 
-        val family = normalizeForMatch(server.label)
+        var family = normalizeForMatch(server.label)
+        var embedUrl = server.url
+        // Series labels can be only "Lecteur 1/2/3". Identify a rotating
+        // host from its own metadata, and handle packed JWPlayer sources.
+        if ("voe" !in family && "ddstream" !in family && "dood" !in family) {
+            val visited = HashSet<String>()
+            for (attempt in 0..2) {
+                if (!visited.add(embedUrl)) break
+                val response = try {
+                    app.get(embedUrl, headers = browserHeaders, referer = referer,
+                        cacheTime = 0, timeout = PAGE_TIMEOUT_SECONDS)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    Log.w(SEARCH_TAG, "Lecture du lecteur impossible : ${server.label}", error)
+                    break
+                }
+                if (response.okhttpResponse.code !in 200..299) break
+                embedUrl = response.okhttpResponse.request.url.toString()
+                val html = response.text
+                val media = FlemmixEmbedParser.sources(html) { JsUnpacker(it).unpack() }
+                val embedOrigin = URI(embedUrl).let { "${it.scheme}://${it.rawAuthority}" }
+                for (value in media) {
+                    val mediaUrl = FlemmixPlayerParser.resolvePlayerUrl(embedOrigin, value) ?: continue
+                    callback(newExtractorLink(
+                        source = name,
+                        name = "Flemmix/Wiflix · ${server.label}",
+                        url = mediaUrl,
+                        type = when {
+                            mediaUrl.contains(".m3u8", true) -> ExtractorLinkType.M3U8
+                            mediaUrl.contains(".mpd", true) -> ExtractorLinkType.DASH
+                            else -> ExtractorLinkType.VIDEO
+                        },
+                    ) {
+                        this.referer = "$embedOrigin/"
+                        headers = browserHeaders + ("Origin" to embedOrigin)
+                    })
+                    emitted = true
+                }
+                if (emitted) {
+                    Log.i(SEARCH_TAG, "Sources du lecteur récupérées : ${server.label}, flux=${media.size}")
+                    return true
+                }
+                FlemmixEmbedParser.family(html)?.let { family = it }
+                if (family in listOf("voe", "dood", "uqload")) break
+                embedUrl = FlemmixEmbedParser.redirect(html, embedUrl) ?: break
+            }
+        }
         val actualOrigin = runCatching {
-            URI(server.url).let { uri ->
+            URI(embedUrl).let { uri ->
                 "${uri.scheme}://${uri.host}" +
                     if (uri.port != -1 && uri.port != 443) ":${uri.port}" else ""
             }
@@ -1149,9 +1071,9 @@ class FlemmixProvider : MainAPI() {
                 "host=${runCatching { URI(server.url).host }.getOrNull().orEmpty()}",
         )
 
-        runCatching {
+        try {
             extractor.getUrl(
-                url = server.url,
+                url = embedUrl,
                 referer = referer,
                 subtitleCallback = subtitleCallback,
                 callback = {
@@ -1159,7 +1081,12 @@ class FlemmixProvider : MainAPI() {
                     callback(it)
                 },
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            Log.w(SEARCH_TAG, "Extracteur par famille en échec : ${server.label}", error)
         }
+        if (!emitted) Log.w(SEARCH_TAG, "Aucun flux émis par le lecteur '${server.label}'")
 
         return emitted
     }
@@ -1184,9 +1111,13 @@ class FlemmixProvider : MainAPI() {
         }
 
         var emitted = false
-        val referer = "${page.origin}${request.path}"
+        val referer = page.url
+        val api = if (servers.any { it.needsResolution }) {
+            FlemmixPlayerApi.fromHtml(page.html, page.url)
+        } else null
 
-        for (server in servers.distinctBy(FlemmixServer::url)) {
+        for (player in servers.distinctBy(FlemmixPlayer::value)) {
+            val server = resolvePlayer(player, page, api) ?: continue
             if (DIRECT_MEDIA_REGEX.containsMatchIn(server.url)) {
                 callback(
                     newExtractorLink(
