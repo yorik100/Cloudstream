@@ -535,7 +535,16 @@ internal object AfterDarkNativeEmbedResolver {
                 "uqload=$isUqload vidzy=$isVidzy candidats=${candidates.size}",
         )
 
-        for (candidate in candidates.take(30)) {
+        // Prefer a genuine direct container, when Vidzy offers one, over
+        // an HLS master whose first segment works but later segments 403.
+        // All candidates still pass the content gate. Never emit an embed URL.
+        val orderedCandidates = if (isVidzy) {
+            candidates.sortedBy { candidate ->
+                if (runCatching { URI(candidate).path.orEmpty().lowercase() }.getOrDefault("")
+                        .let { path -> listOf(".mp4", ".m4v", ".webm", ".mkv").any(path::endsWith) }) 0 else 1
+            }
+        } else candidates.toList()
+        for (candidate in orderedCandidates.take(30)) {
             val resolved = validateCandidate(
                 candidate = candidate,
                 pageUrl = finalPageUrl,

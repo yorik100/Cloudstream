@@ -233,7 +233,31 @@ internal object AfterDarkMediaProbe {
             if (!checkResource(childContext(media, url), stage)) return false
         }
         val segmentUrl = resolveUrl(media.url, lines[firstSegment]) ?: return false
-        return checkResource(childContext(media, segmentUrl), "segment")
+        if (!checkResource(childContext(media, segmentUrl), "segment")) return false
+
+        // Vidzy's master/initial segment can succeed while later HLS media
+        // chunks receive HTTP 403. Check the actual URLs supplied by the
+        // playlist around 2 and 10 minutes before advertising a source.
+        // This is a fail-closed preflight, NOT a replacement for Vidzy's
+        // independent `gk` gate token (which must never be fabricated).
+        val hlsHost = host(media.url)
+        val vidzyCdn = hlsHost == "vidzy.cc" || hlsHost.endsWith(".vidzy.cc")
+        if (vidzyCdn) {
+            val checkpoints = AfterDarkHlsCheckpoints.select(text)
+            for (point in checkpoints) {
+                val laterUrl = resolveUrl(media.url, point.segment) ?: return false
+                if (!checkResource(childContext(media, laterUrl), "segment-${point.seconds}s")) {
+                    Log.w(
+                        TAG,
+                        "Vidzy non seekable: refus d'un segment à ${point.seconds}s " +
+                            "host=${host(laterUrl)}; la source est écartée avant ExoPlayer",
+                    )
+                    return false
+                }
+            }
+            Log.i(TAG, "Vidzy précontrôlé: premier segment et ${checkpoints.size} positions ultérieures")
+        }
+        return true
     }
 
     suspend fun validate(media: ResolvedWebMedia): ResolvedWebMedia? =
