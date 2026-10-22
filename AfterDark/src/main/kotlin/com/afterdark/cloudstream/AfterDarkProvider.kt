@@ -569,12 +569,12 @@ class AfterDarkProvider : MainAPI() {
         val season = request.season ?: 1
         val episode = request.episode ?: 1
 
-        // Never synthesize/open Videasy directly anymore. When the official
-        // AfterDark /api/sources response is empty, the same /watch WebView
-        // stays alive and lets AfterDark use its own cached/session player.
+        // The verification WebView is destroyed as soon as /api/sources is
+        // captured and is never allowed to mount AfterDark's official player.
+        // Therefore an empty official response reaches this native fallback
+        // path instead of staying inside the /watch page.
         //
-        // Peachify remains only as a defensive fallback for an older or
-        // incomplete in-memory ProofSession that somehow reaches this branch.
+        // Peachify remains the existing defensive fallback here.
         val peachify = if (request.type == "tv") {
             "https://peachify.top/embed/tv/${request.tmdbId}/$season/$episode" +
                 "?dub=French&sub=French&autoNext=30"
@@ -859,9 +859,8 @@ class AfterDarkProvider : MainAPI() {
 
         val parsedSources = parseNdjson(response.second)
 
-        // Normally an empty official /api/sources response stays inside the
-        // same /watch WebView and never reaches this branch. This is only a
-        // defensive path for an old/incomplete cached session.
+        // The verification-only WebView always returns control after capturing
+        // /api/sources, including when the official response has no items.
         val sources = if (parsedSources.isEmpty()) {
             fallbackSources(request)
         } else {
@@ -933,51 +932,14 @@ class AfterDarkProvider : MainAPI() {
                 continue
             }
 
-            // Defensive browser fallback for the remaining source(s).
-            // Videasy stays inside the official AfterDark WebView path.
-            if (isEmbed && source.group == "Secours") {
-                val resolved = runCatching {
-                    AfterDarkEmbedWebView.resolve(
-                        embedUrl = source.url,
-                        sourceName = source.service,
-                        referer = sourceReferer,
-                    )
-                }.getOrNull()
-
-                if (resolved != null && seen.add(resolved.url)) {
-                    // Detection alone is not success: a player can briefly
-                    // expose a stale/deleted media URL. Verify it before
-                    // stopping the fallback chain.
-                    val valid = validateResolvedMedia(resolved)
-
-                    if (!valid) {
-                        continue
-                    }
-
-                    val resolvedType = when (resolved.type) {
-                        "m3u8" -> ExtractorLinkType.M3U8
-                        "mpd" -> ExtractorLinkType.DASH
-                        else -> ExtractorLinkType.VIDEO
-                    }
-
-                    callback(
-                        newExtractorLink(
-                            source = source.service,
-                            name = "AfterDark · ${source.service}",
-                            url = resolved.url,
-                            type = resolvedType,
-                        ) {
-                            referer = resolved.referer.orEmpty()
-                            quality = getQualityFromName(source.quality)
-                            headers = resolved.headers
-                        },
-                    )
-                    emitted = true
-
-                    // Only a verified fallback media URL stops the chain.
-                    return true
-                }
-
+            // Verification-only policy: never launch an embed/player WebView
+            // as a fallback. If the native extractor cannot resolve an embed,
+            // leave it unresolved rather than rendering the player in WebView.
+            if (isEmbed) {
+                Log.w(
+                    PROVIDER_TAG,
+                    "Embed non résolu nativement, WebView lecteur interdite: ${source.service}",
+                )
                 continue
             }
 

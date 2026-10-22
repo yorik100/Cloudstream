@@ -231,7 +231,7 @@ object AfterDarkProofWebView {
                     "Timeout préchargement 30 s: ${request.sessionKey}",
                 )
                 finish(null)
-            } else if (!officialPlayerMode.get()) {
+            } else {
                 finish(null)
             }
         }
@@ -325,7 +325,8 @@ object AfterDarkProofWebView {
                 loadsImagesAutomatically = true
                 mediaPlaybackRequiresUserGesture = false
                 javaScriptCanOpenWindowsAutomatically = true
-                setSupportMultipleWindows(true)
+                // Verification-only mode: never create a second player WebView.
+                setSupportMultipleWindows(false)
                 cacheMode = WebSettings.LOAD_DEFAULT
             }
 
@@ -407,6 +408,16 @@ object AfterDarkProofWebView {
                         button.dataset.afterdarkAutoOpenedState = state;
 
                         try {
+                          // Never let verification spawn another WebView/window.
+                          // If AfterDark uses an anchor with target=_blank, keep
+                          // the navigation inside this verification-only WebView.
+                          if (button instanceof HTMLAnchorElement) {
+                            try {
+                              button.removeAttribute("target");
+                              button.target = "_self";
+                            } catch (_) {}
+                          }
+
                           button.click();
                           return true;
                         } catch (_) {
@@ -3278,69 +3289,23 @@ object AfterDarkProofWebView {
                 Log.w(TAG, "Clicker Turnstile profond multi-frame indisponible")
             }
 
-            fun officialBodyHasItems(body: String): Boolean =
-                body.lineSequence().any { rawLine ->
-                    val line = rawLine.trim()
-                    if (line.isEmpty()) {
-                        false
-                    } else {
-                        runCatching {
-                            val root = JSONObject(line)
-                            val items = root.optJSONArray("items")
-                            items != null && items.length() > 0
-                        }.getOrDefault(false)
-                    }
-                }
-
-            fun enterOfficialPlayerMode() {
-                if (!officialPlayerMode.compareAndSet(false, true)) return
-
-                // The official /watch page now owns playback. Keep this exact
-                // WebView/session alive instead of opening the source URL.
-                handler.removeCallbacks(timeoutRunnable)
-                    verificationButtonHasAppeared.set(true)
-                cloudflareErrorReloadInProgress.set(false)
-                handler.post {
-                    if (finished.get()) return@post
-
-                    info.visibility = android.view.View.GONE
-                    controls.visibility = android.view.View.GONE
-
-                    browser.settings.mediaPlaybackRequiresUserGesture = false
-                    browser.requestFocus()
-                    browser.requestFocusFromTouch()
-
-                    Log.i(
-                        TAG,
-                        "API sources vide : conservation de la WebView officielle AfterDark",
-                    )
-
-                    selectPreferredOfficialSource()
-                }
-            }
-
             fun finishWithCapturedResponse(captured: CapturedSourceResponse) {
-                val officialSourcesEmpty =
-                    captured.statusCode in 200..299 &&
-                        !officialBodyHasItems(captured.body)
-
-                if (officialSourcesEmpty) {
-                    emptyOfficialResponse.set(captured)
-
-                    // Return the empty response to AfterDark, but do not close
-                    // this WebView. Its own React page will render the fallback
-                    // player inside the already-established /watch session.
-                    enterOfficialPlayerMode()
-                    return
-                }
-
-                // Normal non-empty response: hand it back to the provider.
+                // Verification-only contract:
+                // - capture the real /api/sources response for the provider;
+                // - close this WebView immediately;
+                // - NEVER let the /watch React page consume that response and
+                //   mount its player / Sources UI.
                 handler.post {
                     if (finished.get()) return@post
 
                     val cookie = runCatching {
                         CookieManager.getInstance().getCookie(mainUrl)
                     }.getOrNull()
+
+                    Log.i(
+                        TAG,
+                        "Preuve + /api/sources capturés; fermeture WebView avant montage lecteur",
+                    )
 
                     finish(
                         ProofSession(
@@ -3390,102 +3355,22 @@ object AfterDarkProofWebView {
                 }
 
                 finishWithCapturedResponse(intercepted.captured)
-                return intercepted.webResponse
+
+                // Do not expose the real source payload back to the WebView.
+                // A 204 cannot populate AfterDark's player/source selector.
+                return WebResourceResponse(
+                    "text/plain",
+                    "UTF-8",
+                    204,
+                    "No Content",
+                    emptyMap(),
+                    ByteArrayInputStream(ByteArray(0)),
+                )
             }
 
-            browser.webChromeClient = object : WebChromeClient() {
-                override fun onCreateWindow(
-                    view: WebView?,
-                    isDialog: Boolean,
-                    isUserGesture: Boolean,
-                    resultMsg: Message?,
-                ): Boolean {
-                    if (resultMsg == null) return false
-
-                    /*
-                     * AfterDark's verification can use target=_blank/window.open.
-                     * Never dispatch those URLs to Android ACTION_VIEW:
-                     * - third-party popups are consumed without opening another app;
-                     * - same-host AfterDark popups are redirected into this WebView.
-                     *
-                     * We do not fabricate a proof. The extension still waits until
-                     * AfterDark itself emits x-nabi-proof on /api/sources.
-                     */
-                    val popup = WebView(activity)
-                    popup.settings.apply {
-                        javaScriptEnabled = true
-                        domStorageEnabled = true
-                        mediaPlaybackRequiresUserGesture = false
-                        javaScriptCanOpenWindowsAutomatically = true
-                        setSupportMultipleWindows(false)
-                    }
-
-                    CookieManager.getInstance().apply {
-                        setAcceptCookie(true)
-                        setAcceptThirdPartyCookies(popup, true)
-                    }
-
-                    popup.webViewClient = object : WebViewClient() {
-                        override fun onPageFinished(
-                            view: WebView?,
-                            url: String?,
-                        ) {
-                            super.onPageFinished(view, url)
-                            installAutoOpenAndPlay(view)
-                        }
-
-                        override fun shouldOverrideUrlLoading(
-                            view: WebView?,
-                            request: WebResourceRequest?,
-                        ): Boolean {
-                            val uri = request?.url ?: return true
-                            val scheme = uri.scheme?.lowercase()
-
-                            // Same-host navigation stays inside the verification WebView.
-                            if (
-                                (scheme == "http" || scheme == "https") &&
-                                uri.host.equals(targetHost, ignoreCase = true)
-                            ) {
-                                browser.post {
-                                    if (!finished.get()) {
-                                        browser.loadUrl(uri.toString())
-                                    }
-                                }
-                            }
-
-                            // Any external popup is swallowed. No browser/app is launched.
-                            view?.post {
-                                runCatching { view.stopLoading() }
-                                runCatching { view.loadUrl("about:blank") }
-                                runCatching { view.destroy() }
-                            }
-                            return true
-                        }
-
-                        override fun shouldInterceptRequest(
-                            view: WebView?,
-                            webRequest: WebResourceRequest?,
-                        ): WebResourceResponse? {
-                            val sourceResponse = interceptOfficialSources(webRequest)
-                            if (sourceResponse != null) return sourceResponse
-
-                            captureOfficialPlayerMedia(webRequest)?.let {
-                                finishWithResolvedMedia(it)
-                            }
-
-                            return super.shouldInterceptRequest(view, webRequest)
-                        }
-                    }
-
-                    val transport = resultMsg.obj as? WebView.WebViewTransport ?: run {
-                        runCatching { popup.destroy() }
-                        return false
-                    }
-                    transport.webView = popup
-                    resultMsg.sendToTarget()
-                    return true
-                }
-            }
+            // No WebChromeClient popup transport is installed on purpose.
+            // Combined with setSupportMultipleWindows(false), verification
+            // cannot spawn a second WebView that might render a player.
 
             browser.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(
@@ -3495,11 +3380,7 @@ object AfterDarkProofWebView {
                     super.onPageFinished(view, url)
                     cloudflareErrorReloadInProgress.set(false)
 
-                    if (!officialPlayerMode.get()) {
-                        installAutoOpenAndPlay(view)
-                    } else if (!preferredSourceSelectionDone.get()) {
-                        selectPreferredOfficialSource()
-                    }
+                    installAutoOpenAndPlay(view)
                 }
 
                 override fun shouldOverrideUrlLoading(
@@ -3508,7 +3389,13 @@ object AfterDarkProofWebView {
                 ): Boolean {
                     val uri = webRequest?.url ?: return true
 
-                    // Subframes (including Turnstile) continue to work normally.
+                    // As soon as the exact episode /api/sources request starts,
+                    // freeze the verification page. It must not navigate into
+                    // any player/source UI while native code owns that request.
+                    if (finished.get() || sourceInterceptStarted.get()) return true
+
+                    // Subframes (including Turnstile) continue to work normally
+                    // only while verification is still active.
                     if (!webRequest.isForMainFrame) return false
 
                     val scheme = uri.scheme?.lowercase()
@@ -3531,10 +3418,23 @@ object AfterDarkProofWebView {
                     val sourceResponse = interceptOfficialSources(webRequest)
                     if (sourceResponse != null) return sourceResponse
 
-                    captureOfficialPlayerMedia(webRequest)?.let {
-                        finishWithResolvedMedia(it)
+                    // Freeze every other resource as soon as /api/sources has
+                    // started. This closes the race between interception and
+                    // UI-thread destruction of the verification WebView.
+                    if (sourceInterceptStarted.get() || finished.get()) {
+                        return WebResourceResponse(
+                            "text/plain",
+                            "UTF-8",
+                            204,
+                            "No Content",
+                            emptyMap(),
+                            ByteArrayInputStream(ByteArray(0)),
+                        )
                     }
 
+                    // Verification-only WebView: never inspect/capture media
+                    // from a mounted official player because that player must
+                    // never be allowed to mount here.
                     return super.shouldInterceptRequest(view, webRequest)
                 }
             }

@@ -20,6 +20,7 @@ Ce dépôt contient plusieurs extensions pour [CloudStream](https://github.com/r
 - Indicateur du temps restant lorsqu'un épisode de série n'est pas encore sorti.
 - Affichage du nom et de la description des épisodes.
 - Résolution automatique du domaine actif.
+- Pré vérification du prochain épisode d'une série à 80% de l'épisode actuel en arrière plan.
 
 ### Frembed
 
