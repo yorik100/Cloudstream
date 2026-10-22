@@ -908,6 +908,69 @@ class AfterDarkProvider : MainAPI() {
                 continue
             }
 
+            val sourceHost = runCatching {
+                java.net.URI(source.url).host.orEmpty().lowercase()
+            }.getOrDefault("")
+            val sourceService = source.service.lowercase()
+            val nativePriorityEmbed = isEmbed && (
+                "uqload" in sourceHost ||
+                    "uqload" in sourceService ||
+                    "vidzy" in sourceHost ||
+                    "vidzy" in sourceService
+                )
+
+            if (isEmbed) {
+                val nativeResolved = runCatching {
+                    AfterDarkNativeEmbedResolver.resolve(
+                        source = source,
+                        referer = sourceReferer,
+                        userAgent = session.userAgent,
+                    )
+                }.onFailure {
+                    Log.w(
+                        PROVIDER_TAG,
+                        "Résolution embed native impossible service=${source.service} host=$sourceHost",
+                        it,
+                    )
+                }.getOrNull()
+
+                if (nativeResolved != null) {
+                    val nativeType = when (nativeResolved.type) {
+                        "m3u8" -> ExtractorLinkType.M3U8
+                        "mpd" -> ExtractorLinkType.DASH
+                        else -> ExtractorLinkType.VIDEO
+                    }
+
+                    callback(
+                        newExtractorLink(
+                            source = source.service,
+                            name = "AfterDark · ${source.service}",
+                            url = nativeResolved.url,
+                            type = nativeType,
+                        ) {
+                            referer = nativeResolved.referer.orEmpty()
+                            quality = getQualityFromName(source.quality)
+                            headers = nativeResolved.headers
+                        },
+                    )
+                    emitted = true
+                    if (source.group == "Secours") return true
+                    continue
+                }
+
+                // Uqload's built-in CloudStream extractor can currently emit a
+                // malformed pseudo-manifest. Vidzy also needs its current
+                // decoder. For those two families, never fall back to the
+                // generic built-in extractor after native validation failed.
+                if (nativePriorityEmbed) {
+                    Log.w(
+                        PROVIDER_TAG,
+                        "Embed ${source.service} rejeté après validation native host=$sourceHost",
+                    )
+                    continue
+                }
+            }
+
             var extractorEmitted = false
 
             runCatching {
@@ -924,21 +987,18 @@ class AfterDarkProvider : MainAPI() {
             }
 
             if (extractorEmitted) {
-                // "Secours" is a failover chain, not a list that should be
-                // resolved all at once. Once Videasy (or a later fallback)
-                // produced a real link, stop here so the next fallback does
-                // not replace it while it is still loading.
                 if (source.group == "Secours") return true
                 continue
             }
 
             // Verification-only policy: never launch an embed/player WebView
-            // as a fallback. If the native extractor cannot resolve an embed,
-            // leave it unresolved rather than rendering the player in WebView.
+            // as a fallback. The native resolver above gets first chance for
+            // every embed (including unknown/new services such as "Thais").
             if (isEmbed) {
                 Log.w(
                     PROVIDER_TAG,
-                    "Embed non résolu nativement, WebView lecteur interdite: ${source.service}",
+                    "Embed non résolu nativement, WebView lecteur interdite: " +
+                        "service=${source.service} host=$sourceHost",
                 )
                 continue
             }
