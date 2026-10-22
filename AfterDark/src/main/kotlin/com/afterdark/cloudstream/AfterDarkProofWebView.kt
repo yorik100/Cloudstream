@@ -13,6 +13,7 @@ import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -31,8 +32,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.coroutines.resume
-import kotlin.coroutines.suspendCoroutine
+import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONObject
 
 object AfterDarkProofWebView {
@@ -41,11 +41,126 @@ object AfterDarkProofWebView {
     private const val TIMEOUT_MS = 180_000L
     private const val CHECKBOX_POLL_INTERVAL_MS = 250L
 
-    @SuppressLint("SetJavaScriptEnabled")
+    private const val BACKGROUND_TIMEOUT_MS = 30_000L
+    private const val BACKGROUND_PLAYER_POLL_MS = 500L
+
+    private class ManagedSession(
+        val key: String,
+        initialBackground: Boolean,
+    ) {
+        val result = CompletableDeferred<ProofSession?>()
+        val background = AtomicBoolean(initialBackground)
+
+        @Volatile
+        var promoteAction: (() -> Unit)? = null
+
+        @Volatile
+        var cancelAction: (() -> Unit)? = null
+
+        fun promote() {
+            val action = promoteAction
+            if (action != null) {
+                action()
+            } else {
+                // launchSession has not attached the Dialog yet. Mark the
+                // requested mode now; setup will start directly in foreground.
+                background.set(false)
+            }
+        }
+
+        fun cancel() {
+            cancelAction?.invoke()
+        }
+    }
+
+    private val sessionLock = Any()
+
+    @Volatile
+    private var activeSession: ManagedSession? = null
+
     suspend fun acquire(
         request: PlaybackRequest,
         mainUrl: String,
-    ): ProofSession? = suspendCoroutine { continuation ->
+        backgroundPreload: Boolean = false,
+    ): ProofSession? {
+        var startNew = false
+        var rejectBackground = false
+
+        val managed = synchronized(sessionLock) {
+            val existing = activeSession
+                ?.takeUnless { it.result.isCompleted }
+
+            when {
+                existing == null -> {
+                    ManagedSession(
+                        key = request.sessionKey,
+                        initialBackground = backgroundPreload,
+                    ).also {
+                        activeSession = it
+                        startNew = true
+                    }
+                }
+
+                existing.key == request.sessionKey -> {
+                    if (!backgroundPreload) {
+                        Log.i(
+                            TAG,
+                            "Promotion de la WebView préchargée: ${request.sessionKey}",
+                        )
+                        existing.promote()
+                    }
+                    existing
+                }
+
+                backgroundPreload && !existing.background.get() -> {
+                    rejectBackground = true
+                    existing
+                }
+
+                else -> {
+                    Log.i(
+                        TAG,
+                        "Fermeture de la session WebView ${existing.key}; " +
+                            "nouvelle demande=${request.sessionKey}",
+                    )
+                    existing.cancel()
+                    ManagedSession(
+                        key = request.sessionKey,
+                        initialBackground = backgroundPreload,
+                    ).also {
+                        activeSession = it
+                        startNew = true
+                    }
+                }
+            }
+        }
+
+        if (rejectBackground) {
+            Log.i(
+                TAG,
+                "Préchargement ${request.sessionKey} ignoré: " +
+                    "une vérification interactive est déjà active",
+            )
+            return null
+        }
+
+        if (startNew) {
+            launchSession(
+                request = request,
+                mainUrl = mainUrl,
+                managed = managed,
+            )
+        }
+
+        return managed.result.await()
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun launchSession(
+        request: PlaybackRequest,
+        mainUrl: String,
+        managed: ManagedSession,
+    ) {
         val finished = AtomicBoolean(false)
         val sourceInterceptStarted = AtomicBoolean(false)
         val officialPlayerMode = AtomicBoolean(false)
@@ -62,11 +177,13 @@ object AfterDarkProofWebView {
         var webView: WebView? = null
 
         lateinit var timeoutRunnable: Runnable
+        lateinit var playerVisibilityRunnable: Runnable
 
         fun finish(result: ProofSession?) {
             if (!finished.compareAndSet(false, true)) return
 
             handler.removeCallbacks(timeoutRunnable)
+            runCatching { handler.removeCallbacks(playerVisibilityRunnable) }
             handler.post {
                 runCatching { dialog?.setOnDismissListener(null) }
                 runCatching { dialog?.dismiss() }
@@ -80,12 +197,68 @@ object AfterDarkProofWebView {
                 webView = null
             }
 
-            continuation.resume(result)
+            synchronized(sessionLock) {
+                if (activeSession === managed) {
+                    activeSession = null
+                }
+            }
+            managed.result.complete(result)
+        }
+
+        managed.cancelAction = {
+            handler.post {
+                Log.i(TAG, "Session WebView annulée: ${request.sessionKey}")
+                finish(null)
+            }
+        }
+
+        fun scheduleTimeout() {
+            handler.removeCallbacks(timeoutRunnable)
+            handler.postDelayed(
+                timeoutRunnable,
+                if (managed.background.get()) {
+                    BACKGROUND_TIMEOUT_MS
+                } else {
+                    TIMEOUT_MS
+                },
+            )
         }
 
         timeoutRunnable = Runnable {
-            if (!officialPlayerMode.get()) {
+            if (managed.background.get()) {
+                Log.w(
+                    TAG,
+                    "Timeout préchargement 30 s: ${request.sessionKey}",
+                )
                 finish(null)
+            } else if (!officialPlayerMode.get()) {
+                finish(null)
+            }
+        }
+
+        playerVisibilityRunnable = object : Runnable {
+            private var missingTicks = 0
+
+            override fun run() {
+                if (finished.get() || !managed.background.get()) return
+
+                if (AfterDarkRuntime.isGeneratorPlayerVisible()) {
+                    missingTicks = 0
+                } else {
+                    missingTicks++
+                }
+
+                if (missingTicks >= 2) {
+                    Log.i(
+                        TAG,
+                        "Player quitté pendant le préchargement; fermeture: " +
+                            request.sessionKey,
+                    )
+                    finish(null)
+                    return
+                }
+
+                handler.postDelayed(this, BACKGROUND_PLAYER_POLL_MS)
             }
         }
 
@@ -3272,19 +3445,100 @@ object AfterDarkProofWebView {
                 ),
             )
 
-            dialog = Dialog(activity, android.R.style.Theme_Black_NoTitleBar_Fullscreen).apply {
+            fun applyWindowMode() {
+                val silent = managed.background.get()
+
+                dialog?.window?.let { window ->
+                    window.setDimAmount(0f)
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+
+                    val attributes = window.attributes
+                    attributes.alpha = if (silent) 0.01f else 1f
+                    window.attributes = attributes
+
+                    if (silent) {
+                        window.addFlags(
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                        )
+                    } else {
+                        window.clearFlags(
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                        )
+                    }
+                }
+
+                if (!silent) {
+                    browser.requestFocus()
+                }
+            }
+
+            dialog = Dialog(
+                activity,
+                android.R.style.Theme_Black_NoTitleBar_Fullscreen,
+            ).apply {
                 setContentView(root)
                 setCancelable(true)
                 setOnCancelListener { finish(null) }
                 setOnDismissListener {
                     if (!finished.get()) finish(null)
                 }
+
+                // Configure the window before show() to avoid a visible flash
+                // when CloudStream is merely preloading the next episode.
+                if (managed.background.get()) {
+                    window?.let { silentWindow ->
+                        silentWindow.setDimAmount(0f)
+                        silentWindow.clearFlags(
+                            WindowManager.LayoutParams.FLAG_DIM_BEHIND,
+                        )
+                        silentWindow.addFlags(
+                            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                        )
+                        val attributes = silentWindow.attributes
+                        attributes.alpha = 0.01f
+                        silentWindow.attributes = attributes
+                    }
+                }
+
                 show()
             }
 
-                browser.requestFocus()
-                browser.loadUrl(watchUrl)
-                handler.postDelayed(timeoutRunnable, TIMEOUT_MS)
+            managed.promoteAction = {
+                handler.post {
+                    if (finished.get()) return@post
+
+                    val wasBackground = managed.background.getAndSet(false)
+                    applyWindowMode()
+
+                    if (wasBackground) {
+                        Log.i(
+                            TAG,
+                            "WebView préchargée mise au premier plan: " +
+                                request.sessionKey,
+                        )
+                    }
+
+                    scheduleTimeout()
+                }
+            }
+
+            applyWindowMode()
+
+            if (managed.background.get()) {
+                Log.i(
+                    TAG,
+                    "Préchargement WebView silencieux démarré: " +
+                        request.sessionKey,
+                )
+                handler.post(playerVisibilityRunnable)
+            }
+
+            browser.requestFocus()
+            browser.loadUrl(watchUrl)
+            scheduleTimeout()
             } catch (_: Exception) {
                 // A broken/missing WebView component must not crash CloudStream.
                 finish(null)

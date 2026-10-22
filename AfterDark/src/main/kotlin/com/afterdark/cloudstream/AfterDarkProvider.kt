@@ -467,11 +467,18 @@ class AfterDarkProvider : MainAPI() {
         return response.okhttpResponse.code to response.text
     }
 
-    private suspend fun obtainSession(request: PlaybackRequest): ProofSession? {
+    private suspend fun obtainSession(
+        request: PlaybackRequest,
+        backgroundPreload: Boolean,
+    ): ProofSession? {
         proofCache[request.sessionKey]?.let { return it }
 
         val session = try {
-            AfterDarkProofWebView.acquire(request, mainUrl)
+            AfterDarkProofWebView.acquire(
+                request = request,
+                mainUrl = mainUrl,
+                backgroundPreload = backgroundPreload,
+            )
         } catch (_: Exception) {
             null
         } ?: return null
@@ -784,7 +791,21 @@ class AfterDarkProvider : MainAPI() {
         val request = PlaybackRequest.decode(data)
             ?: throw ErrorLoadingException("Données AfterDark invalides")
 
-        var session = obtainSession(request) ?: return false
+        val playerRole = AfterDarkRuntime.playerRequestRole(data)
+        val backgroundPreload =
+            request.type == "tv" &&
+                playerRole == AfterDarkPlayerRequestRole.NEXT_PRELOAD
+
+        Log.i(
+            PROVIDER_TAG,
+            "loadLinks ${request.sessionKey}: role=$playerRole " +
+                "backgroundPreload=$backgroundPreload",
+        )
+
+        var session = obtainSession(
+            request = request,
+            backgroundPreload = backgroundPreload,
+        ) ?: return false
 
         session.resolvedMedia?.let { resolved ->
             val resolvedType = when (resolved.type) {
@@ -814,10 +835,23 @@ class AfterDarkProvider : MainAPI() {
 
         var response = fetchSources(request, session)
 
-        // Proofs are temporary. Retry once through the official WebView flow.
+        // Proofs are temporary. A real playback request may retry once through
+        // the official WebView flow. Background preload is strictly one-shot:
+        // if it fails, CloudStream will retry normally when the episode is
+        // actually opened.
         if (response.first == 403) {
             proofCache.remove(request.sessionKey)
-            session = obtainSession(request) ?: return false
+            if (backgroundPreload) {
+                Log.w(
+                    PROVIDER_TAG,
+                    "Préchargement ${request.sessionKey}: 403, aucun restart en arrière-plan",
+                )
+                return false
+            }
+            session = obtainSession(
+                request = request,
+                backgroundPreload = false,
+            ) ?: return false
             response = fetchSources(request, session)
         }
 
