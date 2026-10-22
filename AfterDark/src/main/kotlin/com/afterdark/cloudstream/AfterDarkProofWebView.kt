@@ -3453,7 +3453,7 @@ object AfterDarkProofWebView {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
 
                     val attributes = window.attributes
-                    attributes.alpha = if (silent) 0.f else 1f
+                    attributes.alpha = if (silent) 0.0f else 1f
                     window.attributes = attributes
 
                     if (silent) {
