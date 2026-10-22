@@ -5,6 +5,10 @@ import android.util.Log
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.utils.JsUnpacker
 import com.lagradost.cloudstream3.utils.getAndUnpack
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Cookie
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.net.URI
 
 /**
@@ -18,7 +22,6 @@ import java.net.URI
 internal object AfterDarkNativeEmbedResolver {
     private const val TAG = "AfterDarkNativeEmbed"
     private const val PAGE_TIMEOUT_SECONDS = 20L
-    private const val MEDIA_TIMEOUT_SECONDS = 12L
 
     private val explicitMediaUrl = Regex(
         """https?://[^\s"'<>\\]+\.(?:m3u8|mp4|m4v|webm)(?:\?[^\s"'<>\\]*)?""",
@@ -77,6 +80,7 @@ internal object AfterDarkNativeEmbedResolver {
         .trimEnd(')', ']', '}', ',', ';')
 
     private fun isObviouslyAsset(url: String): Boolean {
+        if (AfterDarkSourcePolicy.isDecoy(url)) return true
         val path = runCatching { URI(url).path.orEmpty().lowercase() }.getOrDefault("")
         return path.endsWith(".js") ||
             path.endsWith(".css") ||
@@ -146,7 +150,11 @@ internal object AfterDarkNativeEmbedResolver {
 
     private fun vidzyEmbedUrl(url: String): String {
         val currentOrigin = origin(url) ?: return url
-        val code = vidzyCode.find(url)?.groupValues?.getOrNull(1) ?: return url
+        val code = vidzyCode.find(url)?.groupValues?.getOrNull(1)
+            ?: Regex("""^/([a-zA-Z0-9]{12})(?:\.html)?$""")
+                .find(runCatching { URI(url).path }.getOrNull().orEmpty())
+                ?.groupValues?.get(1)
+            ?: return url
         return "$currentOrigin/embed-$code.html"
     }
 
@@ -326,7 +334,6 @@ internal object AfterDarkNativeEmbedResolver {
         source: ParsedSource,
         userAgent: String,
         pageUrl: String,
-        cookies: Map<String, String>,
     ): Map<String, String> {
         val headers = LinkedHashMap<String, String>(source.headers)
         if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
@@ -339,10 +346,6 @@ internal object AfterDarkNativeEmbedResolver {
             }
         }
 
-        if (cookies.isNotEmpty() && headers.keys.none { it.equals("Cookie", ignoreCase = true) }) {
-            headers["Cookie"] = cookies.entries.joinToString("; ") { (key, value) -> "$key=$value" }
-        }
-
         return headers
     }
 
@@ -350,6 +353,7 @@ internal object AfterDarkNativeEmbedResolver {
         candidate: String,
         pageUrl: String,
         headers: Map<String, String>,
+        cookies: List<Cookie>,
     ): ResolvedWebMedia? {
         if (!candidate.startsWith("http://", true) && !candidate.startsWith("https://", true)) {
             return null
@@ -370,11 +374,27 @@ internal object AfterDarkNativeEmbedResolver {
                 }
             }
 
+        val mediaHeaders = LinkedHashMap(headers)
+        // Embed cookies must obey Domain/Path when passed to another CDN.
+        // Do not copy a bare Cookie header from the page to an unrelated host.
+        if (host(candidate) != host(pageUrl)) {
+            mediaHeaders.keys.filter { it.equals("Cookie", true) || it.equals("Authorization", true) }
+                .forEach(mediaHeaders::remove)
+        }
+        candidate.toHttpUrlOrNull()?.let { url ->
+            val applicable = cookies.filter { it.matches(url) && it.expiresAt > System.currentTimeMillis() }
+            if (applicable.isNotEmpty()) {
+                val key = mediaHeaders.keys.firstOrNull { it.equals("Cookie", true) }
+                val explicit = key?.let { mediaHeaders.remove(it) }.orEmpty()
+                mediaHeaders["Cookie"] = listOf(explicit, applicable.joinToString("; ") { "${it.name}=${it.value}" })
+                    .filter(String::isNotBlank).joinToString("; ")
+            }
+        }
         return AfterDarkMediaProbe.validate(
             ResolvedWebMedia(
                 url = candidate,
                 referer = pageUrl,
-                headers = headers,
+                headers = mediaHeaders,
                 type = hintedType,
             ),
         )
@@ -394,6 +414,9 @@ internal object AfterDarkNativeEmbedResolver {
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
+        }.onFailure {
+            if (it is CancellationException) throw it
+            Log.w(TAG, "Requête embed échouée host=${host(url)} erreur=${it.javaClass.simpleName}")
         }.getOrNull() ?: return null
 
         if (!retryForVidzy || page.okhttpResponse.code !in 200..299) {
@@ -428,12 +451,20 @@ internal object AfterDarkNativeEmbedResolver {
                 cacheTime = 0,
                 timeout = PAGE_TIMEOUT_SECONDS,
             )
-        }.getOrDefault(page)
+        }.onFailure { if (it is CancellationException) throw it }.getOrDefault(page)
 
         return page
     }
 
     suspend fun resolve(
+        source: ParsedSource,
+        referer: String,
+        userAgent: String,
+    ): ResolvedWebMedia? = withTimeoutOrNull(30_000L) {
+        resolveInternal(source, referer, userAgent)
+    }
+
+    private suspend fun resolveInternal(
         source: ParsedSource,
         referer: String,
         userAgent: String,
@@ -443,7 +474,7 @@ internal object AfterDarkNativeEmbedResolver {
         val isUqload = "uqload" in sourceHost || "uqload" in sourceService
         val isVidzy = "vidzy" in sourceHost || "vidzy" in sourceService
 
-        val pageUrl = if (isVidzy) vidzyEmbedUrl(source.url) else source.url
+        val pageUrl = if (isVidzy || isUqload) vidzyEmbedUrl(source.url) else source.url
         val requestHeaders = LinkedHashMap<String, String>(source.headers)
         if (requestHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
             requestHeaders["User-Agent"] = userAgent
@@ -452,54 +483,40 @@ internal object AfterDarkNativeEmbedResolver {
         val page = runCatching {
             fetchEmbedPage(
                 url = pageUrl,
-                referer = referer,
+                // The supplied AfterDark iframe has referrerpolicy=no-referrer.
+                // This applies to the embed request, not the subsequent media.
+                referer = if (isVidzy && source.referer == null) "" else referer,
                 headers = requestHeaders,
                 retryForVidzy = isVidzy,
             )
         }.onFailure {
+            if (it is CancellationException) throw it
             Log.w(TAG, "Page embed inaccessible service=${source.service} host=$sourceHost", it)
         }.getOrNull() ?: return null
 
-        if (page.okhttpResponse.code !in 200..299) return null
+        if (page.okhttpResponse.code !in 200..299) {
+            Log.w(TAG, "Page embed refusée service=${source.service} host=$sourceHost status=${page.code}")
+            page.body?.close()
+            return null
+        }
 
         val finalPageUrl = page.okhttpResponse.request.url.toString()
         val headers = responseHeaders(
             source = source,
             userAgent = userAgent,
             pageUrl = finalPageUrl,
-            cookies = page.cookies,
         )
+        val pageCookies = ArrayList<Cookie>()
+        var cookieResponse: okhttp3.Response? = page.okhttpResponse
+        while (cookieResponse != null) {
+            pageCookies += Cookie.parseAll(cookieResponse.request.url, cookieResponse.headers)
+            cookieResponse = cookieResponse.priorResponse
+        }
 
         val candidates = LinkedHashSet<String>()
 
         if (isVidzy) {
-            decodeVidzy(page.text, finalPageUrl)?.let { decoded ->
-                // Current Vidzy media URLs are signed. A successful GET probe
-                // here can consume/age the URL before ExoPlayer requests it,
-                // which surfaces later as ERROR_CODE_IO_BAD_HTTPS_STATUS
-                // (2004). The decoder already rejects troll/non-http output,
-                // so emit the decoded HLS without a body GET.
-                val vidzyOrigin = origin(finalPageUrl)
-                val vidzyReferer = vidzyOrigin?.let { "$it/" } ?: finalPageUrl
-                val vidzyHeaders = LinkedHashMap(headers)
-                if (vidzyOrigin != null) {
-                    vidzyHeaders["Origin"] = vidzyOrigin
-                }
-                vidzyHeaders["Sec-Fetch-Dest"] = "empty"
-                vidzyHeaders["Sec-Fetch-Mode"] = "cors"
-                vidzyHeaders["Sec-Fetch-Site"] = "same-site"
-
-                Log.i(
-                    TAG,
-                    "Vidzy signé prêt sans GET probe host=$sourceHost",
-                )
-                return ResolvedWebMedia(
-                    url = decoded,
-                    referer = vidzyReferer,
-                    headers = vidzyHeaders,
-                    type = "m3u8",
-                )
-            }
+            decodeVidzy(page.text, finalPageUrl)?.let(candidates::add)
         }
 
         // Server-rendered media nodes also cover extensionless HLS proxies.
@@ -523,6 +540,7 @@ internal object AfterDarkNativeEmbedResolver {
                 candidate = candidate,
                 pageUrl = finalPageUrl,
                 headers = headers,
+                cookies = pageCookies,
             )
             if (resolved != null) {
                 Log.i(

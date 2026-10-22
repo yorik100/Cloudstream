@@ -27,6 +27,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkPlayList
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
@@ -42,7 +43,7 @@ class AfterDarkProvider : MainAPI() {
     override var lang = "fr"
 
     override val hasMainPage = true
-    // Verification and fallback players open their own WebViews explicitly.
+    // Only verification opens a WebView; native resolution never opens a player.
     // Keep CloudStream from treating the unresolved registry URL as a page to
     // open automatically when link loading fails.
     override val usesWebView = false
@@ -57,7 +58,8 @@ class AfterDarkProvider : MainAPI() {
     // Public frontend key present in AfterDark's current browser bundle.
     private val tmdbApiKey = "f3d757824f08ea2cff45eb8f47ca3a1e"
 
-    private val proofCache = ConcurrentHashMap<String, ProofSession>()
+    private data class CachedProof(val session: ProofSession, val createdAtNanos: Long)
+    private val proofCache = ConcurrentHashMap<String, CachedProof>()
     private val domainResolver = AfterDarkDomainResolver()
 
     private suspend fun ensureAfterDarkDomain(): String? {
@@ -472,7 +474,11 @@ class AfterDarkProvider : MainAPI() {
         request: PlaybackRequest,
         backgroundPreload: Boolean,
     ): ProofSession? {
-        proofCache[request.sessionKey]?.let { return it }
+        // /api/sources contains expiring signed URLs, not a reusable catalogue.
+        // Consume a recent capture once; never reuse it indefinitely on replay.
+        proofCache.remove(request.sessionKey)?.takeIf {
+            System.nanoTime() - it.createdAtNanos < 60_000_000_000L
+        }?.let { return it.session }
 
         val session = try {
             AfterDarkProofWebView.acquire(
@@ -480,12 +486,14 @@ class AfterDarkProvider : MainAPI() {
                 mainUrl = mainUrl,
                 backgroundPreload = backgroundPreload,
             )
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             null
         } ?: return null
 
         if (session.resolvedMedia == null) {
-            proofCache[request.sessionKey] = session
+            proofCache[request.sessionKey] = CachedProof(session, System.nanoTime())
         }
         return session
     }
@@ -563,17 +571,7 @@ class AfterDarkProvider : MainAPI() {
             }
         }
 
-        return sources.distinctBy {
-            listOf(
-                it.group,
-                it.provider,
-                it.service,
-                it.language.orEmpty(),
-                it.quality.orEmpty(),
-                it.type.orEmpty(),
-                it.url,
-            ).joinToString("|")
-        }
+        return sources.distinctBy(AfterDarkSourcePolicy::sourceKey)
     }
 
     private fun fallbackSources(request: PlaybackRequest): List<ParsedSource> {
@@ -617,11 +615,7 @@ class AfterDarkProvider : MainAPI() {
         return when (declared) {
             "hls", "m3u8" -> ExtractorLinkType.M3U8
             "dash", "mpd" -> ExtractorLinkType.DASH
-            "mp4", "video" -> ExtractorLinkType.VIDEO
-            // "direct" only describes the delivery path. AfterDark can use
-            // extensionless HLS proxy URLs for direct providers, so never
-            // force those URLs to VIDEO before MIME/type classification.
-            "direct" -> null
+            "mp4", "video", "direct" -> ExtractorLinkType.VIDEO
             else -> {
                 val path = source.url.substringBefore("?")
                 when {
@@ -635,24 +629,7 @@ class AfterDarkProvider : MainAPI() {
         }
     }
 
-    private fun displayName(source: ParsedSource): String =
-        listOfNotNull(
-            source.group.takeIf {
-                it.isNotBlank() &&
-                    !it.equals("AfterDark", ignoreCase = true)
-            },
-            source.provider.takeIf {
-                it.isNotBlank() &&
-                    !it.equals("AfterDark", ignoreCase = true) &&
-                    !it.equals(source.group, ignoreCase = true)
-            },
-            source.service.takeIf { it.isNotBlank() },
-            source.language,
-            source.quality,
-        )
-            .distinctBy { it.lowercase() }
-            .joinToString(" · ")
-            .ifBlank { source.group.ifBlank { "AfterDark" } }
+    private fun displayName(source: ParsedSource): String = AfterDarkSourcePolicy.displayName(source)
 
     private fun afterDarkTodayUtc(): String =
         SimpleDateFormat(
@@ -795,7 +772,28 @@ class AfterDarkProvider : MainAPI() {
         }
 
         var emitted = false
-        val seen = HashSet<String>()
+        val seen = HashSet<List<String>>()
+        val emittedMedia = HashSet<List<String>>()
+
+        suspend fun emitMedia(source: ParsedSource, media: ResolvedWebMedia) {
+            if (!emittedMedia.add(AfterDarkSourcePolicy.mediaKey(source, media))) {
+                Log.i(PROVIDER_TAG, "Média identique ignoré service=${source.service} langue=${source.language.orEmpty()}")
+                return
+            }
+            callback(
+                newExtractorLink(
+                    source = source.service,
+                    name = displayName(source),
+                    url = media.url,
+                    type = extractorType(media),
+                ) {
+                    referer = media.referer.orEmpty()
+                    quality = getQualityFromName(source.quality)
+                    headers = media.headers
+                },
+            )
+            emitted = true
+        }
 
         for (source in sources) {
             for (subtitle in source.subtitles) {
@@ -808,15 +806,7 @@ class AfterDarkProvider : MainAPI() {
                 )
             }
 
-            val sourceIdentity = listOf(
-                source.group,
-                source.service,
-                source.language.orEmpty(),
-                source.quality.orEmpty(),
-                source.type.orEmpty(),
-                source.url,
-            ).joinToString("|")
-            if (!seen.add(sourceIdentity)) continue
+            if (!seen.add(AfterDarkSourcePolicy.sourceKey(source))) continue
 
             Log.i(
                 PROVIDER_TAG,
@@ -826,51 +816,19 @@ class AfterDarkProvider : MainAPI() {
             )
 
             val type = directType(source)
-            val declaredType = source.type.orEmpty().lowercase()
             val sourceHost = runCatching {
                 java.net.URI(source.url).host.orEmpty().lowercase()
             }.getOrDefault("")
-            val sourceService = source.service.lowercase()
-
-            // The official selector exposes direct provider groups (for
-            // example Canberra/Paris) separately from the "Embeds" group.
-            // A direct Paris source can legitimately have service=uqload;
-            // the service label alone must therefore never turn it into an
-            // Uqload iframe/embed.
-            val explicitEmbed =
-                declaredType == "embed" ||
-                    declaredType == "iframe" ||
-                    declaredType == "player"
-            val groupEmbed = source.group.equals("Embeds", ignoreCase = true)
-            val officialDirectGroup =
-                source.group.isNotBlank() &&
-                    !groupEmbed &&
-                    !source.group.equals("Secours", ignoreCase = true)
-            val hostLooksNativeEmbed =
-                "uqload" in sourceHost ||
-                    "vidzy" in sourceHost
-            val serviceLooksNativeEmbed =
-                "uqload" in sourceService ||
-                    "vidzy" in sourceService
-            val isKnownNativeEmbed =
-                hostLooksNativeEmbed ||
-                    (serviceLooksNativeEmbed && (explicitEmbed || groupEmbed || !officialDirectGroup))
-            val isEmbed =
-                explicitEmbed ||
-                    groupEmbed ||
-                    (isKnownNativeEmbed && !officialDirectGroup)
+            val isEmbed = AfterDarkSourcePolicy.isEmbed(source)
+            val isKnownNativeEmbed = isEmbed && AfterDarkSourcePolicy.isKnownNative(source)
             val sourceReferer = source.referer ?: "$mainUrl/"
             val sourceHeaders = LinkedHashMap<String, String>(source.headers)
             if (sourceHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
                 sourceHeaders["User-Agent"] = session.userAgent
             }
 
-            if (!isEmbed && (type != null || source.proxied || officialDirectGroup)) {
-                // Official direct sources can be short-lived signed URLs.
-                // Do not consume them with a GET probe before ExoPlayer. Use
-                // declared/path information, then HEAD only when the type is
-                // still unknown (notably extensionless direct HLS proxies).
-                val checked = AfterDarkMediaProbe.classifyWithoutBody(
+            if (!isEmbed && (type != null || source.proxied)) {
+                val checked = validateResolvedMedia(
                     ResolvedWebMedia(
                         url = source.url,
                         referer = sourceReferer,
@@ -880,19 +838,7 @@ class AfterDarkProvider : MainAPI() {
                 )
 
                 if (checked != null) {
-                    callback(
-                        newExtractorLink(
-                            source = source.service,
-                            name = displayName(source),
-                            url = checked.url,
-                            type = extractorType(checked),
-                        ) {
-                            referer = checked.referer.orEmpty()
-                            quality = getQualityFromName(source.quality)
-                            headers = checked.headers
-                        },
-                    )
-                    emitted = true
+                    emitMedia(source, checked)
                     Log.i(
                         PROVIDER_TAG,
                         "Source émise service=${source.service} " +
@@ -919,6 +865,7 @@ class AfterDarkProvider : MainAPI() {
                         userAgent = session.userAgent,
                     )
                 }.onFailure {
+                    if (it is CancellationException) throw it
                     Log.w(
                         PROVIDER_TAG,
                         "Résolution embed native impossible service=${source.service} host=$sourceHost",
@@ -927,19 +874,7 @@ class AfterDarkProvider : MainAPI() {
                 }.getOrNull()
 
                 if (nativeResolved != null) {
-                    callback(
-                        newExtractorLink(
-                            source = source.service,
-                            name = displayName(source),
-                            url = nativeResolved.url,
-                            type = extractorType(nativeResolved),
-                        ) {
-                            referer = nativeResolved.referer.orEmpty()
-                            quality = getQualityFromName(source.quality)
-                            headers = nativeResolved.headers
-                        },
-                    )
-                    emitted = true
+                    emitMedia(source, nativeResolved)
                     Log.i(
                         PROVIDER_TAG,
                         "Source native émise service=${source.service} " +
@@ -972,7 +907,7 @@ class AfterDarkProvider : MainAPI() {
                     subtitleCallback = subtitleCallback,
                     callback = { extractedLinks.add(it) },
                 )
-            }
+            }.onFailure { if (it is CancellationException) throw it }
 
             var extractorEmitted = false
             for (link in extractedLinks) {
@@ -1010,8 +945,10 @@ class AfterDarkProvider : MainAPI() {
                 link.type = extractorType(checked)
                 link.referer = checked.referer.orEmpty()
                 link.headers = checked.headers
-                callback(link)
-                emitted = true
+                if (emittedMedia.add(AfterDarkSourcePolicy.mediaKey(source, checked))) {
+                    callback(link)
+                    emitted = true
+                }
                 extractorEmitted = true
             }
 
@@ -1044,19 +981,7 @@ class AfterDarkProvider : MainAPI() {
                     ),
                 )
                 if (checked != null) {
-                    callback(
-                        newExtractorLink(
-                            source = source.service,
-                            name = displayName(source),
-                            url = checked.url,
-                            type = extractorType(checked),
-                        ) {
-                            referer = checked.referer.orEmpty()
-                            quality = getQualityFromName(source.quality)
-                            headers = checked.headers
-                        },
-                    )
-                    emitted = true
+                    emitMedia(source, checked)
                 } else {
                     Log.w(
                         PROVIDER_TAG,
@@ -1067,6 +992,7 @@ class AfterDarkProvider : MainAPI() {
             }
         }
 
+        if (!emitted) proofCache.remove(request.sessionKey)
         return emitted
     }
 
