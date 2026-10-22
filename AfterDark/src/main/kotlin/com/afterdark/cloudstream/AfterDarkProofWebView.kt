@@ -1008,12 +1008,12 @@ object AfterDarkProofWebView {
                         """
                         (() => {
                           if (
-                            window.__afterdarkPreferredSourceSelected ||
-                            window.__afterdarkPreferredSourceLocked ||
-                            window.__afterdarkPreferredSourceObserverInstalled
-                          ) return;
-
-                          window.__afterdarkPreferredSourceObserverInstalled = true;
+                            typeof window.__afterdarkSelectNextOfficialSource ===
+                              "function"
+                          ) {
+                            window.__afterdarkSelectNextOfficialSource(false);
+                            return;
+                          }
 
                           const normalize = value =>
                             String(value || "")
@@ -1021,98 +1021,308 @@ object AfterDarkProofWebView {
                               .trim()
                               .toLocaleLowerCase("fr-FR");
 
+                          const visible = element => {
+                            if (!element || !element.isConnected) return false;
+                            const style = getComputedStyle(element);
+                            if (
+                              style.display === "none" ||
+                              style.visibility === "hidden" ||
+                              Number(style.opacity || "1") <= 0.001 ||
+                              element.getAttribute("aria-hidden") === "true"
+                            ) return false;
+                            const rect = element.getBoundingClientRect();
+                            return rect.width > 1 && rect.height > 1;
+                          };
+
                           const interactive = () =>
                             Array.from(
                               document.querySelectorAll(
-                                'button,a,[role="button"]'
+                                'button,a,[role="button"],[role="menuitem"],[role="option"]'
                               )
                             );
 
-                          const findSourcesButton = () =>
-                            interactive().find(element =>
-                              normalize(element.textContent) === "sources"
-                            );
+                          const labelOf = element => {
+                            const text = String(
+                              element.textContent || ""
+                            ).replace(/\s+/g, " ").trim();
 
-                          const findVideasyButton = () =>
-                            interactive().find(element => {
-                              const text = normalize(element.textContent);
-                              return text === "videasy" ||
-                                     text.includes("videasy");
-                            });
+                            const aria = String(
+                              element.getAttribute("aria-label") || ""
+                            ).replace(/\s+/g, " ").trim();
 
-                          let sourceMenuOpened = false;
+                            const title = String(
+                              element.getAttribute("title") || ""
+                            ).replace(/\s+/g, " ").trim();
 
-                          const trySelectVideasy = () => {
-                            if (
-                              window.__afterdarkPreferredSourceSelected ||
-                              window.__afterdarkPreferredSourceLocked
-                            ) {
-                              return true;
-                            }
+                            const imageAlt = String(
+                              element.querySelector("img[alt]")?.getAttribute("alt") ||
+                              ""
+                            ).replace(/\s+/g, " ").trim();
 
-                            if (!sourceMenuOpened) {
-                              const sources = findSourcesButton();
-                              if (!sources) return false;
-
-                              try {
-                                // The Sources control may be hidden visually by
-                                // our cleanup, but its React click handler still
-                                // opens the official AfterDark source selector.
-                                sources.click();
-                                sourceMenuOpened = true;
-                              } catch (_) {
-                                return false;
-                              }
-                            }
-
-                            const videasy = findVideasyButton();
-                            if (!videasy) return false;
-
-                            window.__afterdarkPreferredSourceSelected = true;
-                            window.__afterdarkPreferredSourceLocked = true;
-
-                            try {
-                              videasy.click();
-                            } catch (_) {
-                              window.__afterdarkPreferredSourceSelected = false;
-                              window.__afterdarkPreferredSourceLocked = false;
-                              return false;
-                            }
-
-                            try {
-                              window.AfterDarkNative.preferredSourceSelected(
-                                "videasy"
-                              );
-                            } catch (_) {}
-
-                            return true;
+                            return text || aria || title || imageAlt;
                           };
 
-                          if (trySelectVideasy()) {
-                            window.__afterdarkPreferredSourceObserverInstalled = false;
-                            return;
-                          }
+                          const findSourcesButton = () =>
+                            interactive().find(element => {
+                              const text = normalize(element.textContent);
+                              const aria = normalize(
+                                element.getAttribute("aria-label")
+                              );
+                              return text === "sources" || aria === "sources";
+                            });
 
-                          const observer = new MutationObserver(() => {
-                            if (trySelectVideasy()) {
-                              try { observer.disconnect(); } catch (_) {}
-                              window.__afterdarkPreferredSourceObserverInstalled = false;
+                          const tried =
+                            window.__afterdarkOfficialSourceTried ||
+                            Object.create(null);
+                          window.__afterdarkOfficialSourceTried = tried;
+
+                          const notifyCandidates = candidates => {
+                            const payload = candidates.map(candidate => ({
+                              key: candidate.key,
+                              label: candidate.label
+                            }));
+                            const signature = JSON.stringify(payload);
+
+                            if (
+                              signature ===
+                              window.__afterdarkSourceCandidateSignature
+                            ) return;
+
+                            window.__afterdarkSourceCandidateSignature =
+                              signature;
+
+                            try {
+                              window.AfterDarkNative.sourceCandidatesDiscovered(
+                                signature
+                              );
+                            } catch (_) {}
+                          };
+
+                          const selectNext = isAdvance => {
+                            if (window.__afterdarkSourceScannerRunning) return;
+                            window.__afterdarkSourceScannerRunning = true;
+
+                            const toggle = findSourcesButton();
+                            if (!toggle) {
+                              window.__afterdarkSourceScannerRunning = false;
+
+                              if (!isAdvance) {
+                                if (!window.__afterdarkSourceButtonObserver) {
+                                  const buttonObserver =
+                                    new MutationObserver(() => {
+                                      if (!findSourcesButton()) return;
+
+                                      try {
+                                        buttonObserver.disconnect();
+                                      } catch (_) {}
+                                      window.__afterdarkSourceButtonObserver =
+                                        null;
+
+                                      try {
+                                        window.__afterdarkSelectNextOfficialSource(
+                                          false
+                                        );
+                                      } catch (_) {}
+                                    });
+
+                                  buttonObserver.observe(
+                                    document.documentElement,
+                                    {
+                                      childList: true,
+                                      subtree: true,
+                                      characterData: true,
+                                      attributes: true,
+                                      attributeFilter: [
+                                        "class",
+                                        "style",
+                                        "aria-hidden",
+                                        "aria-label"
+                                      ]
+                                    }
+                                  );
+
+                                  window.__afterdarkSourceButtonObserver =
+                                    buttonObserver;
+                                }
+                                return;
+                              }
+
+                              try {
+                                window.AfterDarkNative.noNextSource();
+                              } catch (_) {}
+                              return;
                             }
-                          });
 
-                          observer.observe(document.documentElement, {
-                            childList: true,
-                            subtree: true,
-                            characterData: true,
-                            attributes: true,
-                            attributeFilter: [
-                              "class",
-                              "style",
-                              "aria-hidden"
-                            ]
-                          });
+                            // Remember everything that is visible while the
+                            // official source menu is still closed. After the
+                            // Sources click, newly-visible interactive controls
+                            // are the source choices. This avoids hardcoding
+                            // any player/service hostname or label.
+                            const beforeVisible = new Set(
+                              interactive().filter(visible)
+                            );
 
-                          window.__afterdarkPreferredSourceObserver = observer;
+                            try {
+                              toggle.click();
+                            } catch (_) {
+                              window.__afterdarkSourceScannerRunning = false;
+                              try {
+                                window.AfterDarkNative.noNextSource();
+                              } catch (_) {}
+                              return;
+                            }
+
+                            let observer = null;
+                            let deadline = null;
+                            let retryTimer = null;
+
+                            const cleanup = () => {
+                              if (observer) {
+                                try { observer.disconnect(); } catch (_) {}
+                                observer = null;
+                              }
+                              if (deadline) {
+                                clearTimeout(deadline);
+                                deadline = null;
+                              }
+                              if (retryTimer) {
+                                clearTimeout(retryTimer);
+                                retryTimer = null;
+                              }
+                              window.__afterdarkSourceScannerRunning = false;
+                            };
+
+                            const candidatesNow = () => {
+                              const occurrence = Object.create(null);
+                              const candidates = [];
+
+                              for (const element of interactive()) {
+                                if (
+                                  element === toggle ||
+                                  beforeVisible.has(element) ||
+                                  !visible(element)
+                                ) continue;
+
+                                const label = labelOf(element);
+                                const normalized = normalize(label);
+
+                                if (
+                                  !normalized ||
+                                  normalized === "sources"
+                                ) continue;
+
+                                const index = occurrence[normalized] || 0;
+                                occurrence[normalized] = index + 1;
+
+                                candidates.push({
+                                  element,
+                                  label,
+                                  key: normalized + "#" + index
+                                });
+                              }
+
+                              return candidates;
+                            };
+
+                            const choose = () => {
+                              const candidates = candidatesNow();
+                              if (candidates.length === 0) return false;
+
+                              notifyCandidates(candidates);
+
+                              const next = candidates.find(
+                                candidate => !tried[candidate.key]
+                              );
+
+                              if (!next) {
+                                cleanup();
+                                try {
+                                  window.AfterDarkNative.noNextSource();
+                                } catch (_) {}
+                                return true;
+                              }
+
+                              tried[next.key] = true;
+                              cleanup();
+
+                              try {
+                                next.element.click();
+                              } catch (_) {
+                                // The candidate disappeared between discovery
+                                // and click. Try the next source through the
+                                // same official menu.
+                                setTimeout(() => {
+                                  try {
+                                    window.__afterdarkSelectNextOfficialSource(
+                                      isAdvance
+                                    );
+                                  } catch (_) {}
+                                }, 0);
+                                return true;
+                              }
+
+                              try {
+                                if (isAdvance) {
+                                  window.AfterDarkNative.sourceAdvanced(
+                                    next.label
+                                  );
+                                } else {
+                                  window.AfterDarkNative.preferredSourceSelected(
+                                    next.label
+                                  );
+                                }
+                              } catch (_) {}
+
+                              return true;
+                            };
+
+                            if (choose()) return;
+
+                            observer = new MutationObserver(() => {
+                              choose();
+                            });
+
+                            observer.observe(document.documentElement, {
+                              childList: true,
+                              subtree: true,
+                              characterData: true,
+                              attributes: true,
+                              attributeFilter: [
+                                "class",
+                                "style",
+                                "aria-hidden",
+                                "aria-label",
+                                "role"
+                              ]
+                            });
+
+                            // Keep the existing 3-second deadline only for the
+                            // source menu itself to render. This is not a media
+                            // availability timeout.
+                            deadline = setTimeout(() => {
+                              if (choose()) return;
+                              cleanup();
+                              try {
+                                window.AfterDarkNative.noNextSource();
+                              } catch (_) {}
+                            }, 3000);
+
+                            // Some React trees do not mutate after the click but
+                            // only flip computed styles. Poll the menu briefly
+                            // without imposing any timeout on the selected
+                            // player's media.
+                            const poll = () => {
+                              if (!window.__afterdarkSourceScannerRunning) return;
+                              if (choose()) return;
+                              retryTimer = setTimeout(poll, 100);
+                            };
+                            retryTimer = setTimeout(poll, 100);
+                          };
+
+                          window.__afterdarkSelectNextOfficialSource =
+                            selectNext;
+
+                          selectNext(false);
                         })();
                         """.trimIndent(),
                         null,
@@ -1124,22 +1334,16 @@ object AfterDarkProofWebView {
                 failedHost: String?,
             ) {
                 if (!officialPlayerMode.get() || finished.get()) return
-
-                val failed = failedHost
-                    ?.trim()
-                    ?.lowercase()
-                    .orEmpty()
-
-                // Peachify was already the last allowed AfterDark fallback.
-                if (failed.contains("peachify")) {
-                    finish(null)
-                    return
-                }
-
                 if (!sourceFailoverInProgress.compareAndSet(false, true)) return
 
                 preferredSourceSelectionDone.set(true)
                 mediaCaptureArmed.set(false)
+
+                Log.i(
+                    TAG,
+                    "Source officielle en échec, essai du choix suivant: " +
+                        failedHost.orEmpty(),
+                )
 
                 browser.post {
                     if (finished.get() || !officialPlayerMode.get()) {
@@ -1150,115 +1354,17 @@ object AfterDarkProofWebView {
                     browser.evaluateJavascript(
                         """
                         (() => {
-                          if (window.__afterdarkOfficialFailoverRunning) return;
-                          window.__afterdarkOfficialFailoverRunning = true;
-                          window.__afterdarkOfficialSourceAdvanced = false;
-                          window.__afterdarkPreferredSourceLocked = true;
+                          const selectNext =
+                            window.__afterdarkSelectNextOfficialSource;
 
-                          const normalize = value =>
-                            String(value || "")
-                              .replace(/\s+/g, " ")
-                              .trim()
-                              .toLocaleLowerCase("fr-FR");
-
-                          const interactive = () =>
-                            Array.from(
-                              document.querySelectorAll(
-                                'button,a,[role="button"]'
-                              )
-                            );
-
-                          const sourcesButton = () =>
-                            interactive().find(element =>
-                              normalize(element.textContent) === "sources"
-                            );
-
-                          const peachifyButton = () =>
-                            interactive().find(element => {
-                              const text = normalize(element.textContent);
-                              return text.includes("peachify");
-                            });
-
-                          let observer = null;
-                          let menuDeadline = null;
-
-                          const cleanup = () => {
-                            if (observer) {
-                              try { observer.disconnect(); } catch (_) {}
-                              observer = null;
-                            }
-                            if (menuDeadline) {
-                              clearTimeout(menuDeadline);
-                              menuDeadline = null;
-                            }
-                            window.__afterdarkOfficialFailoverRunning = false;
-                          };
-
-                          const chooseNext = () => {
-                            const next = peachifyButton();
-                            if (!next) return false;
-
-                            window.__afterdarkOfficialSourceAdvanced = true;
-                            try { next.click(); } catch (_) {
-                              cleanup();
-                              try {
-                                window.AfterDarkNative.noNextSource();
-                              } catch (_) {}
-                              return true;
-                            }
-
-                            cleanup();
-                            try {
-                              window.AfterDarkNative.sourceAdvanced("peachify");
-                            } catch (_) {}
-                            return true;
-                          };
-
-                          const toggle = sourcesButton();
-                          if (!toggle) {
-                            cleanup();
+                          if (typeof selectNext !== "function") {
                             try {
                               window.AfterDarkNative.noNextSource();
                             } catch (_) {}
                             return;
                           }
 
-                          // The button may be visually hidden by our UI cleanup;
-                          // HTMLElement.click() still drives AfterDark's React
-                          // handler and therefore changes source through the
-                          // official page rather than by navigating ourselves.
-                          try { toggle.click(); } catch (_) {
-                            cleanup();
-                            try {
-                              window.AfterDarkNative.noNextSource();
-                            } catch (_) {}
-                            return;
-                          }
-
-                          if (chooseNext()) return;
-
-                          observer = new MutationObserver(() => {
-                            chooseNext();
-                          });
-
-                          observer.observe(document.documentElement, {
-                            childList: true,
-                            subtree: true,
-                            characterData: true,
-                            attributes: true,
-                            attributeFilter: ["class", "style", "aria-hidden"]
-                          });
-
-                          // This deadline is only for the AfterDark source menu
-                          // rendering. It is NOT used to decide whether a media
-                          // source is available.
-                          menuDeadline = setTimeout(() => {
-                            if (window.__afterdarkOfficialSourceAdvanced) return;
-                            cleanup();
-                            try {
-                              window.AfterDarkNative.noNextSource();
-                            } catch (_) {}
-                          }, 3000);
+                          selectNext(true);
                         })();
                         """.trimIndent(),
                         null,
@@ -1352,6 +1458,17 @@ object AfterDarkProofWebView {
                             contentType = contentType,
                             pageUrl = pageUrl,
                         )
+                    }
+
+                    @JavascriptInterface
+                    fun sourceCandidatesDiscovered(candidatesJson: String?) {
+                        handler.post {
+                            Log.i(
+                                TAG,
+                                "Sources officielles détectées: " +
+                                    candidatesJson.orEmpty().take(4000),
+                            )
+                        }
                     }
 
                     @JavascriptInterface
@@ -3453,7 +3570,7 @@ object AfterDarkProofWebView {
                     window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
 
                     val attributes = window.attributes
-                    attributes.alpha = if (silent) 0.01f else 1f
+                    attributes.alpha = if (silent) 0.0f else 1f
                     window.attributes = attributes
 
                     if (silent) {
@@ -3498,7 +3615,7 @@ object AfterDarkProofWebView {
                                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
                         )
                         val attributes = silentWindow.attributes
-                        attributes.alpha = 0.01f
+                        attributes.alpha = 0.0f
                         silentWindow.attributes = attributes
                     }
                 }
