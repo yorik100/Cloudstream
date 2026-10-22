@@ -23,6 +23,7 @@ import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import com.lagradost.cloudstream3.newTvSeriesSearchResponse
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.ExtractorLinkPlayList
 import com.lagradost.cloudstream3.utils.getQualityFromName
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
@@ -645,136 +646,24 @@ class AfterDarkProvider : MainAPI() {
     ): Boolean =
         airDate == null || airDate <= todayUtc
 
-    private fun responseContentType(headers: okhttp3.Headers): String =
-        headers["Content-Type"]
-            ?.substringBefore(";")
-            ?.trim()
-            ?.lowercase()
-            .orEmpty()
-
     private suspend fun validateResolvedMedia(
         resolved: ResolvedWebMedia,
-    ): Boolean {
-        val referer = resolved.referer.orEmpty()
-        val headers = LinkedHashMap<String, String>(resolved.headers)
+    ): ResolvedWebMedia? = AfterDarkMediaProbe.validate(resolved)
 
-        // Never reuse a Range header captured from a browser media segment for
-        // playlist validation.
-        headers.keys
-            .firstOrNull { it.equals("Range", ignoreCase = true) }
-            ?.let { headers.remove(it) }
-
-        return when (resolved.type) {
-            "m3u8" -> runCatching {
-                val response = app.get(
-                    url = resolved.url,
-                    headers = headers,
-                    referer = referer,
-                    cacheTime = 0,
-                )
-
-                if (response.okhttpResponse.code !in 200..299) {
-                    return@runCatching false
-                }
-
-                val contentType = responseContentType(response.headers)
-                val body = response.text.trimStart()
-
-                // A real HLS manifest starts with #EXTM3U. Accept the MIME type
-                // too because a few hosts return a minimal/variant body.
-                body.startsWith("#EXTM3U") ||
-                    "mpegurl" in contentType
-            }.getOrDefault(false)
-
-            "mpd" -> runCatching {
-                val response = app.get(
-                    url = resolved.url,
-                    headers = headers,
-                    referer = referer,
-                    cacheTime = 0,
-                )
-
-                if (response.okhttpResponse.code !in 200..299) {
-                    return@runCatching false
-                }
-
-                val contentType = responseContentType(response.headers)
-                val body = response.text.trimStart()
-
-                body.contains("<MPD", ignoreCase = true) ||
-                    "dash+xml" in contentType
-            }.getOrDefault(false)
-
-            else -> {
-                // For direct video, HEAD avoids downloading the media. Some
-                // hosts reject HEAD, so only 404/410 are final failures; other
-                // failures fall back to a one-byte Range probe.
-                val head = runCatching {
-                    app.head(
-                        url = resolved.url,
-                        headers = headers,
-                        referer = referer,
-                        timeout = 10L,
-                    )
-                }.getOrNull()
-
-                if (head != null) {
-                    val code = head.okhttpResponse.code
-                    if (code == 404 || code == 410) {
-                        return false
-                    }
-
-                    if (code in 200..299) {
-                        val contentType = responseContentType(head.headers)
-                        val contentLength =
-                            head.headers["Content-Length"]?.toLongOrNull()
-
-                        if (
-                            contentType.startsWith("video/") ||
-                            contentType == "application/octet-stream" ||
-                            (contentLength != null && contentLength > 0)
-                        ) {
-                            return true
-                        }
-                    }
-                }
-
-                runCatching {
-                    val probeHeaders = LinkedHashMap(headers)
-                    probeHeaders["Range"] = "bytes=0-0"
-
-                    val response = app.get(
-                        url = resolved.url,
-                        headers = probeHeaders,
-                        referer = referer,
-                        cacheTime = 0,
-                    )
-
-                    val code = response.okhttpResponse.code
-                    if (code !in 200..299) {
-                        return@runCatching false
-                    }
-
-                    val contentType = responseContentType(response.headers)
-                    val contentRange =
-                        response.headers["Content-Range"]
-
-                    // Reject common "200 OK" HTML/JSON error pages.
-                    val clearlyNotVideo =
-                        contentType.startsWith("text/html") ||
-                            contentType.startsWith("application/json") ||
-                            contentType.startsWith("text/plain")
-
-                    !clearlyNotVideo && (
-                        code == 206 ||
-                            !contentRange.isNullOrBlank() ||
-                            contentType.startsWith("video/") ||
-                            contentType == "application/octet-stream"
-                    )
-                }.getOrDefault(false)
-            }
+    private fun extractorType(resolved: ResolvedWebMedia): ExtractorLinkType =
+        when (resolved.type) {
+            "m3u8" -> ExtractorLinkType.M3U8
+            "mpd" -> ExtractorLinkType.DASH
+            else -> ExtractorLinkType.VIDEO
         }
-    }
+
+    private fun mediaHint(type: ExtractorLinkType?): String? =
+        when (type) {
+            ExtractorLinkType.M3U8 -> "m3u8"
+            ExtractorLinkType.DASH -> "mpd"
+            ExtractorLinkType.VIDEO -> "video"
+            else -> null
+        }
 
     override suspend fun loadLinks(
         data: String,
@@ -808,29 +697,31 @@ class AfterDarkProvider : MainAPI() {
         ) ?: return false
 
         session.resolvedMedia?.let { resolved ->
-            val resolvedType = when (resolved.type) {
-                "m3u8" -> ExtractorLinkType.M3U8
-                "mpd" -> ExtractorLinkType.DASH
-                else -> ExtractorLinkType.VIDEO
+            val checked = validateResolvedMedia(resolved)
+            if (checked != null) {
+                val service = session.resolvedService
+                    ?.takeIf { it.isNotBlank() }
+                    ?: "AfterDark"
+
+                callback(
+                    newExtractorLink(
+                        source = service,
+                        name = "AfterDark · $service",
+                        url = checked.url,
+                        type = extractorType(checked),
+                    ) {
+                        referer = checked.referer.orEmpty()
+                        headers = checked.headers
+                    },
+                )
+
+                return true
             }
 
-            val service = session.resolvedService
-                ?.takeIf { it.isNotBlank() }
-                ?: "AfterDark"
-
-            callback(
-                newExtractorLink(
-                    source = service,
-                    name = "AfterDark · $service",
-                    url = resolved.url,
-                    type = resolvedType,
-                ) {
-                    referer = resolved.referer.orEmpty()
-                    headers = resolved.headers
-                },
+            Log.w(
+                PROVIDER_TAG,
+                "Média capturé rejeté par le probe final service=${session.resolvedService.orEmpty()}",
             )
-
-            return true
         }
 
         var response = fetchSources(request, session)
@@ -892,19 +783,36 @@ class AfterDarkProvider : MainAPI() {
             }
 
             if (type != null || (source.proxied && !isEmbed)) {
-                callback(
-                    newExtractorLink(
-                        source = source.service,
-                        name = displayName(source),
+                val checked = validateResolvedMedia(
+                    ResolvedWebMedia(
                         url = source.url,
-                        type = type,
-                    ) {
-                        referer = sourceReferer
-                        quality = getQualityFromName(source.quality)
-                        headers = sourceHeaders
-                    },
+                        referer = sourceReferer,
+                        headers = sourceHeaders,
+                        type = mediaHint(type),
+                    ),
                 )
-                emitted = true
+
+                if (checked != null) {
+                    callback(
+                        newExtractorLink(
+                            source = source.service,
+                            name = displayName(source),
+                            url = checked.url,
+                            type = extractorType(checked),
+                        ) {
+                            referer = checked.referer.orEmpty()
+                            quality = getQualityFromName(source.quality)
+                            headers = checked.headers
+                        },
+                    )
+                    emitted = true
+                } else {
+                    Log.w(
+                        PROVIDER_TAG,
+                        "Source directe rejetée par le probe service=${source.service} " +
+                            "host=${AfterDarkMediaProbe.safeHost(source.url)}",
+                    )
+                }
                 continue
             }
 
@@ -935,18 +843,12 @@ class AfterDarkProvider : MainAPI() {
                 }.getOrNull()
 
                 if (nativeResolved != null) {
-                    val nativeType = when (nativeResolved.type) {
-                        "m3u8" -> ExtractorLinkType.M3U8
-                        "mpd" -> ExtractorLinkType.DASH
-                        else -> ExtractorLinkType.VIDEO
-                    }
-
                     callback(
                         newExtractorLink(
                             source = source.service,
                             name = "AfterDark · ${source.service}",
                             url = nativeResolved.url,
-                            type = nativeType,
+                            type = extractorType(nativeResolved),
                         ) {
                             referer = nativeResolved.referer.orEmpty()
                             quality = getQualityFromName(source.quality)
@@ -971,19 +873,56 @@ class AfterDarkProvider : MainAPI() {
                 }
             }
 
-            var extractorEmitted = false
+            val extractedLinks = ArrayList<ExtractorLink>()
 
             runCatching {
                 loadExtractor(
                     url = source.url,
                     referer = sourceReferer,
                     subtitleCallback = subtitleCallback,
-                    callback = {
-                        extractorEmitted = true
-                        emitted = true
-                        callback(it)
-                    },
+                    callback = { extractedLinks.add(it) },
                 )
+            }
+
+            var extractorEmitted = false
+            for (link in extractedLinks) {
+                if (link.url.isBlank()) {
+                    // Only the dedicated playlist link type is allowed to have
+                    // no single URL. Reject any other blank extractor result.
+                    if (link is ExtractorLinkPlayList) {
+                        callback(link)
+                        emitted = true
+                        extractorEmitted = true
+                    } else {
+                        Log.w(PROVIDER_TAG, "Lien extracteur vide rejeté service=${source.service}")
+                    }
+                    continue
+                }
+
+                val checked = validateResolvedMedia(
+                    ResolvedWebMedia(
+                        url = link.url,
+                        referer = link.referer,
+                        headers = link.headers,
+                        type = mediaHint(link.type),
+                    ),
+                )
+
+                if (checked == null) {
+                    Log.w(
+                        PROVIDER_TAG,
+                        "Lien extracteur rejeté service=${source.service} " +
+                            "host=${AfterDarkMediaProbe.safeHost(link.url)} type=${link.type}",
+                    )
+                    continue
+                }
+
+                link.type = extractorType(checked)
+                link.referer = checked.referer.orEmpty()
+                link.headers = checked.headers
+                callback(link)
+                emitted = true
+                extractorEmitted = true
             }
 
             if (extractorEmitted) {
@@ -1003,22 +942,38 @@ class AfterDarkProvider : MainAPI() {
                 continue
             }
 
-            // Unknown non-embed URLs can still be handed to the player.
-            // Unknown embeds are never falsely exposed as direct media.
+            // Unknown non-embed URLs only reach the player after the same
+            // final content probe. Never expose an arbitrary HTTP page as VIDEO.
             if (!isEmbed) {
-                callback(
-                    newExtractorLink(
-                        source = source.service,
-                        name = displayName(source),
+                val checked = validateResolvedMedia(
+                    ResolvedWebMedia(
                         url = source.url,
+                        referer = sourceReferer,
+                        headers = sourceHeaders,
                         type = null,
-                    ) {
-                        referer = sourceReferer
-                        quality = getQualityFromName(source.quality)
-                        headers = sourceHeaders
-                    },
+                    ),
                 )
-                emitted = true
+                if (checked != null) {
+                    callback(
+                        newExtractorLink(
+                            source = source.service,
+                            name = displayName(source),
+                            url = checked.url,
+                            type = extractorType(checked),
+                        ) {
+                            referer = checked.referer.orEmpty()
+                            quality = getQualityFromName(source.quality)
+                            headers = checked.headers
+                        },
+                    )
+                    emitted = true
+                } else {
+                    Log.w(
+                        PROVIDER_TAG,
+                        "URL non-embed rejetée par le probe service=${source.service} " +
+                            "host=${AfterDarkMediaProbe.safeHost(source.url)}",
+                    )
+                }
             }
         }
 

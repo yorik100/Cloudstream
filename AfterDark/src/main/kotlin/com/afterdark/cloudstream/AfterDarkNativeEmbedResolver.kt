@@ -198,95 +198,27 @@ internal object AfterDarkNativeEmbedResolver {
         }
         if (isObviouslyAsset(candidate)) return null
 
-        val cleanPath = runCatching { URI(candidate).path.orEmpty().lowercase() }.getOrDefault("")
-        val declaredVideo = cleanPath.endsWith(".mp4") ||
-            cleanPath.endsWith(".m4v") ||
-            cleanPath.endsWith(".webm")
-
-        if (declaredVideo) {
-            val head = runCatching {
-                app.head(
-                    url = candidate,
-                    headers = headers,
-                    referer = pageUrl,
-                    timeout = MEDIA_TIMEOUT_SECONDS,
-                )
-            }.getOrNull() ?: return null
-
-            if (head.okhttpResponse.code !in 200..299) return null
-            val headType = head.headers["Content-Type"]
-                ?.substringBefore(";")
-                ?.trim()
-                ?.lowercase()
-                .orEmpty()
-            if (headType.startsWith("text/html") || headType.startsWith("application/json")) {
-                return null
+        val hintedType = runCatching { URI(candidate).path.orEmpty().lowercase() }
+            .getOrDefault("")
+            .let { path ->
+                when {
+                    path.endsWith(".m3u8") -> "m3u8"
+                    path.endsWith(".mpd") -> "mpd"
+                    path.endsWith(".mp4") ||
+                        path.endsWith(".m4v") ||
+                        path.endsWith(".webm") ||
+                        path.endsWith(".mkv") -> "video"
+                    else -> null
+                }
             }
 
-            return ResolvedWebMedia(
+        return AfterDarkMediaProbe.validate(
+            ResolvedWebMedia(
                 url = candidate,
                 referer = pageUrl,
                 headers = headers,
-                type = "video",
-            )
-        }
-
-        val probeHeaders = LinkedHashMap(headers)
-        if (!cleanPath.endsWith(".m3u8")) {
-            // Extensionless media endpoints can be large direct videos. Probe
-            // only their first bytes; an HLS manifest always exposes #EXTM3U
-            // at the beginning, while a real video can be identified by type.
-            probeHeaders["Range"] = "bytes=0-65535"
-        }
-
-        val response = runCatching {
-            app.get(
-                url = candidate,
-                headers = probeHeaders,
-                referer = pageUrl,
-                cacheTime = 0,
-                timeout = MEDIA_TIMEOUT_SECONDS,
-            )
-        }.getOrNull() ?: return null
-
-        if (response.okhttpResponse.code !in 200..299 && response.okhttpResponse.code != 206) {
-            return null
-        }
-
-        val contentType = response.headers["Content-Type"]
-            ?.substringBefore(";")
-            ?.trim()
-            ?.lowercase()
-            .orEmpty()
-        val body = response.text.trimStart()
-
-        val isHls = body.startsWith("#EXTM3U") ||
-            contentType.contains("mpegurl") ||
-            cleanPath.endsWith(".m3u8")
-
-        if (isHls) {
-            // Extension/content-type alone is insufficient: require the actual
-            // manifest marker. This blocks HTML/error bodies that otherwise
-            // reach ExoPlayer as ERROR_CODE_PARSING_MANIFEST_MALFORMED (3002).
-            if (!body.startsWith("#EXTM3U")) return null
-            return ResolvedWebMedia(
-                url = candidate,
-                referer = pageUrl,
-                headers = headers,
-                type = "m3u8",
-            )
-        }
-
-        val isVideo = contentType.startsWith("video/") ||
-            contentType == "application/octet-stream"
-
-        if (!isVideo) return null
-
-        return ResolvedWebMedia(
-            url = candidate,
-            referer = pageUrl,
-            headers = headers,
-            type = "video",
+                type = hintedType,
+            ),
         )
     }
 
