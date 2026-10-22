@@ -750,6 +750,20 @@ class AfterDarkProvider : MainAPI() {
 
         val parsedSources = parseNdjson(response.second)
 
+        Log.i(
+            PROVIDER_TAG,
+            "Sources officielles reçues ${request.sessionKey}: " +
+                if (parsedSources.isEmpty()) {
+                    "aucune"
+                } else {
+                    parsedSources.joinToString(", ") { parsed ->
+                        val host = AfterDarkMediaProbe.safeHost(parsed.url)
+                            .ifBlank { "sans-host" }
+                        "${parsed.service}@${host}:type=${parsed.type.orEmpty()}"
+                    }
+                },
+        )
+
         // The verification-only WebView always returns control after capturing
         // /api/sources, including when the official response has no items.
         val sources = if (parsedSources.isEmpty()) {
@@ -774,15 +788,36 @@ class AfterDarkProvider : MainAPI() {
 
             if (!seen.add(source.url)) continue
 
+            Log.i(
+                PROVIDER_TAG,
+                "Source reçue service=${source.service} " +
+                    "host=${AfterDarkMediaProbe.safeHost(source.url)} " +
+                    "type=${source.type.orEmpty()} proxied=${source.proxied}",
+            )
+
             val type = directType(source)
-            val isEmbed = source.type.equals("embed", ignoreCase = true)
+            val declaredType = source.type.orEmpty().lowercase()
+            val sourceHost = runCatching {
+                java.net.URI(source.url).host.orEmpty().lowercase()
+            }.getOrDefault("")
+            val sourceService = source.service.lowercase()
+            val isKnownNativeEmbed =
+                "uqload" in sourceHost ||
+                    "uqload" in sourceService ||
+                    "vidzy" in sourceHost ||
+                    "vidzy" in sourceService
+            val isEmbed =
+                declaredType == "embed" ||
+                    declaredType == "iframe" ||
+                    declaredType == "player" ||
+                    isKnownNativeEmbed
             val sourceReferer = source.referer ?: "$mainUrl/"
             val sourceHeaders = LinkedHashMap<String, String>(source.headers)
             if (sourceHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
                 sourceHeaders["User-Agent"] = session.userAgent
             }
 
-            if (type != null || (source.proxied && !isEmbed)) {
+            if (!isKnownNativeEmbed && (type != null || (source.proxied && !isEmbed))) {
                 val checked = validateResolvedMedia(
                     ResolvedWebMedia(
                         url = source.url,
@@ -806,6 +841,12 @@ class AfterDarkProvider : MainAPI() {
                         },
                     )
                     emitted = true
+                    Log.i(
+                        PROVIDER_TAG,
+                        "Source émise service=${source.service} " +
+                            "host=${AfterDarkMediaProbe.safeHost(checked.url)} " +
+                            "type=${checked.type.orEmpty()}",
+                    )
                 } else {
                     Log.w(
                         PROVIDER_TAG,
@@ -816,16 +857,7 @@ class AfterDarkProvider : MainAPI() {
                 continue
             }
 
-            val sourceHost = runCatching {
-                java.net.URI(source.url).host.orEmpty().lowercase()
-            }.getOrDefault("")
-            val sourceService = source.service.lowercase()
-            val nativePriorityEmbed = isEmbed && (
-                "uqload" in sourceHost ||
-                    "uqload" in sourceService ||
-                    "vidzy" in sourceHost ||
-                    "vidzy" in sourceService
-                )
+            val nativePriorityEmbed = isKnownNativeEmbed
 
             if (isEmbed) {
                 val nativeResolved = runCatching {
@@ -856,6 +888,12 @@ class AfterDarkProvider : MainAPI() {
                         },
                     )
                     emitted = true
+                    Log.i(
+                        PROVIDER_TAG,
+                        "Source native émise service=${source.service} " +
+                            "host=${AfterDarkMediaProbe.safeHost(nativeResolved.url)} " +
+                            "type=${nativeResolved.type.orEmpty()}",
+                    )
                     if (source.group == "Secours") return true
                     continue
                 }

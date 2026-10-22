@@ -35,7 +35,23 @@ internal object AfterDarkNativeEmbedResolver {
         RegexOption.IGNORE_CASE,
     )
 
-    private val vidzyPayload = Regex("""\}\)\("([A-Za-z0-9+/=]+)"\)""")
+    private val vidzyLegacyPayload = Regex("""\}\)\("([A-Za-z0-9+/=]+)"\)""")
+    private val vidzyFunctionPayload = Regex(
+        """src\s*:\s*\(function\([a-zA-Z]+\).*?\}\)\(["']([^"']+)["']\)""",
+        RegexOption.DOT_MATCHES_ALL,
+    )
+    private val vidzyParentWidth = Regex(
+        """width\s*:\s*calc\(\s*1in\s*\+\s*(\d+)px\s*\)""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val vidzyChildWidth = Regex(
+        """width\s*:\s*(?:calc\(\s*)?(\d+(?:\.\d+)?)%\s*(?:([+-])\s*(\d+)px)?""",
+        RegexOption.IGNORE_CASE,
+    )
+    private val vidzyExpectedBc = Regex(
+        """if\s*\(\s*BC\s*!==\s*(\d+)\s*\)""",
+        RegexOption.IGNORE_CASE,
+    )
     private val vidzyCode = Regex(
         """(?:/d/|/download/|/file/|/f/|/v/|/embed-)([a-z0-9]+)""",
         RegexOption.IGNORE_CASE,
@@ -134,34 +150,176 @@ internal object AfterDarkNativeEmbedResolver {
         return "$currentOrigin/embed-$code.html"
     }
 
+    private fun decodeVidzyPayload(
+        encoded: String,
+        hostname: String,
+        bc: Int,
+    ): String? {
+        val decoded = runCatching {
+            Base64.decode(
+                encoded.padEnd((encoded.length + 3) / 4 * 4, '='),
+                Base64.DEFAULT,
+            )
+        }.getOrNull() ?: return null
+
+        val reversed = decoded.reversedArray()
+        var hostSum = 0
+        hostname.forEach { char ->
+            hostSum = (hostSum + char.code) and 0xFF
+        }
+
+        val result = StringBuilder(reversed.size)
+        reversed.indices.forEach { index ->
+            val key = (0x3d + index * 89 + hostSum + bc) and 0xFF
+            result.append(
+                ((reversed[index].toInt() and 0xFF) xor key).toChar(),
+            )
+        }
+
+        return result.toString()
+            .takeIf {
+                it.startsWith("http://", ignoreCase = true) ||
+                    it.startsWith("https://", ignoreCase = true)
+            }
+            ?.takeIf { "/troll/" !in it.lowercase() }
+            ?.takeIf { value ->
+                value.all { char -> char.code in 33..126 }
+            }
+    }
+
+    private fun vidzyBcCandidates(
+        html: String,
+        functionText: String,
+    ): List<Int> {
+        val candidates = LinkedHashSet<Int>()
+
+        // Current Vidzy format derives BC from DOM geometry. The parent is
+        // calc(1in + Npx), with CSS 1in = 96 px. The child width may be
+        // 50%, calc(100% - 11px), etc. Browser layout rounds to integer
+        // pixels, so try both floor and ceil.
+        val extraPx = vidzyParentWidth.find(functionText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?: vidzyParentWidth.find(html)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.toIntOrNull()
+            ?: 156
+
+        val parentWidth = 96 + extraPx
+
+        vidzyExpectedBc.find(functionText)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.let(candidates::add)
+
+        vidzyChildWidth.findAll(functionText).forEach { match ->
+            val percent = match.groupValues.getOrNull(1)
+                ?.toDoubleOrNull()
+                ?: return@forEach
+            val delta = match.groupValues.getOrNull(3)
+                ?.toIntOrNull()
+                ?: 0
+
+            val base = parentWidth * percent / 100.0
+            val measured = when (match.groupValues.getOrNull(2)) {
+                "-" -> base - delta
+                "+" -> base + delta
+                else -> base
+            }
+
+            candidates += kotlin.math.floor(measured).toInt()
+            candidates += kotlin.math.ceil(measured).toInt()
+        }
+
+        // Legacy Vidzy layout used a 50% child.
+        candidates += parentWidth / 2
+        candidates += (parentWidth + 1) / 2
+
+        // Old decoder had no BC term at all. Keep it as last-resort
+        // compatibility, but never accept Vidzy's /troll/ decoy.
+        candidates += 0
+
+        return candidates.toList()
+    }
+
     private fun decodeVidzy(html: String, embedUrl: String): String? {
-        val script = org.jsoup.Jsoup.parse(html)
+        val document = org.jsoup.Jsoup.parse(html)
+        val scripts = document
             .select("script")
             .asSequence()
             .map { it.data().ifBlank { it.html() } }
-            .firstOrNull {
-                it.contains("sources:", ignoreCase = true) &&
-                    it.contains("m3u8", ignoreCase = true)
-            }
-            ?: return null
+            .filter(String::isNotBlank)
+            .toList()
 
-        val encoded = vidzyPayload.find(script)?.groupValues?.getOrNull(1) ?: return null
         val hostname = host(embedUrl).takeIf(String::isNotBlank) ?: return null
+        val hostCandidates = linkedSetOf(
+            hostname,
+            "vidzy.cc",
+            "vidzy.live",
+            "vidzy.to",
+            "vidzy.org",
+        )
 
-        var hostSum = 0
-        hostname.forEach { char -> hostSum = (hostSum + char.code) and 0xFF }
+        // Current format (October 2026): src:(function(s){...})("<base64>")
+        // with an XOR key that includes both the hostname sum and BC, a value
+        // derived from CSS layout geometry.
+        for (script in scripts) {
+            val functionMatch = vidzyFunctionPayload.find(script) ?: continue
+            val encoded = functionMatch.groupValues.getOrNull(1) ?: continue
+            val functionText = functionMatch.value
+            val bcCandidates = vidzyBcCandidates(html, functionText)
 
-        val decoded = runCatching { Base64.decode(encoded, Base64.DEFAULT) }.getOrNull()
-            ?: return null
-        val reversed = decoded.reversedArray()
-        val result = StringBuilder(reversed.size)
+            for (hostCandidate in hostCandidates) {
+                for (bc in bcCandidates) {
+                    decodeVidzyPayload(
+                        encoded = encoded,
+                        hostname = hostCandidate,
+                        bc = bc,
+                    )?.let { decoded ->
+                        Log.i(
+                            TAG,
+                            "Vidzy déchiffré format courant host=$hostCandidate bc=$bc",
+                        )
+                        return decoded
+                    }
+                }
+            }
 
-        reversed.indices.forEach { index ->
-            val key = (0x3d + index * 89 + hostSum) and 0xFF
-            result.append(((reversed[index].toInt() and 0xFF) xor key).toChar())
+            Log.w(
+                TAG,
+                "Payload Vidzy courant trouvé mais aucune clé BC valide",
+            )
         }
 
-        return result.toString().takeIf { it.startsWith("http", ignoreCase = true) }
+        // Compatibility with the previous Vidzy variant.
+        val legacyScript = scripts.firstOrNull {
+            it.contains("sources:", ignoreCase = true)
+        }
+        val legacyEncoded = legacyScript
+            ?.let { vidzyLegacyPayload.find(it) }
+            ?.groupValues
+            ?.getOrNull(1)
+
+        if (legacyEncoded != null) {
+            for (hostCandidate in hostCandidates) {
+                decodeVidzyPayload(
+                    encoded = legacyEncoded,
+                    hostname = hostCandidate,
+                    bc = 0,
+                )?.let { decoded ->
+                    Log.i(
+                        TAG,
+                        "Vidzy déchiffré format legacy host=$hostCandidate",
+                    )
+                    return decoded
+                }
+            }
+        }
+
+        return null
     }
 
     private fun responseHeaders(
@@ -222,6 +380,59 @@ internal object AfterDarkNativeEmbedResolver {
         )
     }
 
+    private suspend fun fetchEmbedPage(
+        url: String,
+        referer: String,
+        headers: Map<String, String>,
+        retryForVidzy: Boolean,
+    ): com.lagradost.nicehttp.NiceResponse? {
+        var page = runCatching {
+            app.get(
+                url = url,
+                headers = headers,
+                referer = referer,
+                cacheTime = 0,
+                timeout = PAGE_TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (!retryForVidzy || page.okhttpResponse.code !in 200..299) {
+            return page
+        }
+
+        fun looksUseful(html: String): Boolean =
+            vidzyFunctionPayload.containsMatchIn(html) ||
+                vidzyLegacyPayload.containsMatchIn(html) ||
+                html.contains(".m3u8", ignoreCase = true) ||
+                html.contains("sources:", ignoreCase = true)
+
+        if (looksUseful(page.text)) return page
+
+        // Vidzy can serve a cookie-setting landing page first. Retry once
+        // with the cookies set by that response and a self referer.
+        val retryHeaders = LinkedHashMap(headers)
+        if (
+            page.cookies.isNotEmpty() &&
+            retryHeaders.keys.none { it.equals("Cookie", ignoreCase = true) }
+        ) {
+            retryHeaders["Cookie"] = page.cookies.entries.joinToString("; ") {
+                (key, value) -> "$key=$value"
+            }
+        }
+
+        page = runCatching {
+            app.get(
+                url = url,
+                headers = retryHeaders,
+                referer = url,
+                cacheTime = 0,
+                timeout = PAGE_TIMEOUT_SECONDS,
+            )
+        }.getOrDefault(page)
+
+        return page
+    }
+
     suspend fun resolve(
         source: ParsedSource,
         referer: String,
@@ -239,12 +450,11 @@ internal object AfterDarkNativeEmbedResolver {
         }
 
         val page = runCatching {
-            app.get(
+            fetchEmbedPage(
                 url = pageUrl,
-                headers = requestHeaders,
                 referer = referer,
-                cacheTime = 0,
-                timeout = PAGE_TIMEOUT_SECONDS,
+                headers = requestHeaders,
+                retryForVidzy = isVidzy,
             )
         }.onFailure {
             Log.w(TAG, "Page embed inaccessible service=${source.service} host=$sourceHost", it)
