@@ -811,6 +811,8 @@ class AfterDarkProvider : MainAPI() {
             Log.i(
                 PROVIDER_TAG,
                 "Source reçue service=${source.service} " +
+                    "catégorie=${if (AfterDarkSourcePolicy.isEmbed(source)) "Embed" else "Direct"} " +
+                    "label=${displayName(source)} " +
                     "host=${AfterDarkMediaProbe.safeHost(source.url)} " +
                     "type=${source.type.orEmpty()} proxied=${source.proxied}",
             )

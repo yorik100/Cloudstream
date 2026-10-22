@@ -245,7 +245,22 @@ internal object AfterDarkMediaProbe {
         }
 
         val (response, prefix) = probe(media, "média") ?: return null
+
+        // HTTP redirects are followed during validation. Their final CDN URL
+        // can be signed/short-lived (or single-use), so it is NOT a stable
+        // URL to hand directly to ExoPlayer. Preserve the original source
+        // URL for playback: it will follow a fresh redirect on its own.
+        // The effective URL is used only to resolve child playlist URIs in
+        // the validation traversal.
         val checked = childContext(media, response.url)
+        if (response.url != media.url) {
+            Log.i(
+                TAG,
+                "Redirection média détectée: originHost=${host(media.url)} " +
+                    "destinationHost=${host(response.url)}; " +
+                    "URL initiale conservée pour la lecture",
+            )
+        }
 
         val type = contentType(response)
         val text = textPrefix(prefix)
@@ -255,11 +270,11 @@ internal object AfterDarkMediaProbe {
                 Log.w(TAG, "HLS rejeté après contrôle playlist/segment host=${host(media.url)}")
                 return null
             }
-            return checked.copy(type = "m3u8")
+            return media.copy(type = "m3u8")
         }
 
         if (text.contains("<MPD", ignoreCase = true)) {
-            return checked.copy(type = "mpd")
+            return media.copy(type = "mpd")
         }
 
         if (
@@ -273,7 +288,7 @@ internal object AfterDarkMediaProbe {
 
         val magic = supportedVideoMagic(prefix)
         if (magic || (type.startsWith("video/") && (prefix.isNotEmpty() || response.size != null))) {
-            return checked.copy(type = "video")
+            return media.copy(type = "video")
         }
 
         // application/octet-stream alone is intentionally NOT enough. Hosts

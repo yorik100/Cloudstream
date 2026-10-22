@@ -51,13 +51,28 @@ internal object AfterDarkSourcePolicy {
         source.referer.orEmpty(), headerKey(source.headers),
     )
 
-    fun displayName(source: ParsedSource): String = listOfNotNull(
-        source.provider.takeIf { it.isNotBlank() && !it.equals("AfterDark", true) }
-            ?: source.group.takeIf { it.isNotBlank() && it.lowercase(Locale.ROOT) !in setOf("embeds", "afterdark") },
-        source.service.takeIf(String::isNotBlank),
-        source.language?.takeIf(String::isNotBlank),
-        source.quality?.takeIf(String::isNotBlank),
-    ).distinct().joinToString(" · ").ifBlank { "AfterDark" }
+    /**
+     * The site puts every embed into its "Embeds" selector even when the
+     * embedded source inherited provider="Paris" from the API. Never label
+     * an embed "Paris": group by actual playback mode first, not by the
+     * provider field. Keep direct Uqload (Paris) distinct from Uqload Embed.
+     */
+    fun displayName(source: ParsedSource): String {
+        val category = if (isEmbed(source)) {
+            "Embed"
+        } else {
+            source.provider.takeIf { it.isNotBlank() && !it.equals("AfterDark", true) }
+                ?: source.group.takeIf { it.isNotBlank() && !it.equals("AfterDark", true) }
+                ?: "Direct"
+        }
+
+        return listOfNotNull(
+            category,
+            source.service.takeIf(String::isNotBlank),
+            source.language?.takeIf(String::isNotBlank),
+            source.quality?.takeIf(String::isNotBlank),
+        ).distinct().joinToString(" · ")
+    }
 
     // Never remove signed query parameters to deduplicate. Keep languages and
     // request contexts distinct even when two choices share a media URL.
