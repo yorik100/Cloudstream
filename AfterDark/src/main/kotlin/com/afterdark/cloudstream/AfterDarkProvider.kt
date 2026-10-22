@@ -563,7 +563,17 @@ class AfterDarkProvider : MainAPI() {
             }
         }
 
-        return sources.distinctBy { "${it.service}|${it.url}" }
+        return sources.distinctBy {
+            listOf(
+                it.group,
+                it.provider,
+                it.service,
+                it.language.orEmpty(),
+                it.quality.orEmpty(),
+                it.type.orEmpty(),
+                it.url,
+            ).joinToString("|")
+        }
     }
 
     private fun fallbackSources(request: PlaybackRequest): List<ParsedSource> {
@@ -607,7 +617,11 @@ class AfterDarkProvider : MainAPI() {
         return when (declared) {
             "hls", "m3u8" -> ExtractorLinkType.M3U8
             "dash", "mpd" -> ExtractorLinkType.DASH
-            "mp4", "video", "direct" -> ExtractorLinkType.VIDEO
+            "mp4", "video" -> ExtractorLinkType.VIDEO
+            // "direct" only describes the delivery path. AfterDark can use
+            // extensionless HLS proxy URLs for direct providers, so never
+            // force those URLs to VIDEO before MIME/type classification.
+            "direct" -> null
             else -> {
                 val path = source.url.substringBefore("?")
                 when {
@@ -623,12 +637,20 @@ class AfterDarkProvider : MainAPI() {
 
     private fun displayName(source: ParsedSource): String =
         listOfNotNull(
-            source.provider.takeIf { it.isNotBlank() && it != "AfterDark" },
+            source.group.takeIf {
+                it.isNotBlank() &&
+                    !it.equals("AfterDark", ignoreCase = true)
+            },
+            source.provider.takeIf {
+                it.isNotBlank() &&
+                    !it.equals("AfterDark", ignoreCase = true) &&
+                    !it.equals(source.group, ignoreCase = true)
+            },
             source.service.takeIf { it.isNotBlank() },
             source.language,
             source.quality,
         )
-            .distinct()
+            .distinctBy { it.lowercase() }
             .joinToString(" · ")
             .ifBlank { source.group.ifBlank { "AfterDark" } }
 
@@ -786,7 +808,15 @@ class AfterDarkProvider : MainAPI() {
                 )
             }
 
-            if (!seen.add(source.url)) continue
+            val sourceIdentity = listOf(
+                source.group,
+                source.service,
+                source.language.orEmpty(),
+                source.quality.orEmpty(),
+                source.type.orEmpty(),
+                source.url,
+            ).joinToString("|")
+            if (!seen.add(sourceIdentity)) continue
 
             Log.i(
                 PROVIDER_TAG,
@@ -801,24 +831,46 @@ class AfterDarkProvider : MainAPI() {
                 java.net.URI(source.url).host.orEmpty().lowercase()
             }.getOrDefault("")
             val sourceService = source.service.lowercase()
-            val isKnownNativeEmbed =
-                "uqload" in sourceHost ||
-                    "uqload" in sourceService ||
-                    "vidzy" in sourceHost ||
-                    "vidzy" in sourceService
-            val isEmbed =
+
+            // The official selector exposes direct provider groups (for
+            // example Canberra/Paris) separately from the "Embeds" group.
+            // A direct Paris source can legitimately have service=uqload;
+            // the service label alone must therefore never turn it into an
+            // Uqload iframe/embed.
+            val explicitEmbed =
                 declaredType == "embed" ||
                     declaredType == "iframe" ||
-                    declaredType == "player" ||
-                    isKnownNativeEmbed
+                    declaredType == "player"
+            val groupEmbed = source.group.equals("Embeds", ignoreCase = true)
+            val officialDirectGroup =
+                source.group.isNotBlank() &&
+                    !groupEmbed &&
+                    !source.group.equals("Secours", ignoreCase = true)
+            val hostLooksNativeEmbed =
+                "uqload" in sourceHost ||
+                    "vidzy" in sourceHost
+            val serviceLooksNativeEmbed =
+                "uqload" in sourceService ||
+                    "vidzy" in sourceService
+            val isKnownNativeEmbed =
+                hostLooksNativeEmbed ||
+                    (serviceLooksNativeEmbed && (explicitEmbed || groupEmbed || !officialDirectGroup))
+            val isEmbed =
+                explicitEmbed ||
+                    groupEmbed ||
+                    (isKnownNativeEmbed && !officialDirectGroup)
             val sourceReferer = source.referer ?: "$mainUrl/"
             val sourceHeaders = LinkedHashMap<String, String>(source.headers)
             if (sourceHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
                 sourceHeaders["User-Agent"] = session.userAgent
             }
 
-            if (!isKnownNativeEmbed && (type != null || (source.proxied && !isEmbed))) {
-                val checked = validateResolvedMedia(
+            if (!isEmbed && (type != null || source.proxied || officialDirectGroup)) {
+                // Official direct sources can be short-lived signed URLs.
+                // Do not consume them with a GET probe before ExoPlayer. Use
+                // declared/path information, then HEAD only when the type is
+                // still unknown (notably extensionless direct HLS proxies).
+                val checked = AfterDarkMediaProbe.classifyWithoutBody(
                     ResolvedWebMedia(
                         url = source.url,
                         referer = sourceReferer,
@@ -878,7 +930,7 @@ class AfterDarkProvider : MainAPI() {
                     callback(
                         newExtractorLink(
                             source = source.service,
-                            name = "AfterDark · ${source.service}",
+                            name = displayName(source),
                             url = nativeResolved.url,
                             type = extractorType(nativeResolved),
                         ) {

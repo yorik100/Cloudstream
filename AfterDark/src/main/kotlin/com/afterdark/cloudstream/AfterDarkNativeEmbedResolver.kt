@@ -473,7 +473,33 @@ internal object AfterDarkNativeEmbedResolver {
         val candidates = LinkedHashSet<String>()
 
         if (isVidzy) {
-            decodeVidzy(page.text, finalPageUrl)?.let(candidates::add)
+            decodeVidzy(page.text, finalPageUrl)?.let { decoded ->
+                // Current Vidzy media URLs are signed. A successful GET probe
+                // here can consume/age the URL before ExoPlayer requests it,
+                // which surfaces later as ERROR_CODE_IO_BAD_HTTPS_STATUS
+                // (2004). The decoder already rejects troll/non-http output,
+                // so emit the decoded HLS without a body GET.
+                val vidzyOrigin = origin(finalPageUrl)
+                val vidzyReferer = vidzyOrigin?.let { "$it/" } ?: finalPageUrl
+                val vidzyHeaders = LinkedHashMap(headers)
+                if (vidzyOrigin != null) {
+                    vidzyHeaders["Origin"] = vidzyOrigin
+                }
+                vidzyHeaders["Sec-Fetch-Dest"] = "empty"
+                vidzyHeaders["Sec-Fetch-Mode"] = "cors"
+                vidzyHeaders["Sec-Fetch-Site"] = "same-site"
+
+                Log.i(
+                    TAG,
+                    "Vidzy signé prêt sans GET probe host=$sourceHost",
+                )
+                return ResolvedWebMedia(
+                    url = decoded,
+                    referer = vidzyReferer,
+                    headers = vidzyHeaders,
+                    type = "m3u8",
+                )
+            }
         }
 
         // Server-rendered media nodes also cover extensionless HLS proxies.

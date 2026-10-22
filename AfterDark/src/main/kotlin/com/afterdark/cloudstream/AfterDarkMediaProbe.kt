@@ -126,6 +126,60 @@ internal object AfterDarkMediaProbe {
         return response to readPrefix(response)
     }
 
+    private fun normalizedHint(media: ResolvedWebMedia): String? {
+        when (media.type?.lowercase()) {
+            "m3u8", "hls" -> return "m3u8"
+            "mpd", "dash" -> return "mpd"
+            "video", "mp4" -> return "video"
+        }
+
+        val path = runCatching { URI(media.url).path.orEmpty().lowercase() }.getOrDefault("")
+        return when {
+            path.endsWith(".m3u8") -> "m3u8"
+            path.endsWith(".mpd") -> "mpd"
+            path.endsWith(".mp4") || path.endsWith(".m4v") ||
+                path.endsWith(".webm") || path.endsWith(".mkv") -> "video"
+            else -> null
+        }
+    }
+
+    /**
+     * Classifies an official direct source without performing a GET. Signed
+     * media URLs can be one-shot/short-lived; probing their body before the
+     * player uses them can turn a valid source into a later HTTP 4xx (2004).
+     *
+     * If AfterDark already declared the media type, trust that declaration.
+     * Otherwise use HEAD only to inspect Content-Type.
+     */
+    suspend fun classifyWithoutBody(media: ResolvedWebMedia): ResolvedWebMedia? {
+        if (!media.url.startsWith("http://", true) && !media.url.startsWith("https://", true)) {
+            return null
+        }
+
+        normalizedHint(media)?.let { return media.copy(type = it) }
+
+        val response = runCatching {
+            app.head(
+                url = media.url,
+                headers = media.headers,
+                referer = media.referer.orEmpty(),
+                timeout = TIMEOUT_SECONDS,
+            )
+        }.getOrNull() ?: return null
+
+        if (response.code !in 200..299) return null
+
+        val type = contentType(response)
+        val resolvedType = when {
+            "mpegurl" in type || "m3u8" in type -> "m3u8"
+            "dash+xml" in type || "mpd" in type -> "mpd"
+            type.startsWith("video/") -> "video"
+            else -> null
+        } ?: return null
+
+        return media.copy(type = resolvedType)
+    }
+
     suspend fun validate(media: ResolvedWebMedia): ResolvedWebMedia? {
         if (!media.url.startsWith("http://", true) && !media.url.startsWith("https://", true)) {
             return null
