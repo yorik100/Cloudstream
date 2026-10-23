@@ -2,7 +2,7 @@ import com.lagradost.cloudstream3.gradle.tasks.CompileDexTask
 import org.gradle.api.attributes.Attribute
 import org.gradle.api.tasks.Sync
 
-version = 109
+version = 110
 
 val publishedIconBase =
     "https://raw.githubusercontent.com/" +

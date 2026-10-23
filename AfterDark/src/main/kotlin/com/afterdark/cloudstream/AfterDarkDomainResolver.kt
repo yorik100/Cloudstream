@@ -63,12 +63,13 @@ internal class AfterDarkDomainResolver {
             return null
         }
 
-        // Prefer the published access link, but do not require a specific
-        // heading, phrase or HTML template from the announcement page.
-        for (candidate in extractCurrentOrigins(source.text)) {
-            validateWithClassicHttp(candidate)?.let { return it }
-        }
-        return null
+        // The announcement page can also contain Telegram, social links and
+        // advertisements. Exactly ONE link is authoritative: the primary
+        // "Ouvrir le site" (or "Ouvrir le lien") button. If it is broken,
+        // resolve() must fall back to GitHub, never another announcement link.
+        val publishedOrigin = extractCurrentOrigins(source.text).singleOrNull()
+            ?: return null
+        return validateWithClassicHttp(publishedOrigin)
     }
 
     /**
@@ -120,6 +121,10 @@ internal class AfterDarkDomainResolver {
         }.getOrNull() ?: return null
 
         if (response.okhttpResponse.code !in 200..299) return null
+        if (!looksLikeAfterDarkApplication(response.text)) {
+            Log.w(TAG, "Domaine $normalizedCandidate : HTTP 2xx mais page AfterDark non reconnue")
+            return null
+        }
 
         val finalOrigin = response.okhttpResponse.request.url.let { url ->
             val scheme = url.scheme
@@ -163,26 +168,64 @@ internal class AfterDarkDomainResolver {
             setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
         )
 
+        private val CLASS_ATTRIBUTE = Regex(
+            "\\bclass\\s*=\\s*([\"'])(.*?)\\1",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),
+        )
+        private val HTML_TAG = Regex("<[^>]+>")
+        private val WHITESPACE = Regex("\\s+")
+        private val AFTERDARK_TITLE = Regex(
+            "<title\\b[^>]*>\\s*Afterdark\\b",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /**
+         * Extract the ONE published origin from the primary CTA only.
+         * In particular, this does not maintain a Telegram blocklist: links
+         * other than that button are never candidates in the first place.
+         */
         fun extractCurrentOrigins(html: String): List<String> {
-            // The announcement's wording and CSS may change. Collect HTTPS
-            // links generically and validate the destination over HTTP.
-            val anchors = ANCHOR_TAG.findAll(html)
-                .mapNotNull { tag ->
-                    val href = HREF.find(tag.value)?.groupValues?.getOrNull(2)
-                    val origin = href?.let(::normalizeOrigin)
-                        ?.takeUnless(::isSourceOrigin)
-                    origin?.let { value ->
-                        // Existing call-to-action is a preference, not a gate.
-                        val preferred = tag.value.contains(
-                            "Ouvrir le site", ignoreCase = true,
-                        )
-                        preferred to value
-                    }
-                }
-                .toList()
-            return anchors.sortedByDescending { it.first }
-                .map { it.second }
-                .distinct()
+            val primaryButton = ANCHOR_TAG.findAll(html).firstOrNull { match ->
+                val anchor = match.value
+                val opening = anchor.substringBefore('>')
+                val classes = CLASS_ATTRIBUTE.find(opening)
+                    ?.groupValues?.getOrNull(2)
+                    ?.split(WHITESPACE)
+                    ?.map { it.lowercase() }
+                    .orEmpty()
+                if ("btn" !in classes || "primary" !in classes) return@firstOrNull false
+
+                val label = HTML_TAG.replace(anchor.substringAfter('>'), " ")
+                    .replace("&nbsp;", " ", ignoreCase = true)
+                    .replace("&#160;", " ", ignoreCase = true)
+                    .trim()
+                    .replace(WHITESPACE, " ")
+                label.equals("Ouvrir le site", ignoreCase = true) ||
+                    label.equals("Ouvrir le lien", ignoreCase = true)
+            } ?: return emptyList()
+
+            // Never try another anchor, even when this CTA is malformed.
+            // A bad primary target means: try the independent GitHub fallback.
+            val selected = HREF.find(primaryButton.value.substringBefore('>'))
+                ?.groupValues?.getOrNull(2)
+                ?.let(::normalizeOrigin)
+                ?.takeUnless(::isSourceOrigin)
+            return listOfNotNull(selected)
+        }
+
+        /**
+         * HTTP 200 alone is not evidence of a working AfterDark frontend.
+         * Reject expired landing sites, CDN placeholders and challenges that
+         * return HTML 200, so the validated GitHub KeepLink can be tried.
+         * This fingerprint matches the real AfterDark SPA, not the registry.
+         */
+        fun looksLikeAfterDarkApplication(html: String): Boolean {
+            val branding = AFTERDARK_TITLE.containsMatchIn(html) ||
+                (html.contains("og:site_name", ignoreCase = true) &&
+                    html.contains("content=\"Afterdark\"", ignoreCase = true))
+            val frontend = html.contains("/assets/index-", ignoreCase = true) &&
+                html.contains("<script", ignoreCase = true)
+            return branding && frontend
         }
 
         fun normalizeOrigin(rawValue: String): String? {
